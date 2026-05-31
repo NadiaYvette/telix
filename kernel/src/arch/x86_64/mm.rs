@@ -471,6 +471,61 @@ pub fn read_pte(pml4: usize, va: usize) -> u64 {
     }
 }
 
+/// #233 (2) write-protect / unprotect helper.  Flips the PTE_RW bit on
+/// the 4 KiB MMU page containing `va`.  Used to catch any-CPU writers
+/// to specific kstack slots via #PF.  Returns true if successful.
+pub fn set_pte_writable(pml4: usize, va: usize, writable: bool) -> bool {
+    let slot = match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(s) => s,
+        None => return false,
+    };
+    unsafe {
+        let entry = *slot;
+        if entry & PTE_P == 0 {
+            return false;
+        }
+        let new_entry = if writable {
+            entry | PTE_RW
+        } else {
+            entry & !PTE_RW
+        };
+        *slot = new_entry;
+    }
+    X86Pte::tlb_invalidate(va);
+    true
+}
+
+/// #233 (3) write-protect the 4 KiB MMU page backing `pa` via its
+/// PHYS_DIRECT_MAP alias.  Demotes any 1 GiB or 2 MiB superpage along
+/// the PML4[507] path so the leaf PTE for the watched page can hold a
+/// dedicated PTE_RW=0 bit.  Sibling pages remain writable.
+///
+/// Used by the kstack WPROT probe to catch writers that bypass the
+/// per-thread KSTACK_REGION VA window by going via direct-map PAs
+/// (or the legacy PML4[0] identity, whose RAM overlaps direct-map).
+///
+/// Returns true if the leaf is now RW=0.  TLB is invalidated locally;
+/// callers should ensure no peer CPU has a stale gigapage TLB entry for
+/// this VA (arming during early boot is safe — APs haven't started).
+pub fn wprot_4k_via_direct_map(pml4: usize, pa: usize) -> bool {
+    use crate::mm::page::SUPERPAGE_LEVELS;
+    let two_mib = &SUPERPAGE_LEVELS[0]; // 2 MiB (PD)
+    let one_gib = &SUPERPAGE_LEVELS[1]; // 1 GiB (PDPT)
+    let dm_va = phys_to_kva(pa & !0xFFF);
+    let demote_flags = PTE_P | PTE_RW | PTE_NX;
+    if is_superpage_at_level(pml4, dm_va, one_gib).is_some()
+        && !demote_superpage_at_level(pml4, dm_va, demote_flags, one_gib)
+    {
+        return false;
+    }
+    if is_superpage_at_level(pml4, dm_va, two_mib).is_some()
+        && !demote_superpage_at_level(pml4, dm_va, demote_flags, two_mib)
+    {
+        return false;
+    }
+    set_pte_writable(pml4, dm_va, false)
+}
+
 /// Evict a 4K MMU page: clear Present bit but preserve PTE_SW_ZEROED hint.
 /// Returns old PA, or 0. Used by WSCLOCK.
 pub fn evict_mmupage(pml4: usize, va: usize) -> usize {

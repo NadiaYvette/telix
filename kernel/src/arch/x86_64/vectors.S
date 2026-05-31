@@ -49,8 +49,13 @@ __isr_common:
     push    r14
     push    r15
 
-    // Call Rust handler: rdi = current SP (pointer to ExceptionFrame)
+    // Call Rust handler: rdi = current SP (pointer to ExceptionFrame).
+    // #233: also stash frame_sp in r12 (callee-saved by System V ABI;
+    // x86_exception_handler preserves it).  Used below to detect the
+    // no-stack-switch case so we can skip the second `call` whose ret-
+    // push would scribble the outer ret-addr slot.
     mov     rdi, rsp
+    mov     r12, rsp
     call    x86_exception_handler
     // Return value in rax = (potentially new) SP for context switch.
     // Guard: if the returned SP is below 64K, the frame is corrupt
@@ -59,19 +64,15 @@ __isr_common:
     // the interrupt, rather than restoring from address 0.
     cmp     rax, 0x10000
     jb      1f
+    // #233 RET-SCRIBBLE mitigation: the second `call finalize_*` push
+    // would overwrite our outer ret-addr slot when rsp didn't change.
+    // Now eliminated entirely — finalize_release_after_stack_switch's
+    // work has been moved to the START of x86_exception_handler so it
+    // runs on every handler entry.  The CPU that staged a release-slot
+    // entry will drain it on its NEXT handler entry (typically the
+    // very next timer tick).  Peer CPUs that observe RELEASING in the
+    // meantime simply fail the dispatch CAS and yield to idle.
     mov     rsp, rax
-    // #208 Fix D Stage 2: at this point cpu_old has just left prev's
-    // kstack (rsp now on next's kstack).  Drain the per-CPU release
-    // slot and CAS-transition prev's on_cpu RELEASING→PENDING so peer
-    // CPUs can safely dispatch prev.  Call is intentionally placed
-    // ONLY on the success path (rax >= 0x10000); the bail-on-corrupt-
-    // frame path doesn't actually leave the original stack so we
-    // must not advertise prev as PENDING.  The slot in that case
-    // stays populated until the next try_switch's publish overwrites
-    // it.  Caller-saved registers are clobbered by the call but all
-    // of them are popped from the new stack in the sequence below,
-    // refreshing their values before any depend on them.
-    call    finalize_release_after_stack_switch
 1:
 
     pop     r15
@@ -91,6 +92,49 @@ __isr_common:
     pop     rax
 
     add     rsp, 16     // Skip vector_number + error_code
+
+    // #233 PRE-IRETQ probe: log if CS slot has a non-legit value.
+    // RSP now points at iretq frame: [rsp]=RIP [rsp+8]=CS [rsp+16]=RFLAGS [rsp+24]=RSP [rsp+32]=SS.
+    // Telix legit CS values at iretq: 0x08 (kernel) or 0x23 (user, USER_CS|3).
+    // Anything else = scribbled — call probe to dump.
+    //
+    // Save 8 caller-saved regs (RSP currently 8-aligned-not-16; 8 pushes
+    // keep it 8-aligned, then `call` aligns to 16). All saved regs are
+    // restored before iretq so user-mode resumption is unaffected.
+    push    rax
+    push    rcx
+    push    rdx
+    push    rdi
+    push    rsi
+    push    r8
+    push    r9
+    push    r10
+    // After 8 pushes (64 bytes), iretq frame starts at [rsp + 64].
+    // Check RIP slot first — wild-RIP family has RIP < 0x10000 with
+    // valid CS, so a CS-only check misses it.
+    mov     rax, [rsp + 64]      // RIP slot
+    cmp     rax, 0x10000
+    jb      3f                   // suspect: RIP too small (likely scribbled)
+    // Check CS slot for known legit values.
+    mov     rax, [rsp + 72]      // CS slot
+    cmp     rax, 0x08
+    je      2f
+    cmp     rax, 0x23
+    je      2f
+3:
+    // Suspect frame — call probe with rdi = ptr to iretq frame.
+    lea     rdi, [rsp + 64]
+    call    pre_iretq_dump
+2:
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rsi
+    pop     rdi
+    pop     rdx
+    pop     rcx
+    pop     rax
+
     iretq
 
 // ==== ISR stub macros ====

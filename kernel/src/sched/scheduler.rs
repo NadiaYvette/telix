@@ -45,9 +45,14 @@ const VTIME_UNIT: u64 = 1 << 20;
 // slots — bigger stack creates headroom that masks it.  If they
 // persist, the corruption is from a fixed-offset slot reuse pattern
 // independent of stack depth.
-const KSTACK_ORDER: usize = 2;
+const KSTACK_ORDER: usize = 4;
 
 /// Kernel stack size in bytes (2^KSTACK_ORDER pages).
+/// 2^4 = 16 pages × 4 KiB = 64 KiB, raised from 16 KiB after boot 2511
+/// captured an iretq-frame scribble coincident with a serial.rs:445
+/// fmt_len-OOB panic — strong evidence of in-handler println pushing
+/// the kstack past the 16 KiB envelope.  The VA window is 2 MiB so
+/// the larger phys-backed region fits without infra changes.
 #[inline]
 pub fn kstack_size() -> usize {
     page::page_size() << KSTACK_ORDER
@@ -101,6 +106,41 @@ static KSTACK_PA_OWNER: [core::sync::atomic::AtomicU32; KSTACK_PA_OWNER_CAP] = {
     const Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     [Z; KSTACK_PA_OWNER_CAP]
 };
+
+/// #230: canonical stack_phys_base per tid (for early tids only).
+/// Set at create_thread / create_thread_in_task; checked at every read
+/// site (kill defer, exit defer, drain).  Divergence proves Thread
+/// struct corruption between creation and read.
+const SPB_CANONICAL_MAX: usize = 100;
+static SPB_CANONICAL: [core::sync::atomic::AtomicU64; SPB_CANONICAL_MAX] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; SPB_CANONICAL_MAX]
+};
+
+pub fn spb_set_canonical(tid: u32, pa: u64) {
+    if (tid as usize) < SPB_CANONICAL_MAX {
+        SPB_CANONICAL[tid as usize].store(pa, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn spb_check(tid: u32, observed: u64, site: &str) {
+    if (tid as usize) >= SPB_CANONICAL_MAX {
+        return;
+    }
+    let canon = SPB_CANONICAL[tid as usize].load(core::sync::atomic::Ordering::Acquire);
+    if canon == 0 || canon == observed {
+        return;
+    }
+    static DIVERG_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = DIVERG_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 32 {
+        crate::println!(
+            "SPB-DIVERGED: tid={} site={} canon={:#x} observed={:#x} n={}",
+            tid, site, canon, observed, n,
+        );
+    }
+}
 
 /// Query whether `pa`'s 64 KiB slot is currently owned by a kstack.
 /// Used by zero_daemon to skip writing to PAs that are in use as
@@ -185,12 +225,110 @@ fn kstack_pa_audit(pa: usize, ksize: usize, delta: i32, tag: &str) {
                     // Underflow: freed a PA that wasn't tracked as live.
                     // Either we missed an alloc (instrumentation gap) or
                     // someone freed twice.
+                    let bad_pa = pa + (i << 16);
                     crate::println!(
                         "KSTACK-PA-FREE-UNDERFLOW: tag={} pa={:#x} page_idx={} n={}",
-                        tag, pa + (i << 16), slot, n,
+                        tag, bad_pa, slot, n,
                     );
+                    // #230: chunk 163 (0xA3) is the recurring UNDERFLOW
+                    // target across boots 2312/2317/2320.  Dump phys event
+                    // ring filtered to this chunk so we can replay the
+                    // alloc+free sequence that left the slot count at 0
+                    // with stack_phys_base still pointing here.  Once per
+                    // underflow site.
+                    if n < 4 {
+                        let chunk_size = 64 * crate::mm::page::page_size();
+                        let chunk_idx = bad_pa / chunk_size;
+                        crate::mm::phys::dump_evt_ring_for_chunk(chunk_idx);
+                    }
                 }
             }
+        }
+    }
+}
+
+/// #233 (2) PF-write-protection probe state.  We pick a deterministic
+/// kstack slot VA, write-protect its page at alloc time, and log the
+/// first writer (any CPU) via the #PF handler.  After one hit the
+/// page is re-enabled so the writer can complete; ARMED stays true so
+/// later kstack allocs don't re-protect the page.
+pub const PF_WPROT_VA: u64 = 0xfffffe00049ff608;
+pub static PF_WPROT_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static PF_WPROT_DISARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// #233 (3) DM-alias of the watched page.  Stored on arm so the PF
+/// handler can recognize a write that arrived via the PHYS_DIRECT_MAP
+/// (or the legacy PML4[0] identity, since DM and identity overlap RAM).
+/// 0 = not armed; non-zero = page-base VA in PHYS_DIRECT_MAP.
+pub static PF_WPROT_DM_VA: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static PF_WPROT_DM_DISARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// #233 THREAD-VA-ALIAS detector: registry of (PA, slot_idx) of currently
+/// alive kstacks.  On every new alloc, scan to see if the PA we just got
+/// matches an already-registered live PA — that would mean phys::alloc
+/// double-issued and two threads now share a kstack PA via their VAs.
+/// Bounded array — covers up to 256 simultaneous kstacks.
+const KSTACK_PA_REG_CAP: usize = 256;
+static KSTACK_PA_REG: [core::sync::atomic::AtomicU64; KSTACK_PA_REG_CAP] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; KSTACK_PA_REG_CAP];
+
+fn kstack_pa_register(pa: u64) {
+    use core::sync::atomic::Ordering;
+    // Check for alias before claiming a slot.
+    for slot in KSTACK_PA_REG.iter() {
+        let v = slot.load(Ordering::Acquire);
+        if v == pa {
+            // Alias detected — PA already registered to a live kstack.
+            let mut buf = [0u8; 96];
+            let mut n = 0;
+            for &b in b"THREAD-VA-ALIAS: pa=0x".iter() {
+                if n < buf.len() { buf[n] = b; n += 1; }
+            }
+            let mut v = pa;
+            let mut digits = [0u8; 16];
+            let mut k = 0;
+            if v == 0 { digits[0] = b'0'; k = 1; }
+            else {
+                while v > 0 {
+                    let d = (v & 0xf) as u8;
+                    digits[k] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+                    v >>= 4;
+                    k += 1;
+                }
+            }
+            for i in (0..k).rev() {
+                if n < buf.len() { buf[n] = digits[i]; n += 1; }
+            }
+            if n < buf.len() { buf[n] = b'\n'; n += 1; }
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+            break;
+        }
+    }
+    // Claim a free slot.
+    for slot in KSTACK_PA_REG.iter() {
+        if slot
+            .compare_exchange(0, pa, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn kstack_pa_unregister(pa: u64) {
+    use core::sync::atomic::Ordering;
+    for slot in KSTACK_PA_REG.iter() {
+        if slot
+            .compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
         }
     }
 }
@@ -199,6 +337,7 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
     let pa = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let ksize = kstack_size();
     kstack_pa_audit(pa.as_usize(), ksize, 1, "alloc");
+    kstack_pa_register(pa.as_usize() as u64);
     // #208 KSTACK_WRITE_RING tag: action=1, alloc_kstack_zeroed
     // write_bytes(0) of the entire kstack via identity-map PA.  If the
     // phys allocator double-issued this PA (use-after-free), the zero
@@ -229,6 +368,66 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
             boot_pml4, va_window, pa.as_usize(), num_mmu_pages,
         )?;
         let va_base = va_top - ksize as u64;
+        // #233 (2) PF-WPROT arm: when we allocate the SPECIFIC kstack VA
+        // window containing our chosen recurring slot, write-protect
+        // the 4 KiB page containing the slot.  Any subsequent write
+        // (from any CPU) hits #PF and we log the writer.  Only set
+        // ARMED when we actually arm (slot_va within this window).
+        #[cfg(target_arch = "x86_64")]
+        {
+            let slot_va = PF_WPROT_VA;
+            if slot_va >= va_base
+                && slot_va < va_top
+                && !PF_WPROT_ARMED.swap(true, core::sync::atomic::Ordering::AcqRel)
+            {
+                let boot_pml4 = {
+                    let cr3: u64;
+                    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
+                    (cr3 & !0xFFF) as usize
+                };
+                let ok = crate::arch::x86_64::mm::set_pte_writable(
+                    boot_pml4, (slot_va as usize) & !0xFFF, false,
+                );
+                crate::println!(
+                    "PF-WPROT-ARMED: slot_va={:#x} page_base={:#x} ok={}",
+                    slot_va, slot_va & !0xFFF, ok,
+                );
+                // #233 (3) PHYS_DIRECT_MAP alias: same RAM is also reachable
+                // via PML4[507] (and PML4[0] identity, overlapping RAM).
+                // Compute PA of the slot's 4 KiB page and write-protect it
+                // through DM as well — catches writers that bypass the
+                // KSTACK_REGION VA.
+                let pa_of_slot =
+                    pa.as_usize() + (slot_va as usize - va_base as usize);
+                let pa_page_base = pa_of_slot & !0xFFF;
+                let dm_va_base = crate::arch::x86_64::mm::phys_to_kva(pa_page_base);
+                let dm_ok = crate::arch::x86_64::mm::wprot_4k_via_direct_map(
+                    boot_pml4, pa_page_base,
+                );
+                PF_WPROT_DM_VA.store(
+                    dm_va_base as u64,
+                    core::sync::atomic::Ordering::Release,
+                );
+                crate::println!(
+                    "PF-WPROT-DM-ARMED: pa_page={:#x} dm_va={:#x} ok={}",
+                    pa_page_base, dm_va_base, dm_ok,
+                );
+            }
+        }
+        // #233 (2): log every kstack VA at alloc time with a sequence
+        // counter so we can correlate scribble slots with the (n-th
+        // kstack ever allocated) of the matching VA.
+        {
+            static SEQ: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 256 {
+                crate::println!(
+                    "KSTACK-ALLOC: seq={} va_base={:#x} va_top={:#x} pa={:#x}",
+                    n, va_base, va_top, pa.as_usize(),
+                );
+            }
+        }
         Some(KStackHandle { va_base, pa_base: pa })
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -425,10 +624,55 @@ pub extern "C" fn finalize_release_after_stack_switch() {
                         core::sync::atomic::AtomicU32::new(0);
                     let n = FIX_LOG.fetch_add(1, Ordering::Relaxed);
                     if n < 64 {
-                        crate::println!(
-                            "DEFENSIVE-RSP0-FIX: cpu={} tid={} actual={:#x} -> expected={:#x} n={}",
-                            cpu, current_tid, actual, expected, n,
-                        );
+                        // #233 thin-hex writer: avoid crate::println! here.
+                        // The fmt machinery adds 400-600 B of stack per call
+                        // and runs on the same kstack as the outer handler —
+                        // a contributor to the RET-SCRIBBLE family.  Build
+                        // the line manually into a small fixed buffer.
+                        let mut buf = [0u8; 160];
+                        let mut k = 0usize;
+                        fn put(buf: &mut [u8; 160], k: &mut usize, b: u8) {
+                            if *k < buf.len() { buf[*k] = b; *k += 1; }
+                        }
+                        fn put_str(buf: &mut [u8; 160], k: &mut usize, s: &str) {
+                            for &b in s.as_bytes() { put(buf, k, b); }
+                        }
+                        fn put_hex(buf: &mut [u8; 160], k: &mut usize, mut v: u64) {
+                            put_str(buf, k, "0x");
+                            if v == 0 { put(buf, k, b'0'); return; }
+                            let mut digits = [0u8; 16];
+                            let mut j = 0;
+                            while v > 0 {
+                                let d = (v & 0xf) as u8;
+                                digits[j] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+                                v >>= 4;
+                                j += 1;
+                            }
+                            for i in (0..j).rev() { put(buf, k, digits[i]); }
+                        }
+                        fn put_dec_u32(buf: &mut [u8; 160], k: &mut usize, mut v: u32) {
+                            if v == 0 { put(buf, k, b'0'); return; }
+                            let mut digits = [0u8; 10];
+                            let mut j = 0;
+                            while v > 0 {
+                                digits[j] = b'0' + (v % 10) as u8;
+                                v /= 10;
+                                j += 1;
+                            }
+                            for i in (0..j).rev() { put(buf, k, digits[i]); }
+                        }
+                        put_str(&mut buf, &mut k, "DEFENSIVE-RSP0-FIX: cpu=");
+                        put_dec_u32(&mut buf, &mut k, cpu as u32);
+                        put_str(&mut buf, &mut k, " tid=");
+                        put_dec_u32(&mut buf, &mut k, current_tid);
+                        put_str(&mut buf, &mut k, " actual=");
+                        put_hex(&mut buf, &mut k, actual);
+                        put_str(&mut buf, &mut k, " expected=");
+                        put_hex(&mut buf, &mut k, expected);
+                        put_str(&mut buf, &mut k, " n=");
+                        put_dec_u32(&mut buf, &mut k, n);
+                        put(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k]);
                     }
                     crate::arch::x86_64::gdt::set_rsp0(current_tid, expected);
                 }
@@ -447,8 +691,35 @@ pub extern "C" fn finalize_release_after_stack_switch() {
 /// kstack on the next user→kernel transition.  See commit f250848.
 #[inline]
 pub fn set_current_thread(pcpu: &smp::PerCpuData, tid: ThreadId) {
-    pcpu.current_thread.store(tid, Ordering::Relaxed);
-    record_current_thread_change(smp::cpu_id(), tid as u32);
+    // #232 self-pcpu guard: update_kernel_stack uses smp::cpu_id() to
+    // determine WHICH TSS to write.  If a caller mistakenly passes a
+    // peer's pcpu, current_thread on the peer gets updated but its
+    // TSS does not.  Verify pcpu corresponds to the current CPU; if
+    // not, log + skip the TSS update so we don't corrupt this CPU's
+    // TSS with a peer's stack.
+    let cpu = smp::cpu_id();
+    let expected_pcpu = smp::get(cpu) as *const smp::PerCpuData;
+    let actual_pcpu = pcpu as *const smp::PerCpuData;
+    if expected_pcpu != actual_pcpu {
+        static MISUSE_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = MISUSE_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            crate::println!(
+                "SCT-PEER-PCPU: cur_cpu={} pcpu_addr={:p} expected={:p} tid={} n={}",
+                cpu, actual_pcpu, expected_pcpu, tid, n,
+            );
+        }
+    }
+    // #232 ordering fix: update TSS.RSP0 BEFORE the current_thread.store.
+    // Hardware reads TSS.RSP0 on every ring 3→0 transition.  If
+    // current_thread is visible to peers but TSS.RSP0 is still the
+    // OLD thread's kstack top, a syscall on this CPU lands on the
+    // OLD thread's kstack and scribbles its iretq frame.  Reversing
+    // the order means: after current_thread is visible, TSS.RSP0 is
+    // already correct, so peer-observed (current_thread, TSS) is
+    // always consistent.  Periodic TSS-RSP0-AUDIT false positives
+    // from the old order disappear with this fix.
     let t = thread_ref(tid);
     let kbase = t.stack_base;
     if kbase != 0 {
@@ -457,6 +728,8 @@ pub fn set_current_thread(pcpu: &smp::PerCpuData, tid: ThreadId) {
             kbase + kstack_size(),
         );
     }
+    pcpu.current_thread.store(tid, Ordering::Release);
+    record_current_thread_change(cpu, tid as u32);
 }
 
 /// #135 record one transition into the per-thread `trans_ring`.  Each
@@ -1383,6 +1656,33 @@ pub fn trace_point(label: &'static str, subject: u32) {
 #[inline]
 pub fn thread_ref(tid: u32) -> &'static Thread {
     let p = THREAD_TABLE.get(tid) as *const Thread;
+    // #233 slab-range guard: on x86_64, Thread structs live in
+    // SLAB_THREAD_REGION (one 16 KiB window per Thread, 4 KiB mapped at
+    // the TOP).  If THREAD_TABLE[tid] returns a pointer outside this
+    // region, the table entry was corrupted — log + dump before the
+    // caller dereferences and #GPs.  Tids 0..ncpus are idle threads
+    // whose Thread structs come from the boot stack region and predate
+    // SLAB_THREAD; allow those through without the check.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ncpus = smp::num_cpus() as u32;
+        if tid >= ncpus && tid < 100 {
+            let pu = p as u64;
+            let base = crate::arch::x86_64::mm::SLAB_REGION_BASE;
+            let end = base.wrapping_add(0x0000_0080_0000_0000);
+            if pu < base || pu >= end {
+                static OOR_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = OOR_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    crate::println!(
+                        "THREAD-PTR-OOR: tid={} p={:p} not in SLAB_REGION [{:#x}..{:#x}) n={}",
+                        tid, p, base, end, n,
+                    );
+                }
+            }
+        }
+    }
     unsafe { &*p }
 }
 
@@ -2668,6 +2968,18 @@ fn alloc_task_entry() -> Option<*mut Task> {
 
 #[allow(dead_code)]
 fn free_task_entry(p: *mut Task) {
+    // #233 free poison: overwrite the Task struct with 0xFEEDFACE bytes
+    // BEFORE returning the page to the allocator.  Any subsequent
+    // dereference via a stale pointer hits the poison pattern
+    // (0xFEEDFACE_FEEDFACE u64) instead of stale-but-valid-looking
+    // fields, making UAF symptoms loud.  Done before free_page so the
+    // page is still mapped + writable.
+    unsafe {
+        let bytes = p as *mut u8;
+        for off in 0..(page::page_size() as isize) {
+            core::ptr::write_volatile(bytes.offset(off), 0xCE);
+        }
+    }
     phys::free_page(PhysAddr::new(p as usize));
 }
 
@@ -2926,11 +3238,22 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     // snapshot_iretq_shadow → would bail if stack_base==0).  Previously
     // record-then-stack_base order silently dropped snapshots for fresh
     // threads, making FBD silent on freshly-created threads.
+    // #230 canon-race fix: set canonical BEFORE writing stack_phys_base
+    // so periodic sweep can never observe (new_pa, old_canon) state.
+    if id < 100 {
+        spb_set_canonical(id, stack_phys_base as u64);
+    }
     thread.stack_base = stack_base;
     thread.stack_phys_base = stack_phys_base;
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
+    if id < 100 {
+        crate::println!(
+            "KTHREAD-SPAWN: tid={} entry={:#x} prio={} q={}",
+            id, entry as usize, priority, quantum,
+        );
+    }
     thread.sig_mask = 0;
     thread.sig_pending = 0;
 
@@ -3223,11 +3546,39 @@ fn finalize_spawn(
     thread.default_quantum = quantum;
     // #208: stack_base BEFORE record_saved_sp_write (snapshot gate
     // requires stack_base != 0).
+    // #230 canon-race fix: set canonical BEFORE writing stack_phys_base.
+    if thread_id < 100 {
+        spb_set_canonical(thread_id, kstack_phys_base as u64);
+    }
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, frame_sp);
     record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
+    if thread_id < 100 {
+        crate::println!(
+            "KUSER-SPAWN: tid={} task={} entry=spawn_user prio={} q={}",
+            thread_id, task_id, priority, quantum,
+        );
+    }
+    // #233 DR0 watchpoint on tid 34 (linux_srv main thread)'s iretq frame
+    // CS slot.  This is the slot[1] location that's been showing garbage
+    // across boots.  Address is kstack_top - 32 (CS slot = regs[18] at
+    // frame_sp + 144, and frame_sp = kstack_top - 176, so 144-176=-32).
+    // Every CPU lazily re-arms DR0 on this VA at exception entry; ANY
+    // write to slot[1] of tid 34's iretq frame fires #DB → diagnostic
+    // dump exposes the writer's RIP.
+    #[cfg(target_arch = "x86_64")]
+    if thread_id == 34 {
+        let kstack_top = kstack_base + kstack_size();
+        let cs_slot_va = (kstack_top - 32) as u64;
+        crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+            .store(cs_slot_va, Ordering::Release);
+        crate::println!(
+            "DR0-TID34-CS: armed at {:#x} (kstack_top={:#x})",
+            cs_slot_va, kstack_top,
+        );
+    }
     thread.sig_mask = 0;
     thread.sig_pending = 0;
 
@@ -3288,11 +3639,21 @@ fn create_thread_in_task(
     thread.quantum = quantum;
     thread.default_quantum = quantum;
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
+    // #230 canon-race fix: set canonical BEFORE writing stack_phys_base.
+    if id < 100 {
+        spb_set_canonical(id, kstack_phys_base as u64);
+    }
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
+    if id < 100 {
+        crate::println!(
+            "KUSER-SPAWN: tid={} task={} entry={:#x} prio={} q={}",
+            id, task_id, entry, priority, quantum,
+        );
+    }
     thread.exit_code = 0;
     thread.sig_mask = 0;
     thread.sig_pending = 0;
@@ -4144,6 +4505,42 @@ pub fn tick(current_sp: u64) -> u64 {
                     if t.task_id == 0 {
                         continue;
                     }
+                    // #230 SPB periodic check: cheap canonical comparison
+                    // for early tids (<100) on every sweep — catches
+                    // Thread-slab corruption between create and exit, not
+                    // just at drain/kill/exit code paths.
+                    if (tid as usize) < SPB_CANONICAL_MAX {
+                        spb_check(tid, t.stack_phys_base as u64, "periodic_sweep");
+                    }
+                    // #230 kstack canary sweep: detect mid-flight stack
+                    // overflow / scribble of low-end sentinel.  Skips
+                    // in_kstack_region tids automatically (cross-CR3
+                    // visibility — see check_stack_canary impl).
+                    let _ = check_stack_canary(tid, "periodic_sweep");
+                    // #230 stack-overflow near-miss probe: detect tids
+                    // whose saved_sp is within 4 KiB of the low end of
+                    // the kstack — about to overwrite the canary on the
+                    // next push.  Fires BEFORE corruption; canary fires
+                    // AFTER.  Combined catches both windows.
+                    if (tid as usize) < SPB_CANONICAL_MAX && t.stack_base != 0 {
+                        let sp = t.iretq_shadow_sp;
+                        let sb = t.stack_base as u64;
+                        let kstack_lim = sb + kstack_size() as u64;
+                        if sp >= sb && sp <= kstack_lim
+                            && (sp - sb) < 0x1000
+                        {
+                            static HWM_LOG: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(0);
+                            let n = HWM_LOG.fetch_add(1, Ordering::Relaxed);
+                            if n < 8 {
+                                crate::println!(
+                                    "STACK-HWM-NEAR: tid={} sp={:#x} stack_base={:#x} \
+                                     remaining={} n={}",
+                                    tid, sp, sb, sp - sb, n,
+                                );
+                            }
+                        }
+                    }
                     let sp = t.iretq_shadow_sp;
                     if sp == 0 {
                         continue;
@@ -4165,6 +4562,48 @@ pub fn tick(current_sp: u64) -> u64 {
                     check_iretq_shadow_at_dispatch(tid, sp);
                     check_park_stack_ext(tid, sp);
                     checked += 1;
+                }
+                // #230 TSS.RSP0 cross-CPU audit: for each online CPU,
+                // verify its TSS.RSP0 falls within the current_thread's
+                // kstack range.  If the TSS points to a DIFFERENT
+                // thread's kstack (peer's, or a freed one), that's the
+                // smoking gun for the #229 RSP0 cross-confusion hypothesis.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let ncpu = smp::online_cpus();
+                    for cpu in 0..ncpu {
+                        let pcpu = smp::get(cpu);
+                        // #232 Acquire pairs with set_current_thread's
+                        // Release store: if we read NEW tid here, we're
+                        // guaranteed to also see the corresponding TSS
+                        // write that happened before the Release.
+                        let cur_tid = pcpu.current_thread.load(Ordering::Acquire);
+                        if cur_tid == 0 || (cur_tid as usize) >= max_tid as usize {
+                            continue;
+                        }
+                        let t = unsafe { &*(THREAD_TABLE.get(cur_tid) as *const Thread) };
+                        if t.stack_base == 0 {
+                            continue;
+                        }
+                        // Read tss_for(cpu).rsp0 via gdt helper that takes
+                        // an explicit CPU index, not just the current
+                        // CPU's TSS (we're sweeping every CPU's TSS).
+                        let actual = crate::arch::x86_64::gdt::tss_rsp0_for(cpu as usize);
+                        let sb = t.stack_base as u64;
+                        let st = sb + kstack_size() as u64;
+                        if actual < sb || actual > st {
+                            static MISMATCH_LOG: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(0);
+                            let m = MISMATCH_LOG.fetch_add(1, Ordering::Relaxed);
+                            if m < 8 {
+                                crate::println!(
+                                    "TSS-RSP0-AUDIT: cpu={} cur_tid={} tss_rsp0={:#x} \
+                                     expected_kstack=[{:#x}..{:#x}) n={}",
+                                    cpu, cur_tid, actual, sb, st, m,
+                                );
+                            }
+                        }
+                    }
                 }
                 let nlog = SWEEP_SCAN_LOG.fetch_add(1, Ordering::Relaxed);
                 if nlog < 3 || nlog % 10 == 0 {
@@ -4697,9 +5136,11 @@ fn try_switch(current_sp: u64) -> u64 {
         // current thread's stack_phys_base so we never free a stack we're
         // running on.
         let cur_stack = thread_ref(cur_tid).stack_phys_base;
+        spb_check(cur_tid, cur_stack as u64, "drain_cur_check");
         if cur_stack != deferred {
             deferred_kstack()[cpu as usize].store(0, Ordering::Release);
             kstack_pa_audit(deferred, kstack_size(), -1, "free");
+            kstack_pa_unregister(deferred as u64);
             crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
             let dead_tid = deferred_thread()[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
             if dead_tid < RadixTable::capacity() {
@@ -4971,6 +5412,7 @@ fn try_switch(current_sp: u64) -> u64 {
                 // Phase 5b: store PHYS base (not VA) so the deferred drain
                 // can pass it to phys::free_pages directly.
                 let kstack_phys_base = prev_t.stack_phys_base;
+                spb_check(prev_id, kstack_phys_base as u64, "kill_defer");
                 deferred_thread()[cpu as usize].store(prev_id as usize, Ordering::Release);
                 deferred_kstack()[cpu as usize].store(kstack_phys_base, Ordering::Release);
             } else {
@@ -7115,12 +7557,22 @@ pub fn fork_current() -> u64 {
     thread.thread_task.store(child_task_id, Ordering::Relaxed);
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
+    // #230 canon-race fix: set canonical BEFORE writing stack_phys_base.
+    if child_tid < 100 {
+        spb_set_canonical(child_tid, kstack_phys_base as u64);
+    }
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
+    if child_tid < 100 {
+        crate::println!(
+            "KUSER-SPAWN: tid={} task={} entry=fork prio={} q={}",
+            child_tid, child_task_id, parent_priority, parent_quantum,
+        );
+    }
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -7356,12 +7808,22 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.thread_task.store(child_task_id, Ordering::Relaxed);
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
+    // #230 canon-race fix: set canonical BEFORE writing stack_phys_base.
+    if child_tid < 100 {
+        spb_set_canonical(child_tid, kstack_phys_base as u64);
+    }
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
+    if child_tid < 100 {
+        crate::println!(
+            "KUSER-SPAWN: tid={} task={} entry=clone prio={} q={}",
+            child_tid, child_task_id, parent_priority, parent_quantum,
+        );
+    }
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -7476,12 +7938,22 @@ pub fn clone_thread_in_task(
     thread.thread_task.store(task_id, Ordering::Relaxed);
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
+    // #230 canon-race fix: set canonical BEFORE writing stack_phys_base.
+    if child_tid < 100 {
+        spb_set_canonical(child_tid, kstack_phys_base as u64);
+    }
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
+    if child_tid < 100 {
+        crate::println!(
+            "KUSER-SPAWN: tid={} task={} entry=clone3 prio={} q={}",
+            child_tid, task_id, parent_priority, parent_quantum,
+        );
+    }
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -7601,6 +8073,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let task_id = thread.task_id;
         // Phase 5b: use stack_phys_base for deferred_kstack (PA, not VA).
         let kstack_base = thread.stack_phys_base;
+        spb_check(tid, kstack_base as u64, "exit_defer");
         // NOTE: Do NOT set stack_base=0 here. The thread is still running on
         // its CPU. Setting it to 0 would allow alloc_thread_id to reuse the
         // slot before we're actually off the CPU. Instead, try_switch will set

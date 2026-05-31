@@ -200,6 +200,11 @@ pub fn get_rsp0() -> u64 {
     unsafe { (*tss_for(cpu)).rsp0 }
 }
 
+/// #230: read a specific CPU's TSS RSP0 (sweep-time cross-CPU audit).
+pub fn tss_rsp0_for(cpu: usize) -> u64 {
+    unsafe { (*tss_for(cpu)).rsp0 }
+}
+
 /// #208 DR0 watchpoint helpers.  Used to catch the writer that
 /// corrupts iretq frame slots.  Single-CPU watch: arms DR0 on the
 /// calling CPU only; if the writer is on another CPU, this won't
@@ -261,6 +266,111 @@ pub fn dr0_ensure_watching(addr: u64) {
         return;
     }
     dr0_set_watch_write_qword(addr);
+}
+
+/// #233 user-RIP-scribble investigation: arm DR1 on the recurring
+/// scribbled slot (0xfffffe00049ff608) so any write on this CPU
+/// triggers #DB with the writer's RIP.  Static target chosen because
+/// boots 2600/2623/2627/2640 all hit THIS exact VA — strongly
+/// deterministic via the kstack VA bump allocator.
+pub const SLOT_WATCH_VA: u64 = 0xfffffe00049ff608;
+static DR1_WATCH_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub fn dr1_set_watch_write_qword(addr: u64) {
+    DR1_WATCH_ADDR.store(addr, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        // Read current DR7 so we don't clobber other DR bits.
+        let mut cur_dr7: u64;
+        core::arch::asm!("mov {0}, dr7", out(reg) cur_dr7, options(nomem, nostack));
+        // L1 = bit 2; RW1 = bits 20-21 = 0b01 (write); LEN1 = bits 22-23 = 0b10 (8 B).
+        let dr1_bits: u64 = (1u64 << 2) | (0b01u64 << 20) | (0b10u64 << 22);
+        // Clear any prior DR1 config in DR7 then OR new bits.
+        let mask: u64 = (1u64 << 2) | (0b11u64 << 20) | (0b11u64 << 22);
+        cur_dr7 = (cur_dr7 & !mask) | dr1_bits;
+        core::arch::asm!("mov dr1, {0}", in(reg) addr, options(nostack));
+        core::arch::asm!("mov dr7, {0}", in(reg) cur_dr7, options(nostack));
+    }
+}
+
+#[inline]
+pub fn dr1_ensure_watching() {
+    let addr = SLOT_WATCH_VA;
+    let cur_reg: u64;
+    unsafe {
+        core::arch::asm!("mov {0}, dr1", out(reg) cur_reg, options(nomem, nostack));
+    }
+    if cur_reg == addr {
+        return;
+    }
+    dr1_set_watch_write_qword(addr);
+}
+
+/// DR2 watchpoint on the second recurring slot 0xfffffe0000bffd68
+/// (hit by boots 2594/2599/2692/2695 with the second-call ret-target
+/// scribble pattern, multiple tids/cpus).
+pub const SLOT_WATCH_VA_2: u64 = 0xfffffe0000bffd68;
+static DR2_WATCH_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub fn dr2_set_watch_write_qword(addr: u64) {
+    DR2_WATCH_ADDR.store(addr, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let mut cur_dr7: u64;
+        core::arch::asm!("mov {0}, dr7", out(reg) cur_dr7, options(nomem, nostack));
+        // L2 = bit 4; RW2 = bits 24-25 = 0b01 (write); LEN2 = bits 26-27 = 0b10 (8 B).
+        let dr2_bits: u64 = (1u64 << 4) | (0b01u64 << 24) | (0b10u64 << 26);
+        let mask: u64 = (1u64 << 4) | (0b11u64 << 24) | (0b11u64 << 26);
+        cur_dr7 = (cur_dr7 & !mask) | dr2_bits;
+        core::arch::asm!("mov dr2, {0}", in(reg) addr, options(nostack));
+        core::arch::asm!("mov dr7, {0}", in(reg) cur_dr7, options(nostack));
+    }
+}
+
+#[inline]
+pub fn dr2_ensure_watching() {
+    let addr = SLOT_WATCH_VA_2;
+    let cur_reg: u64;
+    unsafe {
+        core::arch::asm!("mov {0}, dr2", out(reg) cur_reg, options(nomem, nostack));
+    }
+    if cur_reg == addr {
+        return;
+    }
+    dr2_set_watch_write_qword(addr);
+}
+
+/// DR3 watchpoint on tid=8's deterministic NULL-write slot
+/// 0xfffffe00013ff628 (boots 2522/2528).
+pub const SLOT_WATCH_VA_3: u64 = 0xfffffe00013ff628;
+static DR3_WATCH_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub fn dr3_set_watch_write_qword(addr: u64) {
+    DR3_WATCH_ADDR.store(addr, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let mut cur_dr7: u64;
+        core::arch::asm!("mov {0}, dr7", out(reg) cur_dr7, options(nomem, nostack));
+        // L3 = bit 6; RW3 = bits 28-29 = 0b01 (write); LEN3 = bits 30-31 = 0b10 (8 B).
+        let dr3_bits: u64 = (1u64 << 6) | (0b01u64 << 28) | (0b10u64 << 30);
+        let mask: u64 = (1u64 << 6) | (0b11u64 << 28) | (0b11u64 << 30);
+        cur_dr7 = (cur_dr7 & !mask) | dr3_bits;
+        core::arch::asm!("mov dr3, {0}", in(reg) addr, options(nostack));
+        core::arch::asm!("mov dr7, {0}", in(reg) cur_dr7, options(nostack));
+    }
+}
+
+#[inline]
+pub fn dr3_ensure_watching() {
+    let addr = SLOT_WATCH_VA_3;
+    let cur_reg: u64;
+    unsafe {
+        core::arch::asm!("mov {0}, dr3", out(reg) cur_reg, options(nomem, nostack));
+    }
+    if cur_reg == addr {
+        return;
+    }
+    dr3_set_watch_write_qword(addr);
 }
 
 /// Read DR6, clear the B0..B3 status bits, return the original value.

@@ -249,6 +249,35 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     crate::sched::stats::SYSCALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::trace::trace_event(crate::trace::EVT_SYSCALL_ENTER, nr as u32, 0);
 
+    // #231 syscall trace for tid=34 (linux_srv main thread, deterministic
+    // #208 crash victim).  Log first N syscalls per boot so we can
+    // identify which one corrupts.  Capture last syscall before any
+    // crash via the trace ring + last-syscall ring below.
+    {
+        let cur_tid = crate::sched::smp::current()
+            .current_thread
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if cur_tid == 34 {
+            use core::sync::atomic::{AtomicU32, AtomicU64, Ordering as O};
+            static T34_LOG: AtomicU32 = AtomicU32::new(0);
+            // Tail ring: last 8 syscall numbers, indexed mod 8 — survives
+            // when verbose logging is disabled.
+            static T34_RING_NR: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+            static T34_RING_RIP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+            static T34_RING_POS: AtomicU32 = AtomicU32::new(0);
+            let pos = T34_RING_POS.fetch_add(1, O::Relaxed) as usize & 7;
+            T34_RING_NR[pos].store(nr as u64, O::Relaxed);
+            T34_RING_RIP[pos].store(frame.rip(), O::Relaxed);
+            let n = T34_LOG.fetch_add(1, O::Relaxed);
+            if n < 64 {
+                crate::println!(
+                    "T34-SYSCALL: nr={} rip={:#x} a0={:#x} a1={:#x} n={}",
+                    nr, frame.rip(), a0, a1, n,
+                );
+            }
+        }
+    }
+
     // --- Personality routing ---
     // If this task has a non-native personality, forward the syscall to the
     // personality server — unless it's a personality management syscall which

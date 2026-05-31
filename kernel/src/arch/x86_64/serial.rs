@@ -170,6 +170,27 @@ impl fmt::Write for DirectUart {
     }
 }
 
+/// Emit a pre-formatted byte buffer to the serial port without going
+/// through core::fmt.  Used by handler probes that already formatted
+/// via a thin hex writer to keep the kstack frame small.
+///
+/// Takes PRINT_LOCK to prevent interleaving with other CPUs' prints;
+/// IRQs are NOT disabled because callers are already in IRQ context.
+pub fn handler_write_bytes(bytes: &[u8]) {
+    init_uart_fifo_once();
+    // Acquire PRINT_LOCK by busy-waiting (we may be in an IRQ handler,
+    // so just spin until it's available).  Skip the lock-holder check
+    // because we're not at risk of self-deadlock here.
+    while PRINT_LOCK
+        .compare_exchange(0, 1, AOrdering::Acquire, AOrdering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    Serial.push_bytes(bytes);
+    PRINT_LOCK.store(0, AOrdering::Release);
+}
+
 /// Atomically format and emit `args` under the global PRINT_LOCK using
 /// DirectUart's byte-by-byte writes (no per-CPU buffer, no internal
 /// state).  Holds PRINT_LOCK with IRQs disabled across the whole emit
@@ -245,7 +266,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, Ordering as AOrdering};
 static PRINT_LOCK: AtomicU32 = AtomicU32::new(0);
 /// CPU id of the current PRINT_LOCK holder, or -1 if free.  Set under
 /// the lock; checked before attempting to acquire (re-entry guard).
-static PRINT_HOLDER_CPU: AtomicI32 = AtomicI32::new(-1);
+pub(crate) static PRINT_HOLDER_CPU: AtomicI32 = AtomicI32::new(-1);
 
 /// #154 print buffer size.  2048 bytes is enough for the long-form
 /// rescue/IPI-CNT/CLI-TOP debug lines (typically 100-500 bytes each);
@@ -322,6 +343,24 @@ static PRINT_BUFS: [CpuPrintBufs; MAX_PRINT_CPUS] = [const {
     }
 }; MAX_PRINT_CPUS];
 
+/// Per-CPU fallback buffers used when the primary slot is busy
+/// (e.g., IRQ re-entry during in-progress _print).  Promoted off the
+/// stack to keep the kstack frame small even on the fall-through path
+/// — was 768 B of locals (`[0u8;256] + [0u8;512]`).
+struct CpuFallbackBufs {
+    fmt: UnsafeCell<[u8; 256]>,
+    wire: UnsafeCell<[u8; 512]>,
+    busy: AtomicBool,
+}
+unsafe impl Sync for CpuFallbackBufs {}
+static FALLBACK_BUFS: [CpuFallbackBufs; MAX_PRINT_CPUS] = [const {
+    CpuFallbackBufs {
+        fmt: UnsafeCell::new([0u8; 256]),
+        wire: UnsafeCell::new([0u8; 512]),
+        busy: AtomicBool::new(false),
+    }
+}; MAX_PRINT_CPUS];
+
 /// Slice-based fmt::Write adapter — writes into a caller-provided
 /// mutable slice + length counter.  Used to format into the per-CPU
 /// static fmt buffer without allocating any stack frame.
@@ -369,16 +408,35 @@ pub fn _print(args: fmt::Arguments) {
 
     let mut fmt_len: usize = 0;
     let mut wire_len: usize = 0;
-    let mut fallback_fmt = [0u8; 256];
-    let mut fallback_wire = [0u8; 512];
 
-    // Split borrow: get raw pointers to the per-CPU buffers (or fall
-    // through to the fallback arrays).  We hold the busy flag, so no
-    // other path on this CPU touches the per-CPU buffers concurrently.
+    // Acquire fallback slot if primary wasn't available.  If even fallback
+    // is busy (re-entry of re-entry), skip the print entirely — better
+    // than scribbling on the kstack via stack-allocated locals.
+    let fallback_slot = if slot.is_none() && cpu < MAX_PRINT_CPUS {
+        let s = &FALLBACK_BUFS[cpu];
+        if s.busy.compare_exchange(
+            false, true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ).is_ok() {
+            Some(s)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Split borrow: get raw pointers to the per-CPU buffers (or the static
+    // fallback). If neither available, bail entirely.
     let (fmt_buf, wire_buf): (&mut [u8], &mut [u8]) = if let Some(s) = slot {
         unsafe { (&mut *s.fmt.get(), &mut *s.wire.get()) }
+    } else if let Some(s) = fallback_slot {
+        unsafe { (&mut *s.fmt.get(), &mut *s.wire.get()) }
     } else {
-        (&mut fallback_fmt[..], &mut fallback_wire[..])
+        // Both primary and fallback busy — drop the print.  Going to a
+        // stack-local buffer here is what we're trying to avoid.
+        return;
     };
 
     // Phase 1: format into fmt_buf with IRQs ON.
@@ -451,6 +509,9 @@ pub fn _print(args: fmt::Arguments) {
     // last ensures no peer (IRQ-context reentry on this CPU) tries to
     // reuse it while we're still reading.
     if let Some(s) = slot {
+        s.busy.store(false, core::sync::atomic::Ordering::Release);
+    }
+    if let Some(s) = fallback_slot {
         s.busy.store(false, core::sync::atomic::Ordering::Release);
     }
 }
