@@ -51,7 +51,9 @@ impl PortSet {
             return true;
         }
         let page = match phys::alloc_page() {
-            Some(pa) => pa.as_usize() as *mut PortId,
+            // #235 Phase 4b: store ports as PHYS_DIRECT_MAP kva; destroy
+            // converts back to PA via kva_to_phys.
+            Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut PortId,
             None => return false,
         };
         unsafe {
@@ -107,7 +109,9 @@ impl PortSet {
         // Free the backing page if allocated.
         if !self.ports.is_null() {
             unsafe {
-                phys::free_page(page::PhysAddr::new(self.ports as usize));
+                phys::free_page(page::PhysAddr::new(
+                    crate::mm::page::kva_to_phys(self.ports as usize),
+                ));
             }
             self.ports = core::ptr::null_mut();
         }

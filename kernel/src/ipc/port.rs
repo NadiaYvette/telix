@@ -190,7 +190,10 @@ const fn mpsc_capacity_for_size(alloc_size: usize) -> u32 {
 /// Allocate a default MPSC queue from the slab allocator.
 fn alloc_mpsc_queue() -> Option<*mut MpscQueue> {
     let pa = crate::mm::slab::alloc(PORT_QUEUE_SLAB_SIZE)?;
-    let ptr = pa.as_usize() as *mut MpscQueue;
+    // #235 Phase 4b: return a PHYS_DIRECT_MAP pointer so deref + storage
+    // in Port.mpsc_ptr survive PML4[0] unmap.  free_mpsc_queue converts
+    // back to PA via kva_to_phys.
+    let ptr = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut MpscQueue;
     let cap = mpsc_capacity_for_size(PORT_QUEUE_SLAB_SIZE);
     unsafe {
         core::ptr::write_bytes(ptr as *mut u8, 0, PORT_QUEUE_SLAB_SIZE);
@@ -203,7 +206,7 @@ fn alloc_mpsc_queue() -> Option<*mut MpscQueue> {
 /// Allocate a page-backed MPSC queue.
 fn alloc_mpsc_page_queue() -> Option<*mut MpscQueue> {
     let pa = crate::mm::phys::alloc_page()?;
-    let ptr = pa.as_usize() as *mut MpscQueue;
+    let ptr = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut MpscQueue;
     let ps = crate::mm::page::page_size();
     let cap = mpsc_capacity_for_size(ps);
     unsafe {
@@ -217,10 +220,12 @@ fn alloc_mpsc_page_queue() -> Option<*mut MpscQueue> {
 /// Free an MPSC queue (slab or page-backed).
 fn free_mpsc_queue(ptr: *mut MpscQueue) {
     let page_backed = unsafe { (*ptr).page_backed };
+    // ptr is a PHYS_DIRECT_MAP kva; recover the PA at the free edge.
+    let pa = crate::mm::page::kva_to_phys(ptr as usize);
     if page_backed {
-        crate::mm::phys::free_page(PhysAddr::new(ptr as usize));
+        crate::mm::phys::free_page(PhysAddr::new(pa));
     } else {
-        crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_QUEUE_SLAB_SIZE);
+        crate::mm::slab::free(PhysAddr::new(pa), PORT_QUEUE_SLAB_SIZE);
     }
 }
 
@@ -305,7 +310,7 @@ impl Port {
 /// Allocate a Port from the slab allocator with an MPSC queue.
 fn alloc_port(id: PortId, with_queue: bool) -> Option<*mut Port> {
     let pa = crate::mm::slab::alloc(PORT_SLAB_SIZE)?;
-    let ptr = pa.as_usize() as *mut Port;
+    let ptr = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Port;
 
     let mpsc = if with_queue {
         match alloc_mpsc_queue() {
@@ -336,7 +341,10 @@ fn free_port(ptr: *mut Port) {
     if mpsc != 0 {
         free_mpsc_queue(mpsc as *mut MpscQueue);
     }
-    crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_SLAB_SIZE);
+    crate::mm::slab::free(
+        PhysAddr::new(crate::mm::page::kva_to_phys(ptr as usize)),
+        PORT_SLAB_SIZE,
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -80,7 +80,10 @@ const LEAF_SLAB: usize = 64;
 
 fn alloc_leaf(key: u64, value: usize) -> Option<*mut Leaf> {
     let pa = slab::alloc(LEAF_SLAB)?;
-    let p = pa.as_usize() as *mut Leaf;
+    // #235 Phase 4b: pointers stored in ART nodes are PHYS_DIRECT_MAP
+    // kvas so deref + child-walk survive PML4[0] unmap.  free + RCU
+    // defer-free convert back to PA via kva_to_phys at the edge.
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Leaf;
     unsafe {
         (*p).key = key;
         (*p).value = value;
@@ -89,12 +92,16 @@ fn alloc_leaf(key: u64, value: usize) -> Option<*mut Leaf> {
 }
 
 fn free_leaf(p: *mut Leaf) {
-    slab::free(PhysAddr::new(p as usize), LEAF_SLAB);
+    slab::free(
+        PhysAddr::new(crate::mm::page::kva_to_phys(p as usize)),
+        LEAF_SLAB,
+    );
 }
 
 /// Defer-free a published leaf (reclaimed after RCU grace period).
 fn rcu_defer_free_leaf(p: *mut Leaf) {
-    crate::sync::rcu::rcu_defer_free(p as usize, crate::sync::rcu::free_slab64_callback);
+    let pa = crate::mm::page::kva_to_phys(p as usize);
+    crate::sync::rcu::rcu_defer_free(pa, crate::sync::rcu::free_slab64_callback);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +138,7 @@ struct Node4 {
 
 fn alloc_node4(partial: &[u8]) -> Option<*mut Node4> {
     let pa = slab::alloc(NODE4_SLAB)?;
-    let p = pa.as_usize() as *mut Node4;
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Node4;
     unsafe {
         core::ptr::write_bytes(p as *mut u8, 0, NODE4_SLAB);
         (*p).h.node_type = NODE4;
@@ -158,7 +165,7 @@ struct Node16 {
 
 fn alloc_node16(partial: &[u8]) -> Option<*mut Node16> {
     let pa = slab::alloc(NODE16_SLAB)?;
-    let p = pa.as_usize() as *mut Node16;
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Node16;
     unsafe {
         // Source-aliasing guard: if `partial` points into the slab block
         // we just got back, write_bytes would zero the source bytes
@@ -191,7 +198,7 @@ struct Node256 {
 /// Allocate a Node256 from a raw physical page (too large for slab).
 fn alloc_node256(partial: &[u8]) -> Option<*mut Node256> {
     let pa = phys::alloc_page()?;
-    let p = pa.as_usize() as *mut Node256;
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Node256;
     unsafe {
         core::ptr::write_bytes(p as *mut u8, 0, crate::mm::page::page_size());
         (*p).h.node_type = NODE256;
@@ -210,10 +217,12 @@ fn alloc_node256(partial: &[u8]) -> Option<*mut Node256> {
 unsafe fn free_node(ptr: usize) {
     unsafe {
         let h = &*(ptr as *const Header);
+        // ptr is a PHYS_DIRECT_MAP kva; recover PA at the free edge.
+        let pa = crate::mm::page::kva_to_phys(ptr);
         match h.node_type {
-            NODE4 => slab::free(PhysAddr::new(ptr), NODE4_SLAB),
-            NODE16 => slab::free(PhysAddr::new(ptr), NODE16_SLAB),
-            NODE256 => phys::free_page(PhysAddr::new(ptr)),
+            NODE4 => slab::free(PhysAddr::new(pa), NODE4_SLAB),
+            NODE16 => slab::free(PhysAddr::new(pa), NODE16_SLAB),
+            NODE256 => phys::free_page(PhysAddr::new(pa)),
             _ => {}
         }
     }
@@ -230,7 +239,9 @@ fn rcu_defer_free_node(ptr: usize) {
             _ => return,
         }
     };
-    crate::sync::rcu::rcu_defer_free(ptr, free_fn);
+    // RCU callbacks take a PA; recover before deferring.
+    let pa = crate::mm::page::kva_to_phys(ptr);
+    crate::sync::rcu::rcu_defer_free(pa, free_fn);
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1028,10 @@ unsafe fn split_leaves(
 
         let diverge = depth + prefix_len;
         if diverge >= KEY_LEN {
-            slab::free(PhysAddr::new(node as usize), NODE4_SLAB);
+            slab::free(
+                PhysAddr::new(crate::mm::page::kva_to_phys(node as usize)),
+                NODE4_SLAB,
+            );
             return false;
         }
 

@@ -259,7 +259,9 @@ static NEXT_ASPACE_SEQ: AtomicU32 = AtomicU32::new(1);
 /// Allocate a new ASpaceEntry from slab.
 fn alloc_entry() -> Option<*mut ASpaceEntry> {
     let pa = slab::alloc(ASPACE_SLAB_SIZE)?;
-    let p = pa.as_usize() as *mut ASpaceEntry;
+    // #235 Phase 4b: PHYS_DIRECT_MAP kva storage; free_entry undoes
+    // via kva_to_phys.
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut ASpaceEntry;
     unsafe {
         core::ptr::write_bytes(p as *mut u8, 0, ASPACE_SLAB_SIZE);
     }
@@ -268,7 +270,10 @@ fn alloc_entry() -> Option<*mut ASpaceEntry> {
 
 /// Free an ASpaceEntry back to slab.
 fn free_entry(ptr: *mut ASpaceEntry) {
-    slab::free(PhysAddr::new(ptr as usize), ASPACE_SLAB_SIZE);
+    slab::free(
+        PhysAddr::new(crate::mm::page::kva_to_phys(ptr as usize)),
+        ASPACE_SLAB_SIZE,
+    );
 }
 
 /// Kernel port handler for address spaces (stub — not used for IPC).
@@ -788,7 +793,7 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
     const ENTRIES_PER_PAGE: usize = page::MAX_PAGE_SIZE / core::mem::size_of::<CowEntry>();
 
     let cow_page = super::phys::alloc_page()?;
-    let cow_buf = cow_page.as_usize() as *mut CowEntry;
+    let cow_buf = crate::mm::page::phys_to_kva(cow_page.as_usize()) as *mut CowEntry;
     unsafe {
         core::ptr::write_bytes(cow_buf as *mut u8, 0, page::page_size());
     }

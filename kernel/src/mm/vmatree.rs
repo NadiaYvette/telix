@@ -63,7 +63,8 @@ pub(crate) struct LeafNode {
 fn alloc_node() -> *mut u8 {
     match slab::alloc(NODE_SLAB_SIZE) {
         Some(pa) => {
-            let p = pa.as_usize() as *mut u8;
+            // #235 Phase 4b: PHYS_DIRECT_MAP kva storage.
+            let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8;
             unsafe { ptr::write_bytes(p, 0, NODE_SLAB_SIZE) };
             p
         }
@@ -73,7 +74,10 @@ fn alloc_node() -> *mut u8 {
 
 fn free_node(p: *mut u8) {
     if !p.is_null() {
-        slab::free(PhysAddr::new(p as usize), NODE_SLAB_SIZE);
+        slab::free(
+            PhysAddr::new(crate::mm::page::kva_to_phys(p as usize)),
+            NODE_SLAB_SIZE,
+        );
     }
 }
 
@@ -88,7 +92,7 @@ fn alloc_vma() -> *mut Vma {
     );
     match slab::alloc(VMA_SLAB_SIZE) {
         Some(pa) => {
-            let p = pa.as_usize() as *mut Vma;
+            let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Vma;
             unsafe { p.write(Vma::empty()) };
             p
         }
@@ -98,7 +102,10 @@ fn alloc_vma() -> *mut Vma {
 
 fn free_vma(p: *mut Vma) {
     if !p.is_null() {
-        slab::free(PhysAddr::new(p as usize), VMA_SLAB_SIZE);
+        slab::free(
+            PhysAddr::new(crate::mm::page::kva_to_phys(p as usize)),
+            VMA_SLAB_SIZE,
+        );
     }
 }
 
