@@ -344,10 +344,14 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
     // hits the other VA that's still mapped to it — a SCRIBBLE.
     record_kstack_write(pa.as_usize() as u64, ksize as u32, 1);
     // Phase 5b: zero via the existing identity map (still active in
-    // PML4[0]) since we haven't switched away from it.  Once the VA
-    // window is mapped below, both views reach the same phys.
+    // PML4[507] direct map) so the zero survives PML4[0] unmap (#235);
+    // the subsequent VA window mapping below points to the same RAM.
     unsafe {
-        core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, ksize);
+        core::ptr::write_bytes(
+            crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
+            0,
+            ksize,
+        );
     }
     // Phase 5b: reserve a 2 MiB VA window and map the phys pages into
     // its TOP `ksize` bytes.  The remaining VA below the kstack is
@@ -2910,7 +2914,7 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
         );
         unsafe {
             core::ptr::write_bytes(
-                pa.as_usize() as *mut u8,
+                crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
                 0,
                 crate::mm::page::page_size(),
             );

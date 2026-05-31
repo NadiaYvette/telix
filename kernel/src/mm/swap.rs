@@ -163,13 +163,13 @@ impl RamBackend {
             Some(p) => p,
             None => return SwapIoResult::Io,
         };
-        // Safety: both addresses are kernel-identity-mapped phys pages
-        // of size page::page_size(); they never overlap (distinct slot
-        // allocations).
+        // #235: both addresses reach the same RAM via PHYS_DIRECT_MAP
+        // (PML4[507]) so the copy survives PML4[0] unmap; distinct slot
+        // allocations never overlap.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                src_pa.as_usize() as *const u8,
-                dst as *mut u8,
+                crate::mm::page::phys_to_kva(src_pa.as_usize()) as *const u8,
+                crate::mm::page::phys_to_kva(dst as usize) as *mut u8,
                 page::page_size(),
             );
         }
@@ -183,8 +183,8 @@ impl RamBackend {
         };
         unsafe {
             core::ptr::copy_nonoverlapping(
-                src as *const u8,
-                dst_pa.as_usize() as *mut u8,
+                crate::mm::page::phys_to_kva(src as usize) as *const u8,
+                crate::mm::page::phys_to_kva(dst_pa.as_usize()) as *mut u8,
                 page::page_size(),
             );
         }

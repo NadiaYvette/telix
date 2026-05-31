@@ -1042,7 +1042,11 @@ fn test_demand_paging() {
     let pt_root = {
         let pa = mm::phys::alloc_page().expect("alloc pt root");
         unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
+            core::ptr::write_bytes(
+                mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
+                0,
+                mm::page::MMUPAGE_SIZE,
+            );
         }
         pa.as_usize()
     };
@@ -1224,7 +1228,11 @@ fn test_swap_e2e() {
     let pt_root = {
         let pa = mm::phys::alloc_page().expect("swap e2e pt root");
         unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, MMUPAGE_SIZE);
+            core::ptr::write_bytes(
+                mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
+                0,
+                MMUPAGE_SIZE,
+            );
         }
         pa.as_usize()
     };
