@@ -110,6 +110,22 @@ pub fn phys_to_kva(pa: usize) -> usize {
     }
 }
 
+/// Inverse of `phys_to_kva`.  Recovers the physical address backing a
+/// kernel VA that was obtained from the direct/identity map.  Used at
+/// free sites where we previously stored a pointer (now a kva) and
+/// need to construct a `PhysAddr` to return the page to the allocator.
+#[inline]
+pub fn kva_to_phys(va: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::mm::kva_to_phys(va)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        va
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Superpage (large page) level table — architecture-dependent
 // ---------------------------------------------------------------------------

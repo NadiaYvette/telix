@@ -222,21 +222,21 @@ fn pack_inline(indices: &[u32]) -> u64 {
 /// free page that is currently serving as a bitmap page.
 unsafe fn read_bitmap(pa: usize) -> u64 {
     unsafe {
-        let ptr = pa as *const AtomicU64;
+        let ptr = crate::mm::page::phys_to_kva(pa) as *const AtomicU64;
         (*ptr).load(Ordering::Acquire)
     }
 }
 
 unsafe fn write_bitmap(pa: usize, val: u64) {
     unsafe {
-        let ptr = pa as *const AtomicU64;
+        let ptr = crate::mm::page::phys_to_kva(pa) as *const AtomicU64;
         (*ptr).store(val, Ordering::Release);
     }
 }
 
 unsafe fn cas_bitmap(pa: usize, old: u64, new: u64) -> Result<u64, u64> {
     unsafe {
-        let ptr = pa as *const AtomicU64;
+        let ptr = crate::mm::page::phys_to_kva(pa) as *const AtomicU64;
         (*ptr).compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
     }
 }
