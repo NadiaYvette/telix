@@ -79,10 +79,14 @@ impl PtShareTable {
             Some(p) => p,
             None => return false,
         };
+        // #235 Phase 2b: store buckets as a PHYS_DIRECT_MAP VA so .add(idx)
+        // and deref work without PML4[0] identity.  drop_backing converts
+        // back to PA via kva_to_phys.
+        let kva = crate::mm::page::phys_to_kva(page.as_usize());
         unsafe {
-            core::ptr::write_bytes(page.as_usize() as *mut u8, 0, page::page_size());
+            core::ptr::write_bytes(kva as *mut u8, 0, page::page_size());
         }
-        self.buckets = page.as_usize() as *mut Bucket;
+        self.buckets = kva as *mut Bucket;
         self.capacity = buckets_per_page();
         true
     }
@@ -137,13 +141,15 @@ impl PtShareTable {
         };
         let new_pages = (new_cap * BUCKET_SIZE + ps - 1) / ps;
 
-        // Allocate new backing pages.
-        let first_page = match super::phys::alloc_page() {
+        // Allocate new backing pages.  Store kva pointers so deref + free
+        // work post-PML4[0]-unmap; recover PAs at free sites via kva_to_phys.
+        let first_pa = match super::phys::alloc_page() {
             Some(p) => p.as_usize(),
             None => return false,
         };
+        let first_kva = crate::mm::page::phys_to_kva(first_pa);
         unsafe {
-            core::ptr::write_bytes(first_page as *mut u8, 0, ps);
+            core::ptr::write_bytes(first_kva as *mut u8, 0, ps);
         }
 
         // For multi-page tables, allocate contiguous pages.
@@ -159,20 +165,21 @@ impl PtShareTable {
                 o
             };
             // Free the single page we just allocated and get a contiguous block.
-            super::phys::free_page(PhysAddr::new(first_page));
-            let block = match super::phys::alloc_pages(order) {
+            super::phys::free_page(PhysAddr::new(first_pa));
+            let block_pa = match super::phys::alloc_pages(order) {
                 Some(p) => p.as_usize(),
                 None => return false,
             };
+            let block_kva = crate::mm::page::phys_to_kva(block_pa);
             unsafe {
-                core::ptr::write_bytes(block as *mut u8, 0, new_pages * ps);
+                core::ptr::write_bytes(block_kva as *mut u8, 0, new_pages * ps);
             }
-            let new_buckets = block as *mut Bucket;
+            let new_buckets = block_kva as *mut Bucket;
             self.rehash_into(new_buckets, new_cap);
             return true;
         }
 
-        let new_buckets = first_page as *mut Bucket;
+        let new_buckets = first_kva as *mut Bucket;
         self.rehash_into(new_buckets, new_cap);
         true
     }
@@ -197,12 +204,14 @@ impl PtShareTable {
             }
         }
 
-        // Free old backing.
+        // Free old backing.  buckets is a kva; recover the PA before
+        // handing back to the phys allocator.
         if !old_buckets.is_null() {
             let ps = page::page_size();
             let old_pages = (old_cap * BUCKET_SIZE + ps - 1) / ps;
+            let old_pa = crate::mm::page::kva_to_phys(old_buckets as usize);
             if old_pages == 1 {
-                super::phys::free_page(PhysAddr::new(old_buckets as usize));
+                super::phys::free_page(PhysAddr::new(old_pa));
             } else {
                 let order = {
                     let mut o = 0;
@@ -213,7 +222,7 @@ impl PtShareTable {
                     }
                     o
                 };
-                super::phys::free_pages(PhysAddr::new(old_buckets as usize), order);
+                super::phys::free_pages(PhysAddr::new(old_pa), order);
             }
         }
 
@@ -318,8 +327,10 @@ impl PtShareTable {
         }
         let ps = page::page_size();
         let pages = (self.capacity * BUCKET_SIZE + ps - 1) / ps;
+        // #235 Phase 2b: buckets is a kva pointer; recover PA at free edge.
+        let pa = crate::mm::page::kva_to_phys(self.buckets as usize);
         if pages == 1 {
-            super::phys::free_page(PhysAddr::new(self.buckets as usize));
+            super::phys::free_page(PhysAddr::new(pa));
         } else {
             let order = {
                 let mut o = 0;
@@ -330,7 +341,7 @@ impl PtShareTable {
                 }
                 o
             };
-            super::phys::free_pages(PhysAddr::new(self.buckets as usize), order);
+            super::phys::free_pages(PhysAddr::new(pa), order);
         }
         self.buckets = core::ptr::null_mut();
         self.capacity = 0;
@@ -368,7 +379,10 @@ impl ForkGroup {
             Some(p) => p,
             None => return core::ptr::null_mut(),
         };
-        let ptr = pa.as_usize() as *mut ForkGroup;
+        // #235 Phase 2b: return a PHYS_DIRECT_MAP pointer so callers'
+        // deref + method invocations work without PML4[0] identity.
+        // `release` converts back to PA via kva_to_phys before slab::free.
+        let ptr = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut ForkGroup;
         unsafe {
             core::ptr::write(
                 ptr,
@@ -402,7 +416,10 @@ impl ForkGroup {
             unsafe {
                 (*fg).table.lock().drop_backing();
             }
-            super::slab::free(PhysAddr::new(fg as usize), FORK_GROUP_SLAB_SIZE);
+            super::slab::free(
+                PhysAddr::new(crate::mm::page::kva_to_phys(fg as usize)),
+                FORK_GROUP_SLAB_SIZE,
+            );
         }
     }
 
