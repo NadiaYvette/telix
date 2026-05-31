@@ -213,7 +213,9 @@ pub fn rcu_defer_free(ptr: usize, free_fn: fn(usize)) {
     // Ensure we have a current batch.
     if state.current.is_null() {
         if let Some(page) = crate::mm::phys::alloc_page() {
-            let batch = page.as_usize() as *mut RcuBatch;
+            // #235 Phase 4c: PHYS_DIRECT_MAP kva storage; free site
+            // converts via kva_to_phys.
+            let batch = crate::mm::page::phys_to_kva(page.as_usize()) as *mut RcuBatch;
             unsafe {
                 (*batch).next = core::ptr::null_mut();
                 (*batch).epoch = rcu_gen()[cpu].load(Ordering::Relaxed);
@@ -306,7 +308,9 @@ fn rcu_process_callbacks(cpu: usize) {
             unsafe {
                 *prev = next;
             }
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(batch as usize));
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(
+                crate::mm::page::kva_to_phys(batch as usize),
+            ));
         } else {
             prev = unsafe { &mut (*batch).next };
         }

@@ -149,7 +149,11 @@ pub fn zero_daemon() -> ! {
         // Pool clients are user-page allocators (mm::fault, personality
         // mmap) — see mm::ANON_POISON_BYTE.
         unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, crate::mm::ANON_POISON_BYTE, page::page_size());
+            core::ptr::write_bytes(
+                crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
+                crate::mm::ANON_POISON_BYTE,
+                page::page_size(),
+            );
         }
 
         // Push the zeroed page into the pool.

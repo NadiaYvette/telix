@@ -67,7 +67,8 @@ impl PagerFaultTable {
         if self.entries.is_null() {
             let ps = page::page_size();
             let page = match super::phys::alloc_page() {
-                Some(pa) => pa.as_usize() as *mut PagerFaultEntry,
+                // #235 Phase 4c: PHYS_DIRECT_MAP kva storage.
+                Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut PagerFaultEntry,
                 None => return false,
             };
             unsafe {

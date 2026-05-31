@@ -351,7 +351,8 @@ impl RadixTable {
     pub fn init(&self) {
         let pa = phys::alloc_page().expect("radix L0 alloc");
         crate::sched::scheduler::record_pa_alias_check(pa.as_usize(), "radix-L0");
-        let p = pa.as_usize() as *mut u8;
+        // #235 Phase 4c: PHYS_DIRECT_MAP kva storage.
+        let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8;
         unsafe {
             ptr::write_bytes(p, 0, page::page_size());
         }
@@ -474,7 +475,8 @@ impl RadixTable {
         // a kstack.  If so, writes through the kstack VA will scribble
         // this L1 page — the THREAD_TABLE[4] corruption signature.
         crate::sched::scheduler::record_pa_alias_check(pa.as_usize(), "radix-L1");
-        let p = pa.as_usize() as *mut u8;
+        // #235 Phase 4c: PHYS_DIRECT_MAP kva storage.
+        let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8;
         unsafe {
             ptr::write_bytes(p, 0, page::page_size());
         }

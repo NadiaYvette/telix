@@ -128,7 +128,8 @@ const NODE_SLAB_SIZE: usize = 512;
 fn alloc_node() -> *mut u8 {
     match slab::alloc(NODE_SLAB_SIZE) {
         Some(pa) => {
-            let p = pa.as_usize() as *mut u8;
+            // #235 Phase 4c: PHYS_DIRECT_MAP kva storage; free_node undoes.
+            let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8;
             unsafe { ptr::write_bytes(p, 0, NODE_SLAB_SIZE) };
             p
         }
@@ -138,7 +139,10 @@ fn alloc_node() -> *mut u8 {
 
 fn free_node(p: *mut u8) {
     if !p.is_null() {
-        slab::free(PhysAddr::new(p as usize), NODE_SLAB_SIZE);
+        slab::free(
+            PhysAddr::new(crate::mm::page::kva_to_phys(p as usize)),
+            NODE_SLAB_SIZE,
+        );
     }
 }
 

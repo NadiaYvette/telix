@@ -37,7 +37,8 @@ impl CNode {
             return true;
         }
         let page = match phys::alloc_page() {
-            Some(pa) => pa.as_usize() as *mut Capability,
+            // #235 Phase 4c: PHYS_DIRECT_MAP kva storage.
+            Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Capability,
             None => return false,
         };
         // Zero-initialize — null capabilities have all zero bytes.

@@ -63,7 +63,8 @@ fn ensure_init() -> *mut IrqWaiter {
     // Allocate and zero-init a page. Zero-init gives:
     //   thread_id = 0 (no waiter), mmio_base = 0 (not registered), pending = false.
     let page = match crate::mm::phys::alloc_page() {
-        Some(pa) => pa.as_usize() as *mut IrqWaiter,
+        // #235 Phase 4c: PHYS_DIRECT_MAP kva storage.
+        Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut IrqWaiter,
         None => return core::ptr::null_mut(),
     };
     unsafe {
@@ -79,7 +80,9 @@ fn ensure_init() -> *mut IrqWaiter {
     ) {
         Ok(_) => page,
         Err(winner) => {
-            crate::mm::phys::free_page(page::PhysAddr::new(page as usize));
+            crate::mm::phys::free_page(page::PhysAddr::new(
+                crate::mm::page::kva_to_phys(page as usize),
+            ));
             winner
         }
     }
