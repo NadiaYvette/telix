@@ -6,33 +6,32 @@
 
 # Telix minimal userspace package selection.
 #
+# Real T2 pkgsel format (per t2sde/scripts/config-functions.lua
+# `pkgsel_parse`): each line is `<action> <pattern>` where action is
+# X (select), O (unselect), - (remove from list), = (baseline), or
+# `include` (sub-file).  Pattern is glob — `*` is anything.
+#
 # Differs from T2's `embedded-minimal/pkgsel`:
-#   - linux + linux-header DROPPED — Telix supplies its own kernel
-#     via its Linux personality.  We only want the userspace tree.
-#   - No dropbear by default — Telix doesn't need SSH yet; add it
-#     once a network stack maturity story for personality lands.
-#
-# The toolchain (binutils/gmp/mpfr/gcc) is still built for now to
-# bootstrap the package builds; T2 itself uses it as the
-# cross-/native-compiler.  These artifacts are NOT shipped to
-# Telix — only the payload binaries are.
-#
-# To run this target with T2:
-#   1. Sync this directory into your t2sde checkout at
-#      target/tlx-min/ (use tools/t2/sync-target.sh).
-#   2. ./t2 config --cfg telix-min  (and select target=tlx-min).
-#   3. ./t2 build
-#   4. Output ends up under build/telix-min-<ver>-<arch>/
-#      The payload is in pkg/* (per package) or in
-#      build/.../rootfs/ as a unified tree.
+#   - No `linux` / `linux-header` — Telix supplies its own kernel
+#     via its Linux personality.
+#   - No `dropbear` — no SSH until the personality has a usable
+#     network story.
 
-# Toolchain stage (rebuilt; not shipped to Telix).
-[O] toolchain                = binutils
-[O] toolchain                = gmp
-[O] toolchain                = mpfr
-[O] toolchain                = gcc
+# Start by deselecting everything.
+O *
 
-# Payload stage (these are what we ship to Telix).
-[O] payload                  = 00-dirtree
-[O] payload                  = busybox
-[O] payload                  = zlib
+# Toolchain (built in stages 0/1 — required to bootstrap any payload,
+# not shipped to Telix).
+X binutils
+X gmp
+X mpfr
+X mpc
+X gcc
+
+# Libc (overridden via SDECFG_LIBC at config-write time; default glibc).
+X glibc
+
+# Payload — actually shipped to Telix via install-into-initramfs.sh.
+X 00-dirtree
+X busybox
+X zlib
