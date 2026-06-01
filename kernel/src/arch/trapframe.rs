@@ -217,6 +217,33 @@ pub fn set_reg(frame: &mut ExceptionFrame, reg: usize, val: u64) {
 // ---------------------------------------------------------------------------
 
 /// Read the user-space stack pointer from the frame.
+/// Read the program counter / instruction pointer from an exception
+/// frame.  Portable accessor: x86_64's `rip`, aarch64's `elr`, RISC-V's
+/// `sepc`, LoongArch's `era`, MIPS's `epc`.
+#[inline]
+pub fn frame_pc(frame: &ExceptionFrame) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        frame.elr
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        frame.sepc
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        frame.rip()
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        frame.era
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        frame.epc
+    }
+}
+
 #[inline]
 pub fn user_sp(frame: &ExceptionFrame) -> usize {
     #[cfg(target_arch = "aarch64")]

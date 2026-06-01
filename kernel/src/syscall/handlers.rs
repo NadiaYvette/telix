@@ -267,12 +267,12 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             static T34_RING_POS: AtomicU32 = AtomicU32::new(0);
             let pos = T34_RING_POS.fetch_add(1, O::Relaxed) as usize & 7;
             T34_RING_NR[pos].store(nr as u64, O::Relaxed);
-            T34_RING_RIP[pos].store(frame.rip(), O::Relaxed);
+            T34_RING_RIP[pos].store(crate::arch::trapframe::frame_pc(frame), O::Relaxed);
             let n = T34_LOG.fetch_add(1, O::Relaxed);
             if n < 64 {
                 crate::println!(
                     "T34-SYSCALL: nr={} rip={:#x} a0={:#x} a1={:#x} n={}",
-                    nr, frame.rip(), a0, a1, n,
+                    nr, crate::arch::trapframe::frame_pc(frame), a0, a1, n,
                 );
             }
         }
