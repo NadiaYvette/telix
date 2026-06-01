@@ -121,7 +121,9 @@ impl MemObject {
             Some(p) => p,
             None => return false,
         };
-        let ptr = pa.as_usize() as *mut u32;
+        // #235 Phase 4e: PHYS_DIRECT_MAP kva storage for swap_slots
+        // table.  No explicit free path; lives for object lifetime.
+        let ptr = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u32;
         unsafe {
             core::ptr::write_bytes(ptr as *mut u8, 0, pages_needed * page_sz);
         }
@@ -254,7 +256,8 @@ impl MemObject {
             return true;
         }
         let page = match phys::alloc_page() {
-            Some(pa) => pa.as_usize() as *mut Mapping,
+            // #235 Phase 4e: PHYS_DIRECT_MAP kva storage; destroy converts.
+            Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Mapping,
             None => return false,
         };
         unsafe {
@@ -345,7 +348,8 @@ struct ObjEntry {
 /// Allocate a new ObjEntry from slab.
 fn alloc_entry() -> Option<*mut ObjEntry> {
     let pa = slab::alloc(OBJ_SLAB_SIZE)?;
-    let p = pa.as_usize() as *mut ObjEntry;
+    // #235 Phase 4e: PHYS_DIRECT_MAP kva storage; free_entry undoes.
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut ObjEntry;
     unsafe {
         core::ptr::write_bytes(p as *mut u8, 0, OBJ_SLAB_SIZE);
     }
@@ -354,7 +358,10 @@ fn alloc_entry() -> Option<*mut ObjEntry> {
 
 /// Free an ObjEntry back to slab.
 fn free_entry(ptr: *mut ObjEntry) {
-    slab::free(PhysAddr::new(ptr as usize), OBJ_SLAB_SIZE);
+    slab::free(
+        PhysAddr::new(crate::mm::page::kva_to_phys(ptr as usize)),
+        OBJ_SLAB_SIZE,
+    );
 }
 
 /// Resolve an ObjectId (port_id) to the ObjEntry pointer. Lock-free via RCU.
@@ -511,7 +518,7 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
             let order = pages_needed.next_power_of_two().trailing_zeros() as usize;
             match phys::alloc_pages(order) {
                 Some(pa) => {
-                    let ptr = pa.as_usize() as *mut u32;
+                    let ptr = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u32;
                     unsafe {
                         // Zero the full allocation first (may be larger than n slots).
                         core::ptr::write_bytes(ptr as *mut u8, 0, pages_needed * page_sz);
@@ -647,7 +654,9 @@ pub fn destroy(id: ObjectId) {
     // Free PageVec heap and mappings page.
     guard.pages.free_heap();
     if !guard.mappings.is_null() {
-        phys::free_page(PhysAddr::new(guard.mappings as usize));
+        phys::free_page(PhysAddr::new(
+            crate::mm::page::kva_to_phys(guard.mappings as usize),
+        ));
         guard.mappings = core::ptr::null_mut();
     }
     guard.obj_type = ObjectType::Free;

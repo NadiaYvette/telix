@@ -67,7 +67,10 @@ impl<T> PagedArray<T> {
         // Allocate directory page on first use.
         if self.dir.is_null() && needed > 0 {
             let page = match phys::alloc_page() {
-                Some(pa) => pa.as_usize() as *mut *mut T,
+                // #235 Phase 4e: PHYS_DIRECT_MAP kva storage for dir
+                // + data pages.  No explicit free path exists in this
+                // module, so no kva_to_phys mirror needed.
+                Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut *mut T,
                 None => return false,
             };
             unsafe {
@@ -82,7 +85,7 @@ impl<T> PagedArray<T> {
                 return false;
             }
             let page = match phys::alloc_page() {
-                Some(pa) => pa.as_usize() as *mut T,
+                Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut T,
                 None => return false,
             };
             // Zero-initialize the new page.

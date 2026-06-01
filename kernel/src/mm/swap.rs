@@ -550,7 +550,9 @@ fn init_ram_backend(total: u32) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let ctrl_ptr = ctrl_pa.as_usize() as *mut RamBackend;
+    // #235 Phase 4e: PHYS_DIRECT_MAP kva storage for the long-lived
+    // backend control block.
+    let ctrl_ptr = crate::mm::page::phys_to_kva(ctrl_pa.as_usize()) as *mut RamBackend;
     unsafe {
         core::ptr::write(
             ctrl_ptr,
@@ -632,7 +634,7 @@ fn init_blk_backend(offset_kb: u32, size_kb: u32) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let ctrl_ptr = ctrl_pa.as_usize() as *mut BlkIoBackend;
+    let ctrl_ptr = crate::mm::page::phys_to_kva(ctrl_pa.as_usize()) as *mut BlkIoBackend;
     unsafe {
         core::ptr::write(
             ctrl_ptr,

@@ -433,7 +433,8 @@ impl CowGroup {
             return true;
         }
         let page = match super::phys::alloc_page() {
-            Some(pa) => pa.as_usize() as *mut GroupExtent,
+            // #235 Phase 4e: PHYS_DIRECT_MAP kva storage; free path converts.
+            Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut GroupExtent,
             None => return false,
         };
         unsafe {
@@ -696,7 +697,9 @@ impl CowGroup {
             }
         }
         if !self.extents.is_null() {
-            super::phys::free_page(PhysAddr::new(self.extents as usize));
+            super::phys::free_page(PhysAddr::new(
+                crate::mm::page::kva_to_phys(self.extents as usize),
+            ));
             self.extents = core::ptr::null_mut();
             self.extents_cap = 0;
         }
@@ -719,7 +722,8 @@ struct GroupEntry {
 /// Allocate a new GroupEntry from slab.
 fn alloc_entry() -> Option<*mut GroupEntry> {
     let pa = slab::alloc(GROUP_SLAB_SIZE)?;
-    let p = pa.as_usize() as *mut GroupEntry;
+    // #235 Phase 4e: PHYS_DIRECT_MAP kva storage; free_entry undoes.
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut GroupEntry;
     unsafe {
         core::ptr::write_bytes(p as *mut u8, 0, GROUP_SLAB_SIZE);
     }
@@ -728,7 +732,10 @@ fn alloc_entry() -> Option<*mut GroupEntry> {
 
 /// Free a GroupEntry back to slab.
 fn free_entry(ptr: *mut GroupEntry) {
-    slab::free(PhysAddr::new(ptr as usize), GROUP_SLAB_SIZE);
+    slab::free(
+        PhysAddr::new(crate::mm::page::kva_to_phys(ptr as usize)),
+        GROUP_SLAB_SIZE,
+    );
 }
 
 /// Resolve a CowGroupId (port_id) to the GroupEntry pointer. Lock-free via RCU.
