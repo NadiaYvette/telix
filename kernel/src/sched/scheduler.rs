@@ -2942,7 +2942,9 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
     #[cfg(not(target_arch = "x86_64"))]
     {
         let pa = slab::alloc(THREAD_SLAB_SIZE)?;
-        let p = pa.as_usize() as *mut Thread;
+        // #235 Phase 4f: PHYS_DIRECT_MAP kva storage on non-x86 (x86_64
+        // uses SLAB_THREAD_REGION VAs in alloc_thread_entry_x86 above).
+        let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Thread;
         unsafe {
             core::ptr::write_bytes(p as *mut u8, 0, THREAD_SLAB_SIZE);
             core::ptr::write(p, Thread::empty());
@@ -2958,7 +2960,10 @@ fn free_thread_entry(p: *mut Thread) {
     // Non-x86 still routes through slab.
     #[cfg(not(target_arch = "x86_64"))]
     {
-        slab::free(PhysAddr::new(p as usize), THREAD_SLAB_SIZE);
+        slab::free(
+            PhysAddr::new(crate::mm::page::kva_to_phys(p as usize)),
+            THREAD_SLAB_SIZE,
+        );
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -2969,7 +2974,8 @@ fn free_thread_entry(p: *mut Thread) {
 fn alloc_task_entry() -> Option<*mut Task> {
     // Task is ~1400 bytes — too large for any slab cache, use page allocation.
     let pa = phys::alloc_page()?;
-    let p = pa.as_usize() as *mut Task;
+    // #235 Phase 4f: PHYS_DIRECT_MAP kva storage; free_task_entry undoes.
+    let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Task;
     unsafe {
         core::ptr::write_bytes(p as *mut u8, 0, page::page_size());
         core::ptr::write(p, Task::empty());
@@ -2991,7 +2997,7 @@ fn free_task_entry(p: *mut Task) {
             core::ptr::write_volatile(bytes.offset(off), 0xCE);
         }
     }
-    phys::free_page(PhysAddr::new(p as usize));
+    phys::free_page(PhysAddr::new(crate::mm::page::kva_to_phys(p as usize)));
 }
 
 // ---------------------------------------------------------------------------
@@ -3839,14 +3845,17 @@ fn dup_groups_overflow(parent: &mut SpawnParentInfo) -> bool {
         Some(p) => p,
         None => return false,
     };
+    // #235 Phase 4f: store groups_overflow as kva so deref + copy work
+    // without PML4[0] identity.  free_groups_overflow undoes via kva_to_phys.
+    let page_kva = crate::mm::page::phys_to_kva(page.as_usize());
     unsafe {
         core::ptr::copy_nonoverlapping(
             parent.groups_overflow as *const u8,
-            page.as_usize() as *mut u8,
+            page_kva as *mut u8,
             parent.ngroups as usize * core::mem::size_of::<u32>(),
         );
     }
-    parent.groups_overflow = page.as_usize();
+    parent.groups_overflow = page_kva;
     true
 }
 
@@ -7431,14 +7440,16 @@ pub fn fork_current() -> u64 {
         if parent_ngroups as usize > GROUPS_INLINE && parent_groups_overflow != 0 {
             match crate::mm::phys::alloc_page() {
                 Some(p) => {
+                    // #235 Phase 4f: store child groups_overflow as kva.
+                    let kva = crate::mm::page::phys_to_kva(p.as_usize());
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             parent_groups_overflow as *const u8,
-                            p.as_usize() as *mut u8,
+                            kva as *mut u8,
                             parent_ngroups as usize * core::mem::size_of::<u32>(),
                         );
                     }
-                    p.as_usize()
+                    kva
                 }
                 None => return u64::MAX,
             }
@@ -7694,14 +7705,16 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
         if parent_ngroups as usize > GROUPS_INLINE && parent_groups_overflow != 0 {
             match crate::mm::phys::alloc_page() {
                 Some(p) => {
+                    // #235 Phase 4f: store child groups_overflow as kva.
+                    let kva = crate::mm::page::phys_to_kva(p.as_usize());
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             parent_groups_overflow as *const u8,
-                            p.as_usize() as *mut u8,
+                            kva as *mut u8,
                             parent_ngroups as usize * core::mem::size_of::<u32>(),
                         );
                     }
-                    p.as_usize()
+                    kva
                 }
                 None => return u64::MAX,
             }

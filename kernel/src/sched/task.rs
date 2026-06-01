@@ -350,7 +350,11 @@ impl Task {
     /// Free the overflow page if allocated. Called on last-thread exit.
     pub fn free_groups_overflow(&mut self) {
         if self.groups_overflow != 0 {
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(self.groups_overflow));
+            // #235 Phase 4f: groups_overflow is stored as a kva; convert
+            // back to PA before handing to the phys allocator.
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(
+                crate::mm::page::kva_to_phys(self.groups_overflow),
+            ));
             self.groups_overflow = 0;
         }
     }
