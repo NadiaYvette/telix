@@ -67,16 +67,15 @@ fn sbi_set_timer(stime_value: u64) {
 /// interruptible point (which includes waking from WFI), so a runnable
 /// thread enqueued on its runqueue is seen by the next sched::tick.
 pub fn sbi_send_ipi(target_hart: u32) {
-    // SBI v0.2+ hart mask convention: bit (hart - base) in the word at
-    // `hart_mask` (a virtual address).  We pass the mask directly by
-    // using a local on-stack variable and its VA.  base = 0 so the bit
-    // index is the hart id directly.
+    // SBI v0.2+ IPI extension (ID "sPI" = 0x735049): a0 is the hart
+    // mask VALUE (not a pointer — that was the legacy v0.1 convention
+    // and silently sent IPIs to garbage hart ids).  a1 is the base
+    // hart id; bit n of the mask targets hart (base + n).
     let mask: u64 = 1u64 << (target_hart & 63);
-    let mask_addr = &mask as *const u64 as u64;
     unsafe {
         core::arch::asm!(
             "ecall",
-            in("a0") mask_addr,
+            in("a0") mask,
             in("a1") 0u64,       /* hart_mask_base */
             in("a6") SBI_FUN_SEND_IPI,
             in("a7") SBI_EXT_IPI,
