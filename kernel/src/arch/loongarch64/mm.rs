@@ -312,6 +312,58 @@ pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)
 }
 
+/// AP variant of enable_mmu: programs the same DMW windows, page-walk
+/// controller, TLB refill handler, and PGD root as the BSP, then
+/// switches CRMD from DA→PG.  Reads the already-published kernel PT
+/// root from KERNEL_PT_ROOT — must be called after the BSP's
+/// `enable_mmu`.  No println so multiple APs initializing concurrently
+/// don't interleave output.
+pub fn enable_mmu_secondary() {
+    let root = KERNEL_PT_ROOT.load(Ordering::Acquire);
+    debug_assert!(root != 0, "BSP must enable_mmu before APs call secondary");
+
+    let crmd: u64;
+    unsafe { core::arch::asm!("csrrd {}, 0x0", out(reg) crmd) };
+
+    unsafe {
+        let dmw0: u64 = (0x9000u64 << 48) | (1u64 << 4) | 1;
+        core::arch::asm!("csrwr {}, 0x180", in(reg) dmw0);
+
+        let dmw1: u64 = (0x8000u64 << 48) | 1;
+        core::arch::asm!("csrwr {}, 0x181", in(reg) dmw1);
+
+        let pwcl: u64 = 12 | (9 << 5) | (21 << 10) | (9 << 15) | (30 << 20) | (9 << 25);
+        core::arch::asm!("csrwr {}, 0x1C", in(reg) pwcl);
+
+        let pwch: u64 = 39 | (9 << 6);
+        core::arch::asm!("csrwr {}, 0x1D", in(reg) pwch);
+
+        core::arch::asm!("csrwr {}, 0x1E", in(reg) 12u64);
+
+        core::arch::asm!("csrwr {}, 0x19", in(reg) root as u64);
+        core::arch::asm!("csrwr {}, 0x1A", in(reg) root as u64);
+
+        core::arch::asm!(
+            "la.pcrel {tmp}, _tlb_refill",
+            "csrwr {tmp}, 0x88",
+            tmp = out(reg) _,
+        );
+
+        let dmw2: u64 = (0x0000u64 << 48) | (1u64 << 4) | 1;
+        core::arch::asm!("csrwr {}, 0x182", in(reg) dmw2);
+
+        if crmd & (1 << 4) != 0 {
+            core::arch::asm!("invtlb 0, $zero, $zero");
+            return;
+        }
+
+        let new_crmd: u64 = (1 << 4) | (crmd & (1 << 2));
+        core::arch::asm!("csrwr {}, 0x0", in(reg) new_crmd);
+
+        core::arch::asm!("invtlb 0, $r0, $r0");
+    }
+}
+
 /// Switch to a different page table.
 pub fn switch_page_table(root: usize) {
     unsafe {

@@ -105,6 +105,8 @@ pub fn init_dynamic_percpu() {
     crate::arch::aarch64::smp::init_dynamic_percpu();
     #[cfg(target_arch = "riscv64")]
     crate::arch::riscv64::smp::init_dynamic_percpu();
+    #[cfg(target_arch = "loongarch64")]
+    crate::arch::loongarch64::smp::init_dynamic_percpu();
 }
 
 /// Per-CPU trap scratch data, used by archs whose user→kernel trap entry

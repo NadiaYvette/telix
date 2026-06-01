@@ -41,15 +41,42 @@ _start:
     idle      0
     b         .halt
 
+// Secondary CPUs: poll a per-core slot in _ap_entry_slot waiting for
+// the BSP to install (entry, stack_top).  Once the entry pointer is
+// non-zero we jump to it with a0 = core_id.  CSR.CPUID (0x20) is the
+// authoritative core identity — QEMU may not preserve the original a0
+// across the lock branch on every release.
 .secondary_spin:
+    csrrd     $t0, 0x20           // CSR.CPUID
+    la.pcrel  $t1, _ap_entry_slot
+    slli.d    $t2, $t0, 4         // core_id * 16 (slot stride)
+    add.d     $t1, $t1, $t2
+.ap_poll:
+    dbar      0                   // sync each iteration so cached zero
+    ld.d      $t3, $t1, 0         // doesn't lock us out of seeing BSP's write
+    beqz      $t3, .ap_poll
+    ld.d      $sp, $t1, 8         // stack top
+    move      $a0, $t0            // core_id
+    jirl      $zero, $t3, 0
+    // Should not return; halt if it does.
+.ap_unreachable:
     idle      0
-    b         .secondary_spin
+    b         .ap_unreachable
 
 // Atomic boot lock.
 .section .data
 .balign 4
 _boot_lock:
     .word     0
+
+// Per-core (entry, stack_top) slots, 16 B each.  BSP writes these from
+// arch::loongarch64::smp::start_secondary_cpus(); secondaries poll them
+// in .ap_poll above.  Sized for MAX_CPUS=4.
+.section .bss._ap_entry_slot, "aw", @nobits
+.balign 16
+.global _ap_entry_slot
+_ap_entry_slot:
+    .space    64
 
 // Boot stack: 64 KiB in BSS.
 .section .bss.boot_stack, "aw", @nobits

@@ -3,6 +3,7 @@ pub mod hypervisor;
 pub mod mm;
 pub mod pci;
 pub mod serial;
+pub mod smp;
 pub mod trap;
 
 use core::arch::global_asm;
@@ -47,7 +48,7 @@ pub fn enable_interrupts() {
 
 /// Start secondary CPUs.
 pub fn start_secondary_cpus() {
-    // TODO: SMP bring-up
+    smp::start_secondary_cpus();
 }
 
 /// Idle loop.

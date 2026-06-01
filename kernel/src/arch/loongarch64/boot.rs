@@ -129,4 +129,12 @@ pub fn parse_firmware() {
         bus_end: 255,
         _pad: 0,
     });
+
+    // QEMU loongarch64 virt machine defaults to 4 cores and we don't yet
+    // parse the FDT it ships via FW_CFG.  Register them statically so
+    // detect_cpu_count + start_secondary_cpus see four CPUs.  CSR.CPUID
+    // values run 0..N-1.  Capped to MAX_CPUS by detect_cpu_count.
+    for id in 0..4u32 {
+        crate::firmware::push_cpu(crate::firmware::CpuDesc { id, flags: 1 });
+    }
 }
