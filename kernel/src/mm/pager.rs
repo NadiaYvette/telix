@@ -292,13 +292,22 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
     let ps = page::page_size();
     let copy_len = data_len.min(ps);
     unsafe {
-        core::ptr::copy_nonoverlapping(src_pa as *const u8, phys_addr as *mut u8, copy_len);
+        let dst_kva = crate::mm::page::phys_to_kva(phys_addr);
+        core::ptr::copy_nonoverlapping(
+            crate::mm::page::phys_to_kva(src_pa) as *const u8,
+            dst_kva as *mut u8,
+            copy_len,
+        );
         if copy_len < ps {
             // Poison the tail so reads past end-of-data are visible —
             // see mm::ANON_POISON_BYTE.  ld.so explicitly zeros .bss,
             // so its [filesz, memsz) range is overwritten before user
             // code observes it.
-            core::ptr::write_bytes((phys_addr + copy_len) as *mut u8, crate::mm::ANON_POISON_BYTE, ps - copy_len);
+            core::ptr::write_bytes(
+                (dst_kva + copy_len) as *mut u8,
+                crate::mm::ANON_POISON_BYTE,
+                ps - copy_len,
+            );
         }
     }
 

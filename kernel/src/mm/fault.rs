@@ -275,7 +275,11 @@ pub fn handle_page_fault(
                 // Poisoned (0xCD) instead of zero so uninitialized reads by
                 // user code are diagnosable — see mm::ANON_POISON_BYTE.
                 unsafe {
-                    core::ptr::write_bytes(mmu_pa as *mut u8, crate::mm::ANON_POISON_BYTE, MMUPAGE_SIZE);
+                    core::ptr::write_bytes(
+                        crate::mm::page::phys_to_kva(mmu_pa) as *mut u8,
+                        crate::mm::ANON_POISON_BYTE,
+                        MMUPAGE_SIZE,
+                    );
                 }
                 stats::PAGES_ZEROED.fetch_add(1, Ordering::Relaxed);
             }
@@ -415,7 +419,11 @@ fn try_superpage_promotion(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u6
             let old_pa = obj.pages.get(obj_page_base + p);
             let new_pa = new_block.as_usize() + p * ps;
             unsafe {
-                core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, ps);
+                core::ptr::copy_nonoverlapping(
+                    crate::mm::page::phys_to_kva(old_pa) as *const u8,
+                    crate::mm::page::phys_to_kva(new_pa) as *mut u8,
+                    ps,
+                );
             }
         }
     });
@@ -855,8 +863,8 @@ fn try_consolidate_reservation(
             // Copy scattered page into the reservation slot.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    current_pa as *const u8,
-                    dest_slot_pa as *mut u8,
+                    crate::mm::page::phys_to_kva(current_pa) as *const u8,
+                    crate::mm::page::phys_to_kva(dest_slot_pa) as *mut u8,
                     ps,
                 );
             }

@@ -148,12 +148,16 @@ pub fn kmain() -> ! {
     arch::platform::start_secondary_cpus();
     sched::topology::print();
 
-    // #235 Piece C2: drop the low-RAM identity map.  Helper is in place
-    // (arch::x86_64::mm::unmap_pml4_0) but the call is currently gated
-    // off — fault.rs/aspace.rs still hold raw `pa as *mut u8` writes
-    // (probe boot 11amfsq2937 reached `Testing demand-paged memory…`
-    // then wedged in handle_page_fault).  Sweep those, then turn the
-    // call on.
+    // #235 Piece C2: drop the low-RAM identity map.  Helper is in
+    // arch::x86_64::mm::unmap_pml4_0; call gated off.  C2c swept
+    // fault.rs/pager.rs/radix_pt.rs and the kernel now reaches the
+    // demand-paging tests + initramfs_srv with the unmap on (boot
+    // 11amfsq2940 reached `Phase 3: Starting I/O servers...` then
+    // wedged with tid=6 startup_thread spinning post-spawn of
+    // initramfs).  Next blocker likely in the ELF loader path
+    // (`loader/elf.rs:374,400,414` still write/copy via raw PA-as-VA);
+    // sweep that + the syscall handlers' write_bytes(pa_usize) sites
+    // in C2d, then re-enable.
     // arch::x86_64::mm::unmap_pml4_0();
 
     // Background page pre-zeroing daemon.

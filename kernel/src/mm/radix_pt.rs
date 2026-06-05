@@ -309,8 +309,8 @@ fn cow_break_table<F: PteFormat>(
         };
         unsafe {
             core::ptr::copy_nonoverlapping(
-                old_pa as *const u8,
-                result_pa as *mut u8,
+                crate::mm::page::phys_to_kva(old_pa) as *const u8,
+                crate::mm::page::phys_to_kva(result_pa) as *mut u8,
                 MMU_PAGE_SIZE,
             );
         }
