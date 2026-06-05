@@ -481,6 +481,14 @@ pub fn alloc(size: usize) -> Option<PhysAddr> {
     // Disable IRQs for per-CPU magazine access.
     let saved = crate::sync::spinlock::arch_disable_irqs();
     let cpu = crate::sched::smp::cpu_id() as usize;
+    // #235 C2g probe: surface bogus cpu_id (LAPIC read) before it
+    // walks off the per-CPU magazine array.
+    assert!(
+        cpu < smp::num_cpus(),
+        "slab::alloc cpu={} >= num_cpus={}",
+        cpu,
+        smp::num_cpus()
+    );
 
     let mag = unsafe { &mut (*cpu_magazine_row(cpu))[idx] };
 
@@ -537,6 +545,12 @@ pub fn free(addr: PhysAddr, size: usize) {
 
     let saved = crate::sync::spinlock::arch_disable_irqs();
     let cpu = crate::sched::smp::cpu_id() as usize;
+    assert!(
+        cpu < smp::num_cpus(),
+        "slab::free cpu={} >= num_cpus={}",
+        cpu,
+        smp::num_cpus()
+    );
     let mag = unsafe { &mut (*cpu_magazine_row(cpu))[idx] };
 
     // Fast path 1: push to loaded magazine.

@@ -156,14 +156,15 @@ pub fn kmain() -> ! {
     // but wedges on `THREAD-PTR-OOR: tid=14 p=0x0` (THREAD_TABLE lookup
     // returns NULL for an unspawned tid).  Next session investigates
     // who's calling `thread_ref(14)` before the spawn lands.
-    // #235 Piece C2f: helper still gated off pending slab-corruption
-    // investigation.  4-boot variance run (unmap on) showed 1/4 clean
-    // through pci_srv spawn (tid 9) and 3/4 hitting intermittent
-    // `mm/slab.rs:309` index OOB (values 46036, 6519 — same offsets
-    // across runs).  Unmap is functionally correct; the residual is a
-    // flaky slab freelist race exposed by changed timing.  C2g should
-    // probe Magazine::push/pop for cross-CPU writes or stale per-CPU
-    // routing post-unmap.
+    // #235 Piece C2g: helper still gated off pending C2h slab-race
+    // investigation.  Added cpu-id assert in slab::alloc/free (4-boot
+    // batch with unmap on shows it never fires — cpu_id is fine) but
+    // 4/4 boots still hit `mm/slab.rs:309` with varying indices
+    // (5263/6519/65407 — random data) and a sibling
+    // `sched/scheduler.rs:2647` per-CPU-RQ-array OOB.  Not a cpu
+    // routing bug; magazine memory itself is being scribbled.  C2h
+    // should set a slab-canary or DR0 watch on a Magazine's count
+    // field to catch the writer.
     // arch::x86_64::mm::unmap_pml4_0();
 
     // Background page pre-zeroing daemon.
