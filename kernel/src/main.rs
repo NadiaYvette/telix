@@ -148,6 +148,14 @@ pub fn kmain() -> ! {
     arch::platform::start_secondary_cpus();
     sched::topology::print();
 
+    // #235 Piece C2: drop the low-RAM identity map.  Helper is in place
+    // (arch::x86_64::mm::unmap_pml4_0) but the call is currently gated
+    // off — fault.rs/aspace.rs still hold raw `pa as *mut u8` writes
+    // (probe boot 11amfsq2937 reached `Testing demand-paged memory…`
+    // then wedged in handle_page_fault).  Sweep those, then turn the
+    // call on.
+    // arch::x86_64::mm::unmap_pml4_0();
+
     // Background page pre-zeroing daemon.
     sched::spawn(mm::zeropool::zero_daemon, 1, 5).expect("spawn zero_daemon");
 

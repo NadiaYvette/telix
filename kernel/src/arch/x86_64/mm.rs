@@ -760,6 +760,67 @@ pub fn boot_page_table_root() -> usize {
     BOOT_PML4.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// #235 Piece C2: partial PML4[0] identity removal.
+///
+/// Clears the lower two 1 GiB entries (PDPT[0] and PDPT[1]) of `boot_pdpt`,
+/// removing identity mapping for PA `0..2 GiB`.  On the default QEMU 2 GiB
+/// RAM build this covers the entire RAM region, so any residual kernel
+/// dereference that still treats a phys address as a virtual address now
+/// faults — surfacing the last #208-family writers that Phase 4 + Pieces
+/// A/B/C1 didn't reach.
+///
+/// PDPT[2..3] (PA `2..4 GiB`) stay identity-mapped: that range holds the
+/// PCI ECAM window (`~0xb0000000`) plus all MMIO above 3 GiB (LAPIC,
+/// IOAPIC, HPET, virtio BARs).  Removing them is a separate sweep that
+/// needs every MMIO consumer routed through `phys_to_kva`.
+///
+/// Local TLB is flushed via CR3 reload; peers via TLB-shootdown IPI.
+pub fn unmap_pml4_0() {
+    let boot_pml4 = BOOT_PML4.load(core::sync::atomic::Ordering::Acquire);
+    if boot_pml4 == 0 {
+        crate::println!("[#235] unmap_pml4_0: boot_pml4 not initialized — skip");
+        return;
+    }
+
+    let (prev0, prev1, boot_pdpt_pa): (u64, u64, usize);
+    let flags: u64;
+    unsafe {
+        // Snapshot RFLAGS and disable IRQs around the modify+flush so a
+        // mid-window interrupt doesn't touch a now-stale TLB entry.
+        core::arch::asm!("pushfq; pop {}", out(reg) flags);
+        core::arch::asm!("cli");
+
+        let pml4_e0 = *(pt_kva(boot_pml4));
+        boot_pdpt_pa = (pml4_e0 & 0x000F_FFFF_FFFF_F000) as usize;
+        let pdpt = pt_kva(boot_pdpt_pa);
+        prev0 = *pdpt;
+        prev1 = *pdpt.add(1);
+        *pdpt = 0;
+        *pdpt.add(1) = 0;
+
+        // Local TLB flush via CR3 reload (1 GiB gigapages aren't global,
+        // so this drops their cached translations on this CPU).
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        core::arch::asm!("mov cr3, {}", in(reg) cr3);
+
+        if flags & (1 << 9) != 0 {
+            core::arch::asm!("sti");
+        }
+    }
+
+    // Peer CPUs: fire-and-forget TLB-shootdown IPI.  Stale TLB on a peer
+    // would let it keep using the old identity translation, which is
+    // benign — the entry still points at valid RAM — but we want post-
+    // unmap peer accesses to fault so we surface stragglers.
+    super::lapic::broadcast_tlb_flush();
+
+    crate::println!(
+        "[#235] PML4[0] identity partial-unmap: boot_pdpt={:#x} PDPT[0]={:#x}->0 PDPT[1]={:#x}->0",
+        boot_pdpt_pa, prev0, prev1,
+    );
+}
+
 /// Free all intermediate page table pages for a user page table.
 /// Does NOT free leaf physical pages (those are freed by aspace::destroy).
 /// Skips kernel-range entries (PML4[1..3] point to shared boot tables).
