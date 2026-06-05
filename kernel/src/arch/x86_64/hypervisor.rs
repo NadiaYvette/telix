@@ -17,6 +17,17 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::arch::hypervisor::{HypervisorKind, HypervisorOps, set_ops};
 
+/// Convert a kernel-image VMA to its load (physical) address.  Statics
+/// in the kernel binary are linked at VMA = LMA + KERNEL_VIRT_OFFSET
+/// (see kernel/src/arch/x86_64/linker.ld).  KVM PV MSRs expect raw
+/// phys addresses; without this conversion the host silently no-ops
+/// the registration because the high VMA is way beyond guest RAM.
+#[inline]
+fn kernel_vma_to_pa(vma: u64) -> u64 {
+    const KERNEL_VIRT_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
+    vma.wrapping_sub(KERNEL_VIRT_OFFSET)
+}
+
 // KVM CPUID feature bits (from CPUID 0x40000001 EAX).
 const KVM_FEATURE_PV_SEND_IPI: u32 = 1 << 11;
 #[allow(dead_code)]
@@ -100,7 +111,7 @@ pub fn enable_async_pf_self() {
     if cpu >= crate::sched::smp::MAX_CPUS {
         return;
     }
-    let pa = &APF_DATA[cpu] as *const _ as u64;
+    let pa = kernel_vma_to_pa(&APF_DATA[cpu] as *const _ as u64);
     unsafe { wrmsr(MSR_KVM_ASYNC_PF_EN, pa | KVM_ASYNC_PF_ENABLED); }
 }
 
@@ -172,7 +183,7 @@ pub fn enable_steal_time_self() {
     if cpu >= crate::sched::smp::MAX_CPUS {
         return;
     }
-    let pa = &STEAL_TIME[cpu] as *const _ as u64;
+    let pa = kernel_vma_to_pa(&STEAL_TIME[cpu] as *const _ as u64);
     unsafe { wrmsr(MSR_KVM_STEAL_TIME, pa | 1); }
 }
 
@@ -235,7 +246,7 @@ pub fn enable_pvclock_self() {
     if cpu >= crate::sched::smp::MAX_CPUS {
         return;
     }
-    let pa = &PVCLOCK[cpu] as *const _ as u64;
+    let pa = kernel_vma_to_pa(&PVCLOCK[cpu] as *const _ as u64);
     unsafe {
         wrmsr(MSR_KVM_SYSTEM_TIME_NEW, pa | 1);
     }
