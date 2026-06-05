@@ -3,8 +3,10 @@
 //! Renders characters to a linear framebuffer (UEFI GOP, VBE, or
 //! virtio-gpu scanout) using an embedded 8×16 bitmap font.  Hooks
 //! into the serial print path so every `println!()` also appears on
-//! screen.  Initialized after the MMU is enabled (the framebuffer
-//! address must be identity-mapped).
+//! screen.  Initialized after the MMU is enabled.  The firmware
+//! reports a physical address; we route it through PHYS_DIRECT_MAP
+//! (#235 Piece A) so the runtime put-pixel path doesn't depend on
+//! the PML4[0] identity map.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -29,7 +31,7 @@ const FG_COLOR: u32 = 0x00CCCCCC; // light grey
 const BG_COLOR: u32 = 0x00000000; // black
 
 /// Initialize the framebuffer console from bootloader-provided info.
-/// Must be called after MMU enable (framebuffer address is identity-mapped).
+/// Must be called after MMU enable (uses PHYS_DIRECT_MAP).
 pub fn init() {
     let info = match crate::firmware::framebuffer_info() {
         Some(i) => i,
@@ -39,13 +41,19 @@ pub fn init() {
         return;
     }
 
-    FB_ADDR.store(info.addr as usize, Ordering::Relaxed);
+    // #235 Piece A: route firmware-reported PA through PHYS_DIRECT_MAP
+    // so all FB writes work after PML4[0] is unmapped.  PHYS_DIRECT_MAP
+    // currently covers PA 0..4 GiB (4 × 1 GiB gigapages from boot.S),
+    // which catches the typical QEMU std-VGA / OVMF GOP framebuffer.
+    let fb_kva = crate::mm::page::phys_to_kva(info.addr as usize);
+
+    FB_ADDR.store(fb_kva, Ordering::Relaxed);
     FB_PITCH.store(info.pitch, Ordering::Relaxed);
     FB_WIDTH.store(info.width, Ordering::Relaxed);
     FB_HEIGHT.store(info.height, Ordering::Relaxed);
 
     // Clear screen to background color.
-    let fb = info.addr as *mut u32;
+    let fb = fb_kva as *mut u32;
     let stride = info.pitch / 4; // pixels per row (32-bit)
     for y in 0..info.height {
         for x in 0..info.width {
