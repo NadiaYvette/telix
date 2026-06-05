@@ -26,9 +26,13 @@ pub fn cpu_id() -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         // Read LAPIC ID register (offset 0x020) using firmware-discovered base.
-        let base = crate::firmware::irq_controller().base0 as usize;
-        let base = if base != 0 { base } else { 0xFEE0_0000 };
-        let lapic_id = unsafe { core::ptr::read_volatile((base + 0x020) as *const u32) };
+        // #235 C2e: route through PHYS_DIRECT_MAP so the access works on a
+        // user CR3 (where PML4[0] is empty post-unmap).  PHYS_DIRECT_MAP
+        // covers PA 0..4 GiB, including the 0xFEE0_0000 LAPIC region.
+        let base_pa = crate::firmware::irq_controller().base0 as usize;
+        let base_pa = if base_pa != 0 { base_pa } else { 0xFEE0_0000 };
+        let base_kva = crate::mm::page::phys_to_kva(base_pa);
+        let lapic_id = unsafe { core::ptr::read_volatile((base_kva + 0x020) as *const u32) };
         (lapic_id >> 24) & 0xFF
     }
     #[cfg(target_arch = "loongarch64")]

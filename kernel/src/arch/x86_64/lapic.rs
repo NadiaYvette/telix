@@ -13,14 +13,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static LAPIC_TIMER_FREQ: AtomicU64 = AtomicU64::new(0);
 
 // LAPIC base discovered from firmware (ACPI MADT), default fallback.
+// #235 C2e: returns a PHYS_DIRECT_MAP kva so MMIO access works on any
+// CR3, including user PTs whose PML4[0] is empty after the unmap.
 const LAPIC_FALLBACK: usize = 0xFEE0_0000;
 fn lapic_base() -> usize {
     let info = crate::firmware::irq_controller();
-    if info.kind != 0 {
+    let pa = if info.kind != 0 {
         info.base0 as usize
     } else {
         LAPIC_FALLBACK
-    }
+    };
+    crate::mm::page::phys_to_kva(pa)
 }
 
 // Register offsets.

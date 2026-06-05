@@ -156,6 +156,14 @@ pub fn kmain() -> ! {
     // but wedges on `THREAD-PTR-OOR: tid=14 p=0x0` (THREAD_TABLE lookup
     // returns NULL for an unspawned tid).  Next session investigates
     // who's calling `thread_ref(14)` before the spawn lands.
+    // #235 Piece C2: helper in arch::x86_64::mm::unmap_pml4_0; call
+    // gated off pending C2f.  C2e swept LAPIC + IOAPIC MMIO to use
+    // PHYS_DIRECT_MAP so kernel code running on a user CR3 can still
+    // reach them (user PTs have empty PML4[0] post-unmap).  Boot
+    // 11amfsq2945 (unmap on) reaches Phase 3 acpi_srv spawn + ~10
+    // elf-loads (compositor_srv, console_srv, devfs_srv,
+    // discovery_srv, echo_client, eth_srv, event_srv) then panics in
+    // mm/slab.rs:309 `len 32 index 654078` — slab freelist corruption.
     // arch::x86_64::mm::unmap_pml4_0();
 
     // Background page pre-zeroing daemon.

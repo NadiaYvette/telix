@@ -1665,6 +1665,7 @@ pub fn trace_point(label: &'static str, subject: u32) {
 
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
+#[track_caller]
 pub fn thread_ref(tid: u32) -> &'static Thread {
     let p = THREAD_TABLE.get(tid) as *const Thread;
     // #233 slab-range guard: on x86_64, Thread structs live in
@@ -1686,10 +1687,20 @@ pub fn thread_ref(tid: u32) -> &'static Thread {
                     core::sync::atomic::AtomicU32::new(0);
                 let n = OOR_LOG.fetch_add(1, Ordering::Relaxed);
                 if n < 16 {
+                    let loc = core::panic::Location::caller();
                     crate::println!(
-                        "THREAD-PTR-OOR: tid={} p={:p} not in SLAB_REGION [{:#x}..{:#x}) n={}",
-                        tid, p, base, end, n,
+                        "THREAD-PTR-OOR: tid={} p={:p} not in SLAB_REGION [{:#x}..{:#x}) n={} at {}:{}",
+                        tid, p, base, end, n, loc.file(), loc.line(),
                     );
+                }
+                // #235 C2e: do NOT deref a NULL/garbage pointer — that
+                // crashes the kernel.  Return a sentinel pointer to the
+                // BSP idle thread so the caller can recover or fail
+                // gracefully.  Real callers should re-validate; this
+                // path is meant only to surface bad lookups.
+                if pu == 0 {
+                    let fallback = THREAD_TABLE.get(0) as *const Thread;
+                    return unsafe { &*fallback };
                 }
             }
         }

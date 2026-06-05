@@ -49,19 +49,23 @@ pub fn available() -> bool {
 
 // ── MMIO helpers ───────────────────────────────────────────────────
 
+// #235 C2e: `base` is a PA; route through PHYS_DIRECT_MAP so MMIO works
+// on a user CR3 (whose PML4[0] is empty after the unmap).
 #[inline]
 fn reg_read(base: usize, reg: u32) -> u32 {
+    let base_kva = crate::mm::page::phys_to_kva(base);
     unsafe {
-        core::ptr::write_volatile(base as *mut u32, reg);
-        core::ptr::read_volatile((base + IOWIN) as *const u32)
+        core::ptr::write_volatile(base_kva as *mut u32, reg);
+        core::ptr::read_volatile((base_kva + IOWIN) as *const u32)
     }
 }
 
 #[inline]
 fn reg_write(base: usize, reg: u32, val: u32) {
+    let base_kva = crate::mm::page::phys_to_kva(base);
     unsafe {
-        core::ptr::write_volatile(base as *mut u32, reg);
-        core::ptr::write_volatile((base + IOWIN) as *mut u32, val);
+        core::ptr::write_volatile(base_kva as *mut u32, reg);
+        core::ptr::write_volatile((base_kva + IOWIN) as *mut u32, val);
     }
 }
 
