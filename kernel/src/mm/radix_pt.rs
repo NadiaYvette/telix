@@ -111,13 +111,23 @@ unsafe fn pt_write(ptr: *mut u64, val: u64) {
 // Read-only walkers
 // -------------------------------------------------------------------------
 
+/// Treat a PA as a `*mut u64` PT pointer via the arch direct/identity map.
+/// #235 Phase 4g: was raw `pa as *mut u64` (worked only because PML4[0]
+/// identity-mapped low PAs); now routes through PHYS_DIRECT_MAP so the
+/// PT walkers survive the PML4[0] unmap.  On non-x86 the helper is the
+/// identity since those arches keep the kernel identity-mapped anyway.
+#[inline]
+fn pt_kva(pa: usize) -> *mut u64 {
+    crate::mm::page::phys_to_kva(pa) as *mut u64
+}
+
 /// Walk to the leaf PTE slot for `va`, returning a pointer to it.
 /// Returns `None` if any intermediate level is missing (not present).
 /// Follows shared markers transparently (read-only traversal).
 /// Does NOT check whether the leaf PTE itself is valid.
 #[inline]
 pub fn walk_to_leaf<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
-    let mut table = root as *mut u64;
+    let mut table = pt_kva(root);
     // Walk through non-leaf levels (0 .. LEVELS-2).
     for level in 0..F::LEVELS - 1 {
         let idx = F::va_index(va, level);
@@ -127,9 +137,9 @@ pub fn walk_to_leaf<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
                 // Block/superpage at this level — no leaf-level PTE exists.
                 return None;
             }
-            table = F::table_pa(entry) as *mut u64;
+            table = pt_kva(F::table_pa(entry));
         } else if F::is_shared_entry(entry) {
-            table = F::shared_entry_pa(entry) as *mut u64;
+            table = pt_kva(F::shared_entry_pa(entry));
         } else {
             return None;
         }
@@ -147,7 +157,7 @@ pub fn walk_to_level_slot<F: PteFormat>(
     va: usize,
     target_level: usize,
 ) -> Option<*mut u64> {
-    let mut table = root as *mut u64;
+    let mut table = pt_kva(root);
     for level in 0..target_level {
         let idx = F::va_index(va, level);
         let entry = unsafe { pt_read(table.add(idx)) };
@@ -155,9 +165,9 @@ pub fn walk_to_level_slot<F: PteFormat>(
             if !F::is_table(entry) {
                 return None;
             }
-            table = F::table_pa(entry) as *mut u64;
+            table = pt_kva(F::table_pa(entry));
         } else if F::is_shared_entry(entry) {
-            table = F::shared_entry_pa(entry) as *mut u64;
+            table = pt_kva(F::shared_entry_pa(entry));
         } else {
             return None;
         }
@@ -185,7 +195,7 @@ pub fn walk_to_super_slot<F: PteFormat>(root: usize, va: usize) -> Option<*mut u
 /// shared marker is encountered (caller must `ensure_path_unshared` first).
 #[inline]
 pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
-    let mut table = root as *mut u64;
+    let mut table = pt_kva(root);
     for level in 0..F::LEVELS - 1 {
         let idx = F::va_index(va, level);
         let entry = unsafe { pt_read(table.add(idx)) };
@@ -194,7 +204,7 @@ pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> 
                 // Block descriptor — cannot subdivide.
                 return None;
             }
-            table = F::table_pa(entry) as *mut u64;
+            table = pt_kva(F::table_pa(entry));
         } else if F::is_shared_entry(entry) {
             // Shared marker — caller should have called ensure_path_unshared.
             return None;
@@ -204,7 +214,7 @@ pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> 
             unsafe {
                 pt_write(table.add(idx), F::make_table_entry(new_table));
             }
-            table = new_table as *mut u64;
+            table = pt_kva(new_table);
         }
     }
     let leaf_idx = F::va_index(va, F::LEVELS - 1);
@@ -220,7 +230,7 @@ pub fn walk_or_create_to_level<F: PteFormat>(
     va: usize,
     target_level: usize,
 ) -> Option<*mut u64> {
-    let mut table = root as *mut u64;
+    let mut table = pt_kva(root);
     for level in 0..target_level {
         let idx = F::va_index(va, level);
         let entry = unsafe { pt_read(table.add(idx)) };
@@ -228,7 +238,7 @@ pub fn walk_or_create_to_level<F: PteFormat>(
             if !F::is_table(entry) {
                 return None;
             }
-            table = F::table_pa(entry) as *mut u64;
+            table = pt_kva(F::table_pa(entry));
         } else if F::is_shared_entry(entry) {
             // Shared marker — caller should have called ensure_path_unshared.
             return None;
@@ -237,7 +247,7 @@ pub fn walk_or_create_to_level<F: PteFormat>(
             unsafe {
                 pt_write(table.add(idx), F::make_table_entry(new_table));
             }
-            table = new_table as *mut u64;
+            table = pt_kva(new_table);
         }
     }
     let idx = F::va_index(va, target_level);
@@ -309,7 +319,7 @@ fn cow_break_table<F: PteFormat>(
 
     stats::PT_COW_BREAKS.fetch_add(1, Ordering::Relaxed);
 
-    let table = result_pa as *mut u64;
+    let table = pt_kva(result_pa);
     let child_level = level + 1;
 
     if child_level < F::LEVELS - 1 {
@@ -367,7 +377,7 @@ pub fn ensure_path_unshared<F: PteFormat>(
     if fg.is_null() {
         return true; // Never forked, no shared markers possible.
     }
-    let mut table = root as *mut u64;
+    let mut table = pt_kva(root);
     for level in 0..F::LEVELS - 1 {
         let idx = F::va_index(va, level);
         let entry = unsafe { pt_read(table.add(idx)) };
@@ -380,13 +390,13 @@ pub fn ensure_path_unshared<F: PteFormat>(
             unsafe {
                 pt_write(table.add(idx), F::make_table_entry(new_pa));
             }
-            table = new_pa as *mut u64;
+            table = pt_kva(new_pa);
         } else if F::is_valid(entry) {
             if !F::is_table(entry) {
                 // Block/superpage — path ends here.
                 return true;
             }
-            table = F::table_pa(entry) as *mut u64;
+            table = pt_kva(F::table_pa(entry));
         } else {
             // Not present, not shared — nothing mapped.
             return true;
@@ -415,7 +425,7 @@ pub fn free_shared_subtree<F: PteFormat>(
         return;
     }
 
-    let table = table_pa as *const u64;
+    let table = pt_kva(table_pa) as *const u64;
 
     for i in 0..ENTRIES_PER_TABLE {
         let entry = unsafe { pt_read(table.add(i) as *mut u64) };
@@ -452,8 +462,14 @@ const ENTRIES_PER_TABLE: usize = MMU_PAGE_SIZE / 8;
 fn alloc_table() -> Option<usize> {
     let page = crate::mm::phys::alloc_page()?;
     let addr = page.as_usize();
+    // #235 Phase 4g: zero via direct-map kva, not the bare PA, so the
+    // zero-fill works after PML4[0] is unmapped.
     unsafe {
-        core::ptr::write_bytes(addr as *mut u8, 0, MMU_PAGE_SIZE);
+        core::ptr::write_bytes(
+            crate::mm::page::phys_to_kva(addr) as *mut u8,
+            0,
+            MMU_PAGE_SIZE,
+        );
     }
     Some(addr)
 }

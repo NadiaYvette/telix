@@ -227,12 +227,26 @@ pub const USER_RX_FLAGS: u64 = PTE_P | PTE_US; // No PTE_RW, no PTE_NX
 pub const USER_RW_FLAGS: u64 = PTE_P | PTE_RW | PTE_US | PTE_NX;
 pub const USER_RO_FLAGS: u64 = PTE_P | PTE_US | PTE_NX; // No PTE_RW = read-only
 
+/// Treat a PA as a `*mut u64` PT pointer via the PHYS_DIRECT_MAP.
+/// #235 Phase 4g (Piece C1): PT-walk dereferences used to go through
+/// PML4[0] identity (low PA mapped 1:1 to low VA).  Routing through
+/// phys_to_kva makes the walker survive the PML4[0] unmap.
+#[inline]
+fn pt_kva(pa: usize) -> *mut u64 {
+    phys_to_kva(pa) as *mut u64
+}
+
 /// Allocate a zero-filled 4K page for a page table.
 fn alloc_table() -> Option<usize> {
     let page = crate::mm::phys::alloc_page()?;
     let addr = page.as_usize();
     unsafe {
-        core::ptr::write_bytes(addr as *mut u8, 0, MMU_PAGE_SIZE);
+        // Zero via direct-map kva so this still works after PML4[0] unmap.
+        core::ptr::write_bytes(
+            phys_to_kva(addr) as *mut u8,
+            0,
+            MMU_PAGE_SIZE,
+        );
     }
     Some(addr)
 }
@@ -369,8 +383,8 @@ pub fn free_shared_user_subtree(table_pa: usize, level: usize, fg: *mut crate::m
 pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
     use crate::mm::ptshare::ForkGroup;
 
-    let parent_pml4 = parent_root as *mut u64;
-    let child_pml4 = child_root as *mut u64;
+    let parent_pml4 = pt_kva(parent_root);
+    let child_pml4 = pt_kva(child_root);
 
     // PML4[0]: both have deep-copied PDPTs. Share PDPT[4+] (user entries).
     let parent_e0 = unsafe { *parent_pml4 };
@@ -381,8 +395,8 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
         && X86Pte::is_valid(child_e0)
         && X86Pte::is_table(child_e0)
     {
-        let parent_pdpt = X86Pte::table_pa(parent_e0) as *mut u64;
-        let child_pdpt = X86Pte::table_pa(child_e0) as *mut u64;
+        let parent_pdpt = pt_kva(X86Pte::table_pa(parent_e0));
+        let child_pdpt = pt_kva(X86Pte::table_pa(child_e0));
         for i in 4..512 {
             let entry = unsafe { *parent_pdpt.add(i) };
             if X86Pte::is_valid(entry) && X86Pte::is_table(entry) {
@@ -593,7 +607,7 @@ pub fn read_and_clear_ref_bit(pml4: usize, va: usize) -> bool {
 /// userspace servers can validate caller-supplied addresses before
 /// dereferencing.  Used by SYS_VA_WRITABLE.
 pub fn va_writable(pml4: usize, va: usize) -> bool {
-    let mut table = pml4 as *mut u64;
+    let mut table = pt_kva(pml4);
     for level in 0..X86Pte::LEVELS {
         let idx = X86Pte::va_index(va, level);
         let entry = unsafe { *table.add(idx) };
@@ -608,7 +622,7 @@ pub fn va_writable(pml4: usize, va: usize) -> bool {
             // execute.
             return (entry & PTE_RW) != 0 && (entry & PTE_US) != 0;
         }
-        table = X86Pte::table_pa(entry) as *mut u64;
+        table = pt_kva(X86Pte::table_pa(entry));
     }
     false
 }
@@ -624,7 +638,7 @@ pub fn translate_va(pml4: usize, va: usize) -> Option<usize> {
     // and the previous walk_to_leaf-based translate_va returned None
     // the moment it hit one.  That made every DRM dumb-buffer mmap
     // that crossed a 2 MiB boundary fail with ENOMEM.
-    let mut table = pml4 as *mut u64;
+    let mut table = pt_kva(pml4);
     for level in 0..X86Pte::LEVELS {
         let idx = X86Pte::va_index(va, level);
         let entry = unsafe { *table.add(idx) };
@@ -651,7 +665,7 @@ pub fn translate_va(pml4: usize, va: usize) -> Option<usize> {
             let pa = (entry as usize) & frame_mask & 0x000F_FFFF_FFFF_FFFF;
             return Some(pa | (va & ((1usize << offset_bits) - 1)));
         }
-        table = X86Pte::table_pa(entry) as *mut u64;
+        table = pt_kva(X86Pte::table_pa(entry));
     }
     None
 }
@@ -674,8 +688,8 @@ pub fn create_user_page_table() -> Option<usize> {
     let new_pml4 = alloc_table()?;
 
     unsafe {
-        let src = boot_pml4_addr as *const u64;
-        let dst = new_pml4 as *mut u64;
+        let src = pt_kva(boot_pml4_addr) as *const u64;
+        let dst = pt_kva(new_pml4);
 
         // Deep-copy PML4[0]: allocate a new PDPT and copy all 512 entries.
         // This gives each process its own PDPT so user mappings in the
@@ -684,7 +698,11 @@ pub fn create_user_page_table() -> Option<usize> {
         if boot_pml4_0 & PTE_P != 0 {
             let boot_pdpt = (boot_pml4_0 & 0x000F_FFFF_FFFF_F000) as usize;
             let new_pdpt = alloc_table()?;
-            core::ptr::copy_nonoverlapping(boot_pdpt as *const u64, new_pdpt as *mut u64, 512);
+            core::ptr::copy_nonoverlapping(
+                pt_kva(boot_pdpt) as *const u64,
+                pt_kva(new_pdpt),
+                512,
+            );
             // Point new PML4[0] to the copied PDPT.
             // Add U/S so the CPU allows user-mode page table walks to the PDPT.
             // Kernel gigapages at PDPT[0-3] are safe: they lack U/S, so user
@@ -748,7 +766,7 @@ pub fn boot_page_table_root() -> usize {
 pub fn free_page_table_tree(root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
     use crate::mm::{ptshare::ForkGroup, page::PhysAddr};
 
-    let pml4 = root as *const u64;
+    let pml4 = pt_kva(root) as *const u64;
     unsafe {
         // PML4[0] was deep-copied (its own PDPT). Free with shared-aware logic.
         // Kernel gigapages at PDPT[0-3] are skipped (is_table = false).
@@ -887,7 +905,7 @@ pub fn demote_superpage(pml4: usize, va: usize, flags: u64) -> bool {
         Some(t) => t,
         None => return false,
     };
-    let pt_table = pt as *mut u64;
+    let pt_table = pt_kva(pt);
 
     // Fill 512 entries.
     for i in 0..512 {
@@ -995,7 +1013,7 @@ pub fn demote_superpage_at_level(
         Some(t) => t,
         None => return false,
     };
-    let table_ptr = new_table as *mut u64;
+    let table_ptr = pt_kva(new_table);
 
     for i in 0..512usize {
         let pa = base_pa + i * sub_size;
