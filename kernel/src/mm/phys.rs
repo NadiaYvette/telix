@@ -812,11 +812,15 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
     let chunk_array_bytes = total_chunks * core::mem::size_of::<ChunkNode>();
     let total_metadata_bytes = chunk_array_bytes;
     let metadata_pages = (total_metadata_bytes + ps - 1) >> pshift;
-    let chunk_ptr = start as *mut ChunkNode;
+    // #235 Piece C2: route chunk-metadata accesses through PHYS_DIRECT_MAP
+    // so they survive the PML4[0] identity-map removal.  `start` is the
+    // first usable RAM PA; `chunks` is read on every alloc/free.
+    let chunk_kva = crate::mm::page::phys_to_kva(start);
+    let chunk_ptr = chunk_kva as *mut ChunkNode;
 
     // Zero the metadata region (chunk array).
     unsafe {
-        core::ptr::write_bytes(start as *mut u8, 0, metadata_pages << pshift);
+        core::ptr::write_bytes(chunk_kva as *mut u8, 0, metadata_pages << pshift);
     }
 
     // Safety: single-threaded at boot; direct stores are fine.
