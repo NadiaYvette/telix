@@ -3403,7 +3403,7 @@ fn do_spawn_heavy_work(
         let pa_usize = pa.as_usize();
 
         unsafe {
-            core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
+            core::ptr::write_bytes(crate::mm::page::phys_to_kva(pa_usize) as *mut u8, 0, ps);
         }
 
         let sw_z = crate::mm::fault::sw_zeroed_bit();
@@ -4110,13 +4110,13 @@ pub fn spawn_user_with_data(
             let pa_usize = pa.as_usize();
 
             unsafe {
-                core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
+                core::ptr::write_bytes(crate::mm::page::phys_to_kva(pa_usize) as *mut u8, 0, ps);
                 let copy_start = page_idx * ps;
                 let copy_end = (copy_start + ps).min(data.len());
                 if copy_start < data.len() {
                     core::ptr::copy_nonoverlapping(
                         data[copy_start..copy_end].as_ptr(),
-                        pa_usize as *mut u8,
+                        crate::mm::page::phys_to_kva(pa_usize) as *mut u8,
                         copy_end - copy_start,
                     );
                 }

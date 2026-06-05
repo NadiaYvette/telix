@@ -149,15 +149,13 @@ pub fn kmain() -> ! {
     sched::topology::print();
 
     // #235 Piece C2: drop the low-RAM identity map.  Helper is in
-    // arch::x86_64::mm::unmap_pml4_0; call gated off.  C2c swept
-    // fault.rs/pager.rs/radix_pt.rs and the kernel now reaches the
-    // demand-paging tests + initramfs_srv with the unmap on (boot
-    // 11amfsq2940 reached `Phase 3: Starting I/O servers...` then
-    // wedged with tid=6 startup_thread spinning post-spawn of
-    // initramfs).  Next blocker likely in the ELF loader path
-    // (`loader/elf.rs:374,400,414` still write/copy via raw PA-as-VA);
-    // sweep that + the syscall handlers' write_bytes(pa_usize) sites
-    // in C2d, then re-enable.
+    // arch::x86_64::mm::unmap_pml4_0; call gated off pending C2e.
+    // C2d swept loader/elf, syscall handlers, scheduler spawn helpers
+    // and virtio-blk vring buffers.  Boot 11amfsq2942 (unmap on) now
+    // reaches Phase 2 demand-paging PASS + Phase 3 acpi_srv spawn,
+    // but wedges on `THREAD-PTR-OOR: tid=14 p=0x0` (THREAD_TABLE lookup
+    // returns NULL for an unspawned tid).  Next session investigates
+    // who's calling `thread_ref(14)` before the spawn lands.
     // arch::x86_64::mm::unmap_pml4_0();
 
     // Background page pre-zeroing daemon.

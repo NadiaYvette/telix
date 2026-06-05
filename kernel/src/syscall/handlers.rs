@@ -1848,7 +1848,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
 
         // Zero the page.
         unsafe {
-            core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
+            core::ptr::write_bytes(crate::mm::page::phys_to_kva(pa_usize) as *mut u8, 0, ps);
         }
 
         // Map each MMU page within this alloc page, but only up to mmu_pages total.
@@ -2818,7 +2818,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         let pa_usize = pa.as_usize();
 
         unsafe {
-            core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
+            core::ptr::write_bytes(crate::mm::page::phys_to_kva(pa_usize) as *mut u8, 0, ps);
         }
 
         let sw_z = crate::mm::fault::sw_zeroed_bit();
@@ -3288,7 +3288,7 @@ pub(crate) fn exec_for_task(
             if let Some((pa, _)) = crate::mm::object::with_object(obj_id, |obj| obj.ensure_page(0)) {
                 let pa_usize = pa.as_usize();
                 unsafe {
-                    core::ptr::write_bytes(pa_usize as *mut u8, 0, page::page_size());
+                    core::ptr::write_bytes(crate::mm::page::phys_to_kva(pa_usize) as *mut u8, 0, page::page_size());
                 }
                 let sw_z = crate::mm::fault::sw_zeroed_bit();
                 let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
@@ -3400,7 +3400,7 @@ pub(crate) fn exec_for_task(
         .expect("exec_for_task: stack alloc");
         let pa_usize = pa.as_usize();
 
-        unsafe { core::ptr::write_bytes(pa_usize as *mut u8, 0, ps); }
+        unsafe { core::ptr::write_bytes(crate::mm::page::phys_to_kva(pa_usize) as *mut u8, 0, ps); }
 
         let sw_z = crate::mm::fault::sw_zeroed_bit();
         let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;

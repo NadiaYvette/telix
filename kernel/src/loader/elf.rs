@@ -371,7 +371,11 @@ fn load_segment(
         // Zero the page only if we just created it.
         if !already_mapped {
             unsafe {
-                core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
+                core::ptr::write_bytes(
+                    crate::mm::page::phys_to_kva(pa_usize) as *mut u8,
+                    0,
+                    ps,
+                );
             }
         }
 
@@ -397,7 +401,7 @@ fn load_segment(
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             data.as_ptr().add(src_start),
-                            (mmu_pa + dst_offset) as *mut u8,
+                            (crate::mm::page::phys_to_kva(mmu_pa) + dst_offset) as *mut u8,
                             copy_len,
                         );
                     }
@@ -411,7 +415,7 @@ fn load_segment(
                     // happens only at spawn (not hot-path).
                     unsafe {
                         let src = data.as_ptr().add(src_start);
-                        let dst = (mmu_pa + dst_offset) as *const u8;
+                        let dst = (crate::mm::page::phys_to_kva(mmu_pa) + dst_offset) as *const u8;
                         let mut s1_src: u16 = 0; let mut s2_src: u16 = 0;
                         let mut s1_dst: u16 = 0; let mut s2_dst: u16 = 0;
                         for i in 0..copy_len {

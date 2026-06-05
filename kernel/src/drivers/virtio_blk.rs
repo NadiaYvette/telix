@@ -244,8 +244,10 @@ impl VirtioBlk {
             return Err(());
         }
 
-        // Write request header.
-        let hdr = self.req_hdr_pa as *mut VirtioBlkReqHdr;
+        // Write request header.  Vring descriptors store device-visible
+        // PAs but the kernel touches the buffers via PHYS_DIRECT_MAP kvas
+        // (#235 — PML4[0] identity goes away).
+        let hdr = crate::mm::page::phys_to_kva(self.req_hdr_pa) as *mut VirtioBlkReqHdr;
         unsafe {
             (*hdr).req_type = VIRTIO_BLK_T_IN;
             (*hdr).reserved = 0;
@@ -253,7 +255,7 @@ impl VirtioBlk {
         }
 
         // Write status byte to 0xFF (will be overwritten by device).
-        let status_ptr = self.status_pa as *mut u8;
+        let status_ptr = crate::mm::page::phys_to_kva(self.status_pa) as *mut u8;
         unsafe {
             *status_ptr = 0xFF;
         }
@@ -263,7 +265,7 @@ impl VirtioBlk {
         // Use offset 32 in our buffer page for the 512-byte data.
         let data_pa = self.req_hdr_pa + 32;
 
-        let descs = self.desc_pa as *mut VringDesc;
+        let descs = crate::mm::page::phys_to_kva(self.desc_pa) as *mut VringDesc;
         let d0 = self.alloc_desc();
         let d1 = self.alloc_desc();
         let d2 = self.alloc_desc();
@@ -306,7 +308,11 @@ impl VirtioBlk {
 
         // Copy data out.
         unsafe {
-            core::ptr::copy_nonoverlapping(data_pa as *const u8, buf.as_mut_ptr(), 512);
+            core::ptr::copy_nonoverlapping(
+                crate::mm::page::phys_to_kva(data_pa) as *const u8,
+                buf.as_mut_ptr(),
+                512,
+            );
         }
 
         // Free descriptors.
@@ -321,24 +327,28 @@ impl VirtioBlk {
             return Err(());
         }
 
-        let hdr = self.req_hdr_pa as *mut VirtioBlkReqHdr;
+        let hdr = crate::mm::page::phys_to_kva(self.req_hdr_pa) as *mut VirtioBlkReqHdr;
         unsafe {
             (*hdr).req_type = VIRTIO_BLK_T_OUT;
             (*hdr).reserved = 0;
             (*hdr).sector = sector;
         }
 
-        let status_ptr = self.status_pa as *mut u8;
+        let status_ptr = crate::mm::page::phys_to_kva(self.status_pa) as *mut u8;
         unsafe {
             *status_ptr = 0xFF;
         }
 
         let data_pa = self.req_hdr_pa + 32;
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), data_pa as *mut u8, 512);
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                crate::mm::page::phys_to_kva(data_pa) as *mut u8,
+                512,
+            );
         }
 
-        let descs = self.desc_pa as *mut VringDesc;
+        let descs = crate::mm::page::phys_to_kva(self.desc_pa) as *mut VringDesc;
         let d0 = self.alloc_desc();
         let d1 = self.alloc_desc();
         let d2 = self.alloc_desc();
@@ -383,7 +393,7 @@ impl VirtioBlk {
     }
 
     fn submit(&mut self, head: u16) {
-        let avail = self.avail_pa as *mut VringAvail;
+        let avail = crate::mm::page::phys_to_kva(self.avail_pa) as *mut VringAvail;
         unsafe {
             let idx = (*avail).idx;
             (*avail).ring[(idx as usize) % QUEUE_SIZE] = head;
@@ -396,7 +406,7 @@ impl VirtioBlk {
     }
 
     fn wait_complete(&mut self) {
-        let used = self.used_pa as *mut VringUsed;
+        let used = crate::mm::page::phys_to_kva(self.used_pa) as *mut VringUsed;
         let tid = crate::sched::current_thread_id();
         // Store our tid so the IRQ handler can wake us (best-effort).
         BLK_WAITER_TID.store(tid, Ordering::Release);
