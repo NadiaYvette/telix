@@ -309,9 +309,19 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                     let rip = frame_peek.rip();
                     let mut bytes = [0u8; 16];
                     let pt_root = crate::sched::scheduler::current_page_table_root();
-                    let ok = crate::syscall::handlers::copy_from_user(
-                        pt_root, rip as usize, &mut bytes,
-                    );
+                    // #208 family: a corrupted iretq frame can carry user CS
+                    // even on a kernel task whose pt_root is 0.  Skipping the
+                    // peek there avoids falling into copy_from_user's
+                    // "kernel thread, direct deref" path, which would
+                    // re-fault on the user RIP and add noise to the PF
+                    // record we're already trying to diagnose.
+                    let ok = if pt_root == 0 {
+                        false
+                    } else {
+                        crate::syscall::handlers::copy_from_user(
+                            pt_root, rip as usize, &mut bytes,
+                        )
+                    };
                     let all_zero = bytes.iter().all(|&b| b == 0);
                     crate::println!(
                         "FIRST-IRETQ-USER: tid={} cpu={} vec={} sp={:#x} \
