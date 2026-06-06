@@ -172,11 +172,12 @@ pub fn kmain() -> ! {
     // 5264/46037/65432 (random, different each run) and obj31
     // sometimes a KVA back into the magazine array — i.e. another
     // subsystem is using the same physical pages.  Fix #228 first.
-    // #235 / #228: helper gated off.  Probe boot 11amfsq2963 confirms
-    // phys::alloc_page never returns a PA inside the magazine slice
-    // (no_realloc check never fires) — the C2h magazine corruption is
-    // NOT phys allocator double-issue.  Writer is somewhere else.
-    // arch::x86_64::mm::unmap_pml4_0();
+    // #235 C2i: with the exception PT-walk dump + swap-test + virtio
+    // init-time sweeps in (548f58a, 2e950cf, 3d9d9da), enable the
+    // unmap again and see whether the C2h slab corruption has moved
+    // (the leftover identity-VA writer may have been one of those).
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::mm::unmap_pml4_0();
 
     // Background page pre-zeroing daemon.
     sched::spawn(mm::zeropool::zero_daemon, 1, 5).expect("spawn zero_daemon");
