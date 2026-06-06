@@ -1773,19 +1773,26 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
         let cpu = crate::sched::smp::cpu_id();
         // Walk the PT chain for CR2 to identify which level is missing.
         // Bit-level breakdown of the 4 levels of pointers.
+        // #235: route the diagnostic PT walk through PHYS_DIRECT_MAP so
+        // the handler doesn't re-fault when the kernel #PFs at a low VA
+        // after the PML4[0] identity unmap.
         let cr3_pa = (cr3 & !0xFFF) as usize;
-        let pml4_e = unsafe { *((cr3_pa + ((cr2 >> 39) & 0x1FF) as usize * 8) as *const u64) };
+        let pml4_kva = crate::mm::page::phys_to_kva(cr3_pa);
+        let pml4_e = unsafe { *((pml4_kva + ((cr2 >> 39) & 0x1FF) as usize * 8) as *const u64) };
         let pdpt_e = if pml4_e & 1 != 0 {
             let pdpt_pa = (pml4_e & 0x000F_FFFF_FFFF_F000) as usize;
-            unsafe { *((pdpt_pa + ((cr2 >> 30) & 0x1FF) as usize * 8) as *const u64) }
+            let pdpt_kva = crate::mm::page::phys_to_kva(pdpt_pa);
+            unsafe { *((pdpt_kva + ((cr2 >> 30) & 0x1FF) as usize * 8) as *const u64) }
         } else { 0 };
         let pd_e = if pdpt_e & 1 != 0 {
             let pd_pa = (pdpt_e & 0x000F_FFFF_FFFF_F000) as usize;
-            unsafe { *((pd_pa + ((cr2 >> 21) & 0x1FF) as usize * 8) as *const u64) }
+            let pd_kva = crate::mm::page::phys_to_kva(pd_pa);
+            unsafe { *((pd_kva + ((cr2 >> 21) & 0x1FF) as usize * 8) as *const u64) }
         } else { 0 };
         let pt_e = if pd_e & 1 != 0 {
             let pt_pa = (pd_e & 0x000F_FFFF_FFFF_F000) as usize;
-            unsafe { *((pt_pa + ((cr2 >> 12) & 0x1FF) as usize * 8) as *const u64) }
+            let pt_kva = crate::mm::page::phys_to_kva(pt_pa);
+            unsafe { *((pt_kva + ((cr2 >> 12) & 0x1FF) as usize * 8) as *const u64) }
         } else { 0 };
         // Stack-content snapshot: read 16 quads at and below rsp.  For
         // the wild-RIP-in-kstack pattern (boots 1690/1691), the saved
