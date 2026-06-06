@@ -305,6 +305,25 @@ impl Magazine {
 
     #[inline]
     fn pop(&mut self) -> usize {
+        // #235 C2h: surface where the corrupted Magazine lives + what
+        // its neighborhood looks like.  The original \`self.objs[count]\`
+        // panic gives only the bad index, not the victim address.
+        if self.count == 0 || self.count as usize > MAG_CAPACITY {
+            let va = self as *const _ as usize;
+            let pa_guess = crate::mm::page::kva_to_phys(va);
+            crate::println!(
+                "SLAB-MAG-CORRUPT: va={:p} pa~={:#x} count={} obj0={:#x} obj31={:#x}",
+                self as *const _,
+                pa_guess,
+                self.count,
+                self.objs[0],
+                self.objs[31],
+            );
+            panic!(
+                "Magazine corruption: count={} > MAG_CAPACITY={}",
+                self.count, MAG_CAPACITY
+            );
+        }
         self.count -= 1;
         self.objs[self.count as usize]
     }

@@ -165,6 +165,13 @@ pub fn kmain() -> ! {
     // routing bug; magazine memory itself is being scribbled.  C2h
     // should set a slab-canary or DR0 watch on a Magazine's count
     // field to catch the writer.
+    // #235 Piece C2h: helper still gated off — slab corruption is
+    // downstream of the phys double-issue bug tracked as #228.  The
+    // C2h Magazine bound-check + dump (4-boot batch, unmap on) caught
+    // three corruptions at PA 0x1e150000-0x1e152310 with count values
+    // 5264/46037/65432 (random, different each run) and obj31
+    // sometimes a KVA back into the magazine array — i.e. another
+    // subsystem is using the same physical pages.  Fix #228 first.
     // arch::x86_64::mm::unmap_pml4_0();
 
     // Background page pre-zeroing daemon.
