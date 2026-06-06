@@ -1292,14 +1292,15 @@ fn test_swap_e2e() {
             page_idx,
         );
 
-        // Write pattern: translate VA → PA, write through identity map.
+        // Write pattern via PHYS_DIRECT_MAP kva (#235).
         let pa = mm::hat::translate_va(pt_root, va).expect("swap e2e translate");
         let pattern = 0xDEAD_0000u64 | (page_idx as u64);
-        let ptr = pa as *mut u64;
+        let kva = mm::page::phys_to_kva(pa);
+        let ptr = kva as *mut u64;
         unsafe {
             // Write pattern at the start and end of the page.
             core::ptr::write_volatile(ptr, pattern);
-            let end_ptr = (pa + ps - 8) as *mut u64;
+            let end_ptr = (kva + ps - 8) as *mut u64;
             core::ptr::write_volatile(end_ptr, pattern ^ 0xFFFF_FFFF);
         }
     }
@@ -1338,13 +1339,14 @@ fn test_swap_e2e() {
             result,
         );
 
-        // Verify pattern through identity-mapped PA.
+        // Verify pattern through PHYS_DIRECT_MAP kva (#235).
         let pa = mm::hat::translate_va(pt_root, va).expect("swap e2e translate after");
         let pattern = 0xDEAD_0000u64 | (page_idx as u64);
-        let ptr = pa as *const u64;
+        let kva = mm::page::phys_to_kva(pa);
+        let ptr = kva as *const u64;
         unsafe {
             let start_val = core::ptr::read_volatile(ptr);
-            let end_val = core::ptr::read_volatile((pa + ps - 8) as *const u64);
+            let end_val = core::ptr::read_volatile((kva + ps - 8) as *const u64);
             assert_eq!(
                 start_val, pattern,
                 "swap e2e: page {} start mismatch: got {:#x}, expected {:#x}",
@@ -1418,9 +1420,10 @@ fn test_swap_cow_fork() {
         mm::fault::handle_page_fault(parent_aspace, va, mm::fault::FaultType::Write);
         let pa = mm::hat::translate_va(pt_root, va).expect("swap cow translate");
         let pattern = 0xCAFE_0000u64 | (page_idx as u64);
+        let kva = mm::page::phys_to_kva(pa);
         unsafe {
-            core::ptr::write_volatile(pa as *mut u64, pattern);
-            core::ptr::write_volatile((pa + ps - 8) as *mut u64, pattern ^ 0xFFFF_FFFF);
+            core::ptr::write_volatile(kva as *mut u64, pattern);
+            core::ptr::write_volatile((kva + ps - 8) as *mut u64, pattern ^ 0xFFFF_FFFF);
         }
     }
 
@@ -1453,9 +1456,10 @@ fn test_swap_cow_fork() {
 
         let pa = mm::hat::translate_va(child_pt_root, va).expect("swap cow child translate");
         let pattern = 0xCAFE_0000u64 | (page_idx as u64);
+        let kva = mm::page::phys_to_kva(pa);
         unsafe {
-            let start_val = core::ptr::read_volatile(pa as *const u64);
-            let end_val = core::ptr::read_volatile((pa + ps - 8) as *const u64);
+            let start_val = core::ptr::read_volatile(kva as *const u64);
+            let end_val = core::ptr::read_volatile((kva + ps - 8) as *const u64);
             assert_eq!(
                 start_val, pattern,
                 "swap cow: child page {} start mismatch: got {:#x}, expected {:#x}",
@@ -1484,9 +1488,10 @@ fn test_swap_cow_fork() {
 
         let pa = mm::hat::translate_va(pt_root, va).expect("swap cow parent translate");
         let pattern = 0xCAFE_0000u64 | (page_idx as u64);
+        let kva = mm::page::phys_to_kva(pa);
         unsafe {
-            let start_val = core::ptr::read_volatile(pa as *const u64);
-            let end_val = core::ptr::read_volatile((pa + ps - 8) as *const u64);
+            let start_val = core::ptr::read_volatile(kva as *const u64);
+            let end_val = core::ptr::read_volatile((kva + ps - 8) as *const u64);
             assert_eq!(
                 start_val, pattern,
                 "swap cow: parent page {} start mismatch: got {:#x}, expected {:#x}",
