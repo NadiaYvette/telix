@@ -383,6 +383,14 @@ pub(crate) fn init_dynamic_percpu() {
     unsafe {
         let s = crate::mm::phys::alloc_static_slice::<[MagazinePair; NUM_CACHES]>(n);
         CPU_MAGAZINES_PTR.store(s.as_mut_ptr(), Ordering::Release);
+        // #228 probe: register the magazine slice's PA range with
+        // the phys allocator so any subsequent alloc_pages return
+        // that lands inside it panics on the spot (double-issue
+        // smoking gun for the C2h corruption capture).
+        let va = s.as_mut_ptr() as usize;
+        let pa = crate::mm::page::kva_to_phys(va);
+        let bytes = n * core::mem::size_of::<[MagazinePair; NUM_CACHES]>();
+        crate::mm::phys::register_no_realloc_range(pa, pa + bytes, "slab_magazines");
     }
 }
 

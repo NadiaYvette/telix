@@ -937,8 +937,53 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
     );
 }
 
+/// #228 probe: register a PA range that must never be returned by
+/// alloc_page/alloc_pages.  Used by slab to pin its per-CPU magazine
+/// slice — any subsequent alloc landing in that range is a phys
+/// allocator double-issue (the C2h corruption signature).
+static NO_REALLOC_START: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static NO_REALLOC_END: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static NO_REALLOC_LABEL: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_no_realloc_range(start_pa: usize, end_pa: usize, label: &'static str) {
+    NO_REALLOC_LABEL.store(label.as_ptr() as *mut u8, Ordering::Relaxed);
+    NO_REALLOC_END.store(end_pa, Ordering::Relaxed);
+    NO_REALLOC_START.store(start_pa, Ordering::Release);
+    crate::println!(
+        "[#228 probe] no_realloc range registered: {} pa=[{:#x}..{:#x})",
+        label, start_pa, end_pa,
+    );
+}
+
+#[inline]
+fn check_pa_not_reserved(pa: usize, site: &str) {
+    let start = NO_REALLOC_START.load(Ordering::Acquire);
+    if start == 0 {
+        return;
+    }
+    let end = NO_REALLOC_END.load(Ordering::Relaxed);
+    if pa >= start && pa < end {
+        panic!(
+            "[#228] phys::{} returned reserved PA {:#x} in no_realloc range [{:#x}..{:#x})",
+            site, pa, start, end,
+        );
+    }
+}
+
 /// Allocate a single page. Returns its physical address.
 pub fn alloc_page() -> Option<PhysAddr> {
+    let r = alloc_page_inner();
+    if let Some(ref pa) = r {
+        check_pa_not_reserved(pa.as_usize(), "alloc_page");
+    }
+    r
+}
+
+#[cfg_attr(feature = "dumb_phys_alloc", allow(unused))]
+fn alloc_page_inner() -> Option<PhysAddr> {
     #[cfg(feature = "dumb_phys_alloc")]
     {
         return super::phys_dumb::alloc_page();
@@ -1154,6 +1199,16 @@ pub fn free_page(addr: PhysAddr) {
 #[cfg_attr(feature = "dumb_phys_alloc", allow(unused))]
 #[allow(dead_code)]
 pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
+    let r = alloc_pages_inner(order);
+    if let Some(ref pa) = r {
+        check_pa_not_reserved(pa.as_usize(), "alloc_pages");
+    }
+    r
+}
+
+#[cfg_attr(feature = "dumb_phys_alloc", allow(unused))]
+#[allow(dead_code)]
+fn alloc_pages_inner(order: usize) -> Option<PhysAddr> {
     #[cfg(feature = "dumb_phys_alloc")]
     {
         return super::phys_dumb::alloc_pages(order);
