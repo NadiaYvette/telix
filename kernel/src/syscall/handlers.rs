@@ -3912,7 +3912,11 @@ pub(crate) fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> 
         let page_remaining = 4096 - (pa & 0xFFF);
         let to_copy = page_remaining.min(dst.len() - offset);
         unsafe {
-            core::ptr::copy_nonoverlapping(pa as *const u8, dst.as_mut_ptr().add(offset), to_copy);
+            core::ptr::copy_nonoverlapping(
+                crate::mm::page::phys_to_kva(pa) as *const u8,
+                dst.as_mut_ptr().add(offset),
+                to_copy,
+            );
         }
         offset += to_copy;
     }
@@ -3940,7 +3944,11 @@ pub(crate) fn copy_to_user(pt_root: usize, user_va: usize, src: &[u8]) -> bool {
         let page_remaining = 4096 - (pa & 0xFFF);
         let to_copy = page_remaining.min(src.len() - offset);
         unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr().add(offset), pa as *mut u8, to_copy);
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(offset),
+                crate::mm::page::phys_to_kva(pa) as *mut u8,
+                to_copy,
+            );
         }
         offset += to_copy;
     }
