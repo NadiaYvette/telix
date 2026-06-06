@@ -508,12 +508,36 @@ pub fn _print(args: fmt::Arguments) {
     // Release the per-CPU buffer slot (if we acquired it).  Doing this
     // last ensures no peer (IRQ-context reentry on this CPU) tries to
     // reuse it while we're still reading.
+    //
+    // #208 Pattern A guard: 8-boot PF survey (boot 2978) caught this
+    // release deref'ing a slot pointer of 0x19 instead of the real
+    // &PRINT_BUFS[cpu] kva.  Range-check before the store so the
+    // upstream-corruption symptom is a diagnostic line instead of a
+    // kernel #PF that re-enters _print and may cascade.
     if let Some(s) = slot {
-        s.busy.store(false, core::sync::atomic::Ordering::Release);
+        let p = s as *const CpuPrintBufs as usize;
+        if !slot_kva_looks_sane(p) {
+            handler_write_bytes(b"PRINT-SLOT-CORRUPT: slot ptr scribbled\n");
+        } else {
+            s.busy.store(false, core::sync::atomic::Ordering::Release);
+        }
     }
     if let Some(s) = fallback_slot {
-        s.busy.store(false, core::sync::atomic::Ordering::Release);
+        let p = s as *const CpuFallbackBufs as usize;
+        if !slot_kva_looks_sane(p) {
+            handler_write_bytes(b"PRINT-FALLBACK-CORRUPT: fallback ptr scribbled\n");
+        } else {
+            s.busy.store(false, core::sync::atomic::Ordering::Release);
+        }
     }
+}
+
+#[inline]
+fn slot_kva_looks_sane(p: usize) -> bool {
+    // PRINT_BUFS / FALLBACK_BUFS live in .bss (kernel high-half via
+    // PML4[511], 0xFFFFFFFF80000000+).  Any "slot ptr" that's not in
+    // that range was scribbled — log instead of dereferencing.
+    p >= 0xFFFF_FFFF_8000_0000
 }
 
 #[macro_export]

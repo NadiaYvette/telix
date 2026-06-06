@@ -108,19 +108,24 @@ fn pte_for(pml4: usize, va: u64) -> u64 {
     const PTE_P:  u64 = 1 << 0;
     const PTE_PS: u64 = 1 << 7;
     const FRAME_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    // #235: route each PT page through PHYS_DIRECT_MAP — the raw
+    // pa-as-va deref crashed every kernel #PF dump after the PML4[0]
+    // unmap (boot batch 2995-3002 RIP=0x8017b92b CR2 ∈ {0x29e80000,
+    // 0x21740000, 0x20460000, 0x1ff90000}).
+    use crate::mm::page::phys_to_kva;
     unsafe {
-        let table0 = pml4 as *const u64;
+        let table0 = phys_to_kva(pml4) as *const u64;
         let e0 = *table0.add(pml4_idx);
         if e0 & PTE_P == 0 { return 0; }
-        let table1 = (e0 & FRAME_MASK) as *const u64;
+        let table1 = phys_to_kva((e0 & FRAME_MASK) as usize) as *const u64;
         let e1 = *table1.add(pdpt_idx);
         if e1 & PTE_P == 0 { return 0; }
         if e1 & PTE_PS != 0 { return e1; } // 1 GiB superpage
-        let table2 = (e1 & FRAME_MASK) as *const u64;
+        let table2 = phys_to_kva((e1 & FRAME_MASK) as usize) as *const u64;
         let e2 = *table2.add(pd_idx);
         if e2 & PTE_P == 0 { return 0; }
         if e2 & PTE_PS != 0 { return e2; } // 2 MiB superpage
-        let table3 = (e2 & FRAME_MASK) as *const u64;
+        let table3 = phys_to_kva((e2 & FRAME_MASK) as usize) as *const u64;
         let e3 = *table3.add(pt_idx);
         e3
     }
