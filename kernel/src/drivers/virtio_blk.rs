@@ -161,7 +161,11 @@ impl VirtioBlk {
         let vq_page = phys::alloc_page()?;
         let vq_base = vq_page.as_usize();
         unsafe {
-            core::ptr::write_bytes(vq_base as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                crate::mm::page::phys_to_kva(vq_base) as *mut u8,
+                0,
+                4096,
+            );
         }
 
         let desc_pa = vq_base;
@@ -188,7 +192,11 @@ impl VirtioBlk {
             let buf_page = phys::alloc_page()?;
             let buf_base = buf_page.as_usize();
             unsafe {
-                core::ptr::write_bytes(buf_base as *mut u8, 0, 4096);
+                core::ptr::write_bytes(
+                    crate::mm::page::phys_to_kva(buf_base) as *mut u8,
+                    0,
+                    4096,
+                );
             }
 
             return Some(Self {
@@ -222,7 +230,11 @@ impl VirtioBlk {
         let buf_page = phys::alloc_page()?;
         let buf_base = buf_page.as_usize();
         unsafe {
-            core::ptr::write_bytes(buf_base as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                crate::mm::page::phys_to_kva(buf_base) as *mut u8,
+                0,
+                4096,
+            );
         }
 
         Some(Self {
