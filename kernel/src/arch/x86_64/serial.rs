@@ -381,10 +381,26 @@ impl<'a> fmt::Write for SliceWriter<'a> {
     }
 }
 
+/// #208 / #235 Pattern A probe: 16-boot survey found that every
+/// recurring kernel-text #PF fires on the FIRST deref of a caller-
+/// saved stack slot AFTER a `_print` call returns.  Two distinct
+/// callers reproduce in 2/16 boots each (validate_iretq_frame +
+/// fb_console::write_str, same pattern).  Plant a magic word at a
+/// reserved stack slot on entry and verify it on exit — if it changes
+/// while _print runs, log the corrupted value to confirm the upstream
+/// writer's signature (or rule the theory out).
+const PRINT_CANARY: u64 = 0x504b4e413a3a0a13; // "PNA::\n\x13" — easy to grep
+static PRINT_CANARY_SCRIBBLE_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
     init_uart_fifo_once();
+    let mut canary: u64 = PRINT_CANARY;
+    // Force the canary to live on the stack across calls (otherwise
+    // the optimizer collapses it to a register or a constant).
+    unsafe { core::ptr::write_volatile(&mut canary as *mut u64, PRINT_CANARY); }
 
     // Acquire this CPU's print buffer slot.  If busy (re-entry from
     // an IRQ that fired while we were already inside _print, or the
@@ -528,6 +544,28 @@ pub fn _print(args: fmt::Arguments) {
             handler_write_bytes(b"PRINT-FALLBACK-CORRUPT: fallback ptr scribbled\n");
         } else {
             s.busy.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+    // #208/#235 Pattern A probe: did anyone scribble our stack canary?
+    let observed = unsafe { core::ptr::read_volatile(&canary as *const u64) };
+    if observed != PRINT_CANARY {
+        let canary = observed;
+        let n = PRINT_CANARY_SCRIBBLE_COUNT
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 16 {
+            handler_write_bytes(b"PRINT-CANARY-SCRIBBLE n=0x");
+            for shift in (0..2).rev() {
+                let nib = (n >> (shift * 4)) & 0xF;
+                let c = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
+                handler_write_bytes(core::slice::from_ref(&c));
+            }
+            handler_write_bytes(b" got=0x");
+            for shift in (0..16).rev() {
+                let nib = (canary >> (shift * 4)) & 0xF;
+                let c = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
+                handler_write_bytes(core::slice::from_ref(&c));
+            }
+            handler_write_bytes(b"\n");
         }
     }
 }
