@@ -166,6 +166,59 @@ pub const FRAME_SIZE_U64: usize = 22;
 pub const EXCEPTION_FRAME_SIZE: usize = FRAME_SIZE_U64 * 8; // 176 bytes
 
 /// Validate the iretq frame at `sp` before returning to assembly.
+// #208 Pattern A sweep: module-level put_* helpers used by atomic-emit
+// dump paths that must avoid `format_args!()` — the macro's temporary
+// Argument array gets placed by the optimizer at slots that overlap
+// the caller's locals, surfacing as the recurring print-then-deref
+// kernel-text #PF family.  These helpers take a stack-local buffer +
+// index by mut ref, write ASCII, and the caller emits via
+// `serial::handler_write_bytes` (atomic per-call, no format_args).
+
+#[inline]
+fn put_byte(buf: &mut [u8], n: &mut usize, b: u8) {
+    if *n < buf.len() { buf[*n] = b; *n += 1; }
+}
+#[inline]
+fn put_bytes(buf: &mut [u8], n: &mut usize, s: &[u8]) {
+    for &b in s { put_byte(buf, n, b); }
+}
+#[inline]
+fn put_hex_u64(buf: &mut [u8], n: &mut usize, mut v: u64) {
+    put_bytes(buf, n, b"0x");
+    if v == 0 { put_byte(buf, n, b'0'); return; }
+    let mut digits = [0u8; 16];
+    let mut k = 0;
+    while v > 0 {
+        let d = (v & 0xf) as u8;
+        digits[k] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        v >>= 4;
+        k += 1;
+    }
+    for i in (0..k).rev() { put_byte(buf, n, digits[i]); }
+}
+#[inline]
+fn put_dec_u64(buf: &mut [u8], n: &mut usize, mut v: u64) {
+    if v == 0 { put_byte(buf, n, b'0'); return; }
+    let mut digits = [0u8; 20];
+    let mut k = 0;
+    while v > 0 {
+        digits[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        k += 1;
+    }
+    for i in (0..k).rev() { put_byte(buf, n, digits[i]); }
+}
+#[inline]
+fn put_hex_018(buf: &mut [u8], n: &mut usize, v: u64) {
+    // 0x + 16-nibble zero-padded — matches `{:#018x}`.
+    put_bytes(buf, n, b"0x");
+    for shift in (0..16).rev() {
+        let d = ((v >> (shift * 4)) & 0xf) as u8;
+        let c = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        put_byte(buf, n, c);
+    }
+}
+
 /// If the frame is bad but `sp == fallback_sp` (no context switch happened),
 /// we have no safe recovery — halt. If a switch did happen, mark the target
 /// killed and return fallback_sp.
@@ -483,35 +536,71 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         let tid = crate::sched::scheduler::current_thread_id();
         let tref = crate::sched::scheduler::thread_ref(tid);
         let cur_cpu = crate::sched::smp::cpu_id();
-        crate::println!(
-            "BAD frame: CS={:#x} SS={:#x} RIP={:#x} vec={} tid={} sp={:#x} src={} last_cpu={} cur_cpu={}",
-            cs, ss, f.rip(), vector, tid, sp,
-            tref.saved_sp_source,
-            tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed),
-            cur_cpu
-        );
-        // Dump full frame to diagnose corruption pattern. If GPRs (offsets
-        // 0-112) are valid but CPU-pushed (136-168) are garbage: partial
-        // overwrite from frame top. If everything is garbage: full page alias.
-        crate::println!(
-            "  saved_sp={:#x} kstack={:#x} task={}",
-            tref.saved_sp, tref.stack_base, tref.task_id
-        );
+        // #208 Pattern A sweep: atomic emit via handler_write_bytes —
+        // each chunk is a stack-local buf + manual put_*, no
+        // format_args!() temporaries that the optimizer could place
+        // at slots overlapping the caller's locals.
+        {
+            let mut buf = [0u8; 256];
+            let mut n = 0;
+            put_bytes(&mut buf, &mut n, b"BAD frame: CS=");
+            put_hex_u64(&mut buf, &mut n, cs);
+            put_bytes(&mut buf, &mut n, b" SS=");
+            put_hex_u64(&mut buf, &mut n, ss);
+            put_bytes(&mut buf, &mut n, b" RIP=");
+            put_hex_u64(&mut buf, &mut n, f.rip());
+            put_bytes(&mut buf, &mut n, b" vec=");
+            put_dec_u64(&mut buf, &mut n, vector);
+            put_bytes(&mut buf, &mut n, b" tid=");
+            put_dec_u64(&mut buf, &mut n, tid as u64);
+            put_bytes(&mut buf, &mut n, b" sp=");
+            put_hex_u64(&mut buf, &mut n, sp);
+            put_bytes(&mut buf, &mut n, b" src=");
+            put_dec_u64(&mut buf, &mut n, tref.saved_sp_source as u64);
+            put_bytes(&mut buf, &mut n, b" last_cpu=");
+            put_dec_u64(
+                &mut buf, &mut n,
+                tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed) as u64,
+            );
+            put_bytes(&mut buf, &mut n, b" cur_cpu=");
+            put_dec_u64(&mut buf, &mut n, cur_cpu as u64);
+            put_byte(&mut buf, &mut n, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+        }
+        {
+            let mut buf = [0u8; 128];
+            let mut n = 0;
+            put_bytes(&mut buf, &mut n, b"  saved_sp=");
+            put_hex_u64(&mut buf, &mut n, tref.saved_sp);
+            put_bytes(&mut buf, &mut n, b" kstack=");
+            put_hex_u64(&mut buf, &mut n, tref.stack_base as u64);
+            put_bytes(&mut buf, &mut n, b" task=");
+            put_dec_u64(&mut buf, &mut n, tref.task_id as u64);
+            put_byte(&mut buf, &mut n, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+        }
         // Raw dump: 22 u64 values at [sp..sp+176).  Annotate any value
         // that falls in a live thread's kstack range (#208 ladder
         // step 1: visually distinguish kstack pointers from garbage).
         for i in 0..22u64 {
             let val = unsafe { *((sp + i * 8) as *const u64) };
+            let mut buf = [0u8; 128];
+            let mut n = 0;
+            put_bytes(&mut buf, &mut n, b"  frame[");
+            put_dec_u64(&mut buf, &mut n, i);
+            put_bytes(&mut buf, &mut n, b"]=");
+            put_hex_018(&mut buf, &mut n, val);
             if let Some((annot_tid, off)) =
                 crate::sched::scheduler::classify_kstack_value(val)
             {
-                crate::println!(
-                    "  frame[{}]={:#018x} [kstack tid={} +{:#x}]",
-                    i, val, annot_tid, off,
-                );
-            } else {
-                crate::println!("  frame[{}]={:#018x}", i, val);
+                put_bytes(&mut buf, &mut n, b" [kstack tid=");
+                put_dec_u64(&mut buf, &mut n, annot_tid as u64);
+                put_bytes(&mut buf, &mut n, b" +");
+                put_hex_u64(&mut buf, &mut n, off as u64);
+                put_byte(&mut buf, &mut n, b']');
             }
+            put_byte(&mut buf, &mut n, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
         }
         // #208 H-A vs H-B probe: also dump the frame at tref.saved_sp.
         // If validate's sp ≠ saved_sp, we're checking the wrong frame.
@@ -519,43 +608,62 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         // If saved_sp frame is clean → validate's sp path is wrong (H-B).
         let saved_sp = tref.saved_sp;
         if saved_sp != 0 && saved_sp != sp {
-            crate::println!(
-                "  [also dumping at saved_sp={:#x} (Δ={:#x})]",
-                saved_sp,
-                saved_sp.wrapping_sub(sp) as i64,
-            );
+            let mut buf = [0u8; 96];
+            let mut n = 0;
+            put_bytes(&mut buf, &mut n, b"  [also dumping at saved_sp=");
+            put_hex_u64(&mut buf, &mut n, saved_sp);
+            put_bytes(&mut buf, &mut n, b" delta=");
+            // Print as signed: if delta < 0 prefix with '-' and negate.
+            let d = saved_sp.wrapping_sub(sp) as i64;
+            if d < 0 {
+                put_byte(&mut buf, &mut n, b'-');
+                put_hex_u64(&mut buf, &mut n, (-d) as u64);
+            } else {
+                put_hex_u64(&mut buf, &mut n, d as u64);
+            }
+            put_bytes(&mut buf, &mut n, b"]\n");
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
             for i in 17..22u64 {
                 let val = unsafe { *((saved_sp + i * 8) as *const u64) };
-                let label = match i {
-                    17 => "RIP",
-                    18 => "CS ",
-                    19 => "FLG",
-                    20 => "RSP",
-                    21 => "SS ",
-                    _ => "   ",
+                let label: &[u8] = match i {
+                    17 => b"RIP",
+                    18 => b"CS ",
+                    19 => b"FLG",
+                    20 => b"RSP",
+                    21 => b"SS ",
+                    _ => b"   ",
                 };
-                crate::println!(
-                    "  ssp[{}={}]={:#018x}", i, label, val,
-                );
+                let mut buf = [0u8; 64];
+                let mut n = 0;
+                put_bytes(&mut buf, &mut n, b"  ssp[");
+                put_dec_u64(&mut buf, &mut n, i);
+                put_byte(&mut buf, &mut n, b'=');
+                put_bytes(&mut buf, &mut n, label);
+                put_bytes(&mut buf, &mut n, b"]=");
+                put_hex_018(&mut buf, &mut n, val);
+                put_byte(&mut buf, &mut n, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
             }
         }
-        // #208 shadow + saved_sp last-writer dump: tell whether the
-        // SHADOW (taken at park-time by snapshot_iretq_shadow) was
-        // already corrupt (in which case the save itself was wrong)
-        // or is valid (in which case the memory at sp got mutated
-        // between save and validate).  The dump_saved_sp_log call
-        // emits SAVED-SP-LAST with the tag (1=try_switch, 2=voluntary,
-        // 3=pre_save_frame/park_ipc, 5=park_for_sleep, 6=resync_clone)
-        // identifying who set saved_sp last.
-        crate::println!(
-            "  shadow.sp={:#x} shadow.rip={:#x} shadow.cs={:#x} shadow.rflags={:#x} shadow.rsp={:#x} shadow.ss={:#x}",
-            tref.iretq_shadow_sp,
-            tref.iretq_shadow_rip,
-            tref.iretq_shadow_cs,
-            tref.iretq_shadow_rflags,
-            tref.iretq_shadow_rsp,
-            tref.iretq_shadow_ss,
-        );
+        // #208 shadow + saved_sp last-writer dump.
+        {
+            let mut buf = [0u8; 256];
+            let mut n = 0;
+            put_bytes(&mut buf, &mut n, b"  shadow.sp=");
+            put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_sp);
+            put_bytes(&mut buf, &mut n, b" shadow.rip=");
+            put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_rip);
+            put_bytes(&mut buf, &mut n, b" shadow.cs=");
+            put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_cs);
+            put_bytes(&mut buf, &mut n, b" shadow.rflags=");
+            put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_rflags);
+            put_bytes(&mut buf, &mut n, b" shadow.rsp=");
+            put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_rsp);
+            put_bytes(&mut buf, &mut n, b" shadow.ss=");
+            put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_ss);
+            put_byte(&mut buf, &mut n, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+        }
         crate::sched::scheduler::dump_saved_sp_log(tid);
         // #208 saved_sp watchpoint: arm GLOBAL DR0 to catch the next
         // write to tref.saved_sp.  All CPUs will arm DR0 on this
