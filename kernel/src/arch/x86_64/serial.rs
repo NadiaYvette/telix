@@ -547,25 +547,50 @@ pub fn _print(args: fmt::Arguments) {
         }
     }
     // #208/#235 Pattern A probe: did anyone scribble our stack canary?
+    let canary_addr = &canary as *const u64 as u64;
     let observed = unsafe { core::ptr::read_volatile(&canary as *const u64) };
     if observed != PRINT_CANARY {
-        let canary = observed;
         let n = PRINT_CANARY_SCRIBBLE_COUNT
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < 16 {
-            handler_write_bytes(b"PRINT-CANARY-SCRIBBLE n=0x");
-            for shift in (0..2).rev() {
-                let nib = (n >> (shift * 4)) & 0xF;
-                let c = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
-                handler_write_bytes(core::slice::from_ref(&c));
+            // Build the whole diagnostic in a stack buffer and emit
+            // once — concurrent PF dumps on peer CPUs interleave
+            // byte-by-byte when we call handler_write_bytes piecemeal.
+            let mut buf = [0u8; 512];
+            let mut len = 0usize;
+            fn push(buf: &mut [u8], len: &mut usize, s: &[u8]) {
+                for &b in s {
+                    if *len < buf.len() { buf[*len] = b; *len += 1; }
+                }
             }
-            handler_write_bytes(b" got=0x");
-            for shift in (0..16).rev() {
-                let nib = (canary >> (shift * 4)) & 0xF;
-                let c = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
-                handler_write_bytes(core::slice::from_ref(&c));
+            fn push_hex(buf: &mut [u8], len: &mut usize, v: u64, width: usize) {
+                let start = 16 - width;
+                for shift in (0..width).rev() {
+                    let nib = ((v >> (shift * 4)) & 0xF) as u8;
+                    let c = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+                    if *len < buf.len() { buf[*len] = c; *len += 1; }
+                }
+                let _ = start;
             }
-            handler_write_bytes(b"\n");
+            push(&mut buf, &mut len, b"PRINT-CANARY-SCRIBBLE n=0x");
+            push_hex(&mut buf, &mut len, n as u64, 2);
+            push(&mut buf, &mut len, b" addr=0x");
+            push_hex(&mut buf, &mut len, canary_addr, 16);
+            push(&mut buf, &mut len, b" got=0x");
+            push_hex(&mut buf, &mut len, observed, 16);
+            push(&mut buf, &mut len, b" cpu=");
+            push_hex(&mut buf, &mut len, crate::sched::smp::cpu_id() as u64, 1);
+            push(&mut buf, &mut len, b" tid=");
+            push_hex(&mut buf, &mut len, crate::sched::scheduler::current_thread_id() as u64, 4);
+            push(&mut buf, &mut len, b" stk[-8..+8]=");
+            for off in -8i64..=8i64 {
+                let addr = (canary_addr as i64).wrapping_add(off * 8) as *const u64;
+                let v = unsafe { core::ptr::read_volatile(addr) };
+                push(&mut buf, &mut len, b" ");
+                push_hex(&mut buf, &mut len, v, 16);
+            }
+            push(&mut buf, &mut len, b"\n");
+            handler_write_bytes(&buf[..len]);
         }
     }
 }
