@@ -309,22 +309,77 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         if pre_cs > 0xffff || (pre_cs != 0x08 && pre_cs != 0x23) {
             let tid = crate::sched::scheduler::current_thread_id();
             let tref = crate::sched::scheduler::thread_ref(tid);
-            crate::println!(
-                "VALIDATOR-PRE-BAD: tid={} cpu={} sp={:#x} vec={} pre_rsp={:#x} \
-                 stack_base={:#x} saved_sp_now={:#x} saved_sp_source={} \
-                 pre.rip={:#x} pre.cs={:#x} pre.rflags={:#x} pre.rsp={:#x} pre.ss={:#x} \
-                 pre_below=[{:#x} {:#x} {:#x} {:#x}] pre_above=[{:#x} {:#x} {:#x} {:#x}] \
-                 shadow.sp={:#x} shadow.rip={:#x} shadow.cs={:#x} shadow.rflags={:#x} shadow.rsp={:#x} shadow.ss={:#x}",
-                tid,
-                crate::sched::smp::cpu_id(),
-                sp, vector, pre_rsp,
-                tref.stack_base, tref.saved_sp, tref.saved_sp_source,
-                pre_snap_all[4], pre_snap_all[5], pre_snap_all[6], pre_snap_all[7], pre_snap_all[8],
-                pre_snap_all[0], pre_snap_all[1], pre_snap_all[2], pre_snap_all[3],
-                pre_snap_all[9], pre_snap_all[10], pre_snap_all[11], pre_snap_all[12],
-                tref.iretq_shadow_sp, tref.iretq_shadow_rip, tref.iretq_shadow_cs,
-                tref.iretq_shadow_rflags, tref.iretq_shadow_rsp, tref.iretq_shadow_ss,
-            );
+            // #208 Pattern A sweep: atomic put_* emit (no format_args)
+            // — the prior println! had 27 args and was a prime
+            // collision candidate.  Split into three handler_write_bytes
+            // calls to keep each stack buffer small.
+            let cpu = crate::sched::smp::cpu_id();
+            {
+                let mut buf = [0u8; 256];
+                let mut n = 0;
+                put_bytes(&mut buf, &mut n, b"VALIDATOR-PRE-BAD: tid=");
+                put_dec_u64(&mut buf, &mut n, tid as u64);
+                put_bytes(&mut buf, &mut n, b" cpu=");
+                put_dec_u64(&mut buf, &mut n, cpu as u64);
+                put_bytes(&mut buf, &mut n, b" sp=");
+                put_hex_u64(&mut buf, &mut n, sp);
+                put_bytes(&mut buf, &mut n, b" vec=");
+                put_dec_u64(&mut buf, &mut n, vector);
+                put_bytes(&mut buf, &mut n, b" pre_rsp=");
+                put_hex_u64(&mut buf, &mut n, pre_rsp);
+                put_bytes(&mut buf, &mut n, b" stack_base=");
+                put_hex_u64(&mut buf, &mut n, tref.stack_base as u64);
+                put_bytes(&mut buf, &mut n, b" saved_sp_now=");
+                put_hex_u64(&mut buf, &mut n, tref.saved_sp);
+                put_bytes(&mut buf, &mut n, b" saved_sp_source=");
+                put_dec_u64(&mut buf, &mut n, tref.saved_sp_source as u64);
+                put_byte(&mut buf, &mut n, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
+            }
+            {
+                let mut buf = [0u8; 256];
+                let mut n = 0;
+                put_bytes(&mut buf, &mut n, b"  pre.rip=");
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[5]);
+                put_bytes(&mut buf, &mut n, b" pre.cs=");
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[6]);
+                put_bytes(&mut buf, &mut n, b" pre.rflags=");
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[7]);
+                put_bytes(&mut buf, &mut n, b" pre.rsp=");
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[8]);
+                put_bytes(&mut buf, &mut n, b" pre.ss=");
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[4]);
+                put_bytes(&mut buf, &mut n, b" pre_below=[");
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[0]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[1]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[2]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[3]);
+                put_bytes(&mut buf, &mut n, b"] pre_above=[");
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[9]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[10]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[11]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, pre_snap_all[12]);
+                put_bytes(&mut buf, &mut n, b"]\n");
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
+            }
+            {
+                let mut buf = [0u8; 256];
+                let mut n = 0;
+                put_bytes(&mut buf, &mut n, b"  shadow.sp=");
+                put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_sp);
+                put_bytes(&mut buf, &mut n, b" shadow.rip=");
+                put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_rip);
+                put_bytes(&mut buf, &mut n, b" shadow.cs=");
+                put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_cs);
+                put_bytes(&mut buf, &mut n, b" shadow.rflags=");
+                put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_rflags);
+                put_bytes(&mut buf, &mut n, b" shadow.rsp=");
+                put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_rsp);
+                put_bytes(&mut buf, &mut n, b" shadow.ss=");
+                put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_ss);
+                put_byte(&mut buf, &mut n, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
+            }
             // Last-writer log: who SET saved_sp last, with what value + tag.
             crate::sched::scheduler::dump_saved_sp_log(tid);
         }
@@ -445,28 +500,85 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                     mid_post_first = i as i32;
                 }
             }
-            crate::println!(
-                "VALIDATOR-SELF-SCRIBBLE: tid={} cpu={} sp={:#x} vec={} \
-                 pre_rsp={:#x} mid1_rsp={:#x} post_rsp={:#x} \
-                 pre_mid_first_diff={} mid_post_first_diff={} \
-                 pre.rip={:#x} pre.cs={:#x} pre.rflags={:#x} pre.rsp={:#x} pre.ss={:#x} \
-                 mid1.rip={:#x} mid1.cs={:#x} mid1.rflags={:#x} mid1.rsp={:#x} mid1.ss={:#x} \
-                 post.rip={:#x} post.cs={:#x} post.rflags={:#x} post.rsp={:#x} post.ss={:#x} \
-                 pre_below=[{:#x} {:#x} {:#x} {:#x}] pre_above=[{:#x} {:#x} {:#x} {:#x}] \
-                 post_below=[{:#x} {:#x} {:#x} {:#x}] post_above=[{:#x} {:#x} {:#x} {:#x}]",
-                tid,
-                crate::sched::smp::cpu_id(),
-                sp, vector,
-                pre_rsp, mid1_rsp, post_rsp,
-                pre_mid_first, mid_post_first,
-                pre_snap_all[4], pre_snap_all[5], pre_snap_all[6], pre_snap_all[7], pre_snap_all[8],
-                mid1_snap_all[4], mid1_snap_all[5], mid1_snap_all[6], mid1_snap_all[7], mid1_snap_all[8],
-                post_snap_all[4], post_snap_all[5], post_snap_all[6], post_snap_all[7], post_snap_all[8],
-                pre_snap_all[0], pre_snap_all[1], pre_snap_all[2], pre_snap_all[3],
-                pre_snap_all[9], pre_snap_all[10], pre_snap_all[11], pre_snap_all[12],
-                post_snap_all[0], post_snap_all[1], post_snap_all[2], post_snap_all[3],
-                post_snap_all[9], post_snap_all[10], post_snap_all[11], post_snap_all[12],
-            );
+            // #208 Pattern A sweep: 33-arg println! → atomic put_*
+            // emit, chunked into 4 lines (header, pre, mid1, post).
+            let cpu = crate::sched::smp::cpu_id();
+            {
+                let mut buf = [0u8; 256];
+                let mut n = 0;
+                put_bytes(&mut buf, &mut n, b"VALIDATOR-SELF-SCRIBBLE: tid=");
+                put_dec_u64(&mut buf, &mut n, tid as u64);
+                put_bytes(&mut buf, &mut n, b" cpu=");
+                put_dec_u64(&mut buf, &mut n, cpu as u64);
+                put_bytes(&mut buf, &mut n, b" sp=");
+                put_hex_u64(&mut buf, &mut n, sp);
+                put_bytes(&mut buf, &mut n, b" vec=");
+                put_dec_u64(&mut buf, &mut n, vector);
+                put_bytes(&mut buf, &mut n, b" pre_rsp=");
+                put_hex_u64(&mut buf, &mut n, pre_rsp);
+                put_bytes(&mut buf, &mut n, b" mid1_rsp=");
+                put_hex_u64(&mut buf, &mut n, mid1_rsp);
+                put_bytes(&mut buf, &mut n, b" post_rsp=");
+                put_hex_u64(&mut buf, &mut n, post_rsp);
+                put_bytes(&mut buf, &mut n, b" pre_mid_first=");
+                if pre_mid_first < 0 {
+                    put_byte(&mut buf, &mut n, b'-');
+                    put_dec_u64(&mut buf, &mut n, (-(pre_mid_first as i64)) as u64);
+                } else {
+                    put_dec_u64(&mut buf, &mut n, pre_mid_first as u64);
+                }
+                put_bytes(&mut buf, &mut n, b" mid_post_first=");
+                if mid_post_first < 0 {
+                    put_byte(&mut buf, &mut n, b'-');
+                    put_dec_u64(&mut buf, &mut n, (-(mid_post_first as i64)) as u64);
+                } else {
+                    put_dec_u64(&mut buf, &mut n, mid_post_first as u64);
+                }
+                put_byte(&mut buf, &mut n, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
+            }
+            // Emit pre/mid1/post snap rows.
+            fn snap_row(
+                label: &[u8], snap: &[u64; 13],
+            ) {
+                let mut buf = [0u8; 256];
+                let mut n = 0;
+                put_bytes(&mut buf, &mut n, b"  ");
+                put_bytes(&mut buf, &mut n, label);
+                put_bytes(&mut buf, &mut n, b".rip=");
+                put_hex_u64(&mut buf, &mut n, snap[5]);
+                put_bytes(&mut buf, &mut n, b" ");
+                put_bytes(&mut buf, &mut n, label);
+                put_bytes(&mut buf, &mut n, b".cs=");
+                put_hex_u64(&mut buf, &mut n, snap[6]);
+                put_bytes(&mut buf, &mut n, b" ");
+                put_bytes(&mut buf, &mut n, label);
+                put_bytes(&mut buf, &mut n, b".rflags=");
+                put_hex_u64(&mut buf, &mut n, snap[7]);
+                put_bytes(&mut buf, &mut n, b" ");
+                put_bytes(&mut buf, &mut n, label);
+                put_bytes(&mut buf, &mut n, b".rsp=");
+                put_hex_u64(&mut buf, &mut n, snap[8]);
+                put_bytes(&mut buf, &mut n, b" ");
+                put_bytes(&mut buf, &mut n, label);
+                put_bytes(&mut buf, &mut n, b".ss=");
+                put_hex_u64(&mut buf, &mut n, snap[4]);
+                put_bytes(&mut buf, &mut n, b" below=[");
+                put_hex_u64(&mut buf, &mut n, snap[0]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, snap[1]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, snap[2]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, snap[3]);
+                put_bytes(&mut buf, &mut n, b"] above=[");
+                put_hex_u64(&mut buf, &mut n, snap[9]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, snap[10]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, snap[11]); put_byte(&mut buf, &mut n, b' ');
+                put_hex_u64(&mut buf, &mut n, snap[12]);
+                put_bytes(&mut buf, &mut n, b"]\n");
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
+            }
+            snap_row(b"pre", &pre_snap_all);
+            snap_row(b"mid1", &mid1_snap_all);
+            snap_row(b"post", &post_snap_all);
         }
     }
     let f = unsafe { &*(sp as *const ExceptionFrame) };
@@ -501,11 +613,31 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
     if cs != cs2 || ss != ss2 || rip != rip2 {
         let tid_local = crate::sched::scheduler::current_thread_id();
         let cur_cpu = crate::sched::smp::cpu_id();
-        crate::println!(
-            "FRAME-FLICKER: vec={} tid={} cpu={} sp={:#x} CS={:#x}->{:#x} SS={:#x}->{:#x} RIP={:#x}->{:#x}",
-            vector, tid_local, cur_cpu, sp,
-            cs, cs2, ss, ss2, rip, rip2
-        );
+        // #208 Pattern A sweep: atomic put_* emit.
+        let mut buf = [0u8; 256];
+        let mut n = 0;
+        put_bytes(&mut buf, &mut n, b"FRAME-FLICKER: vec=");
+        put_dec_u64(&mut buf, &mut n, vector);
+        put_bytes(&mut buf, &mut n, b" tid=");
+        put_dec_u64(&mut buf, &mut n, tid_local as u64);
+        put_bytes(&mut buf, &mut n, b" cpu=");
+        put_dec_u64(&mut buf, &mut n, cur_cpu as u64);
+        put_bytes(&mut buf, &mut n, b" sp=");
+        put_hex_u64(&mut buf, &mut n, sp);
+        put_bytes(&mut buf, &mut n, b" CS=");
+        put_hex_u64(&mut buf, &mut n, cs);
+        put_bytes(&mut buf, &mut n, b"->");
+        put_hex_u64(&mut buf, &mut n, cs2);
+        put_bytes(&mut buf, &mut n, b" SS=");
+        put_hex_u64(&mut buf, &mut n, ss);
+        put_bytes(&mut buf, &mut n, b"->");
+        put_hex_u64(&mut buf, &mut n, ss2);
+        put_bytes(&mut buf, &mut n, b" RIP=");
+        put_hex_u64(&mut buf, &mut n, rip);
+        put_bytes(&mut buf, &mut n, b"->");
+        put_hex_u64(&mut buf, &mut n, rip2);
+        put_byte(&mut buf, &mut n, b'\n');
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
     }
     let bad_cs = cs != 0x08 && cs != 0x23;
     let bad_ss = ss != 0x00 && ss != 0x10 && ss != 0x1B;
