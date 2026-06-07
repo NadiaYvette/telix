@@ -80,8 +80,27 @@ pub fn available() -> bool {
 }
 
 /// Write a string to the framebuffer console.  Called from serial _print().
+///
+/// #208 Pattern A guard: the caller's &str data pointer is a stack-resident
+/// fat pointer (data + len), and format_args!() temporaries in _print's
+/// frame can overlap its storage and scribble the data field to a small
+/// integer or non-mapped VA.  16-boot survey 11amfsq3289-3304 caught three
+/// fires at the inner loop's `movzbl (%r14), %ebp` with r14 in {0x1, 0x3b,
+/// 0xfffffe8000000000}.  Defend by sanity-checking the data pointer's
+/// range before iterating; print is droppable, kernel-PF is not.
 pub fn write_str(s: &str) {
     if !available() {
+        return;
+    }
+    let ptr = s.as_ptr() as u64;
+    // The legitimate source for fmtstr.data feeding this path is the
+    // per-CPU PRINT_BUFS / FALLBACK_BUFS in .bss (PML4[511], kernel
+    // image VA range 0xffffffff_80000000+).  Everything else is a
+    // corruption signature — reject and drop the print.  Boots
+    // 11amfsq3289-3304 caught r14 in {0x1, 0x3b, 0xfffffe8000000000};
+    // the first two are small ints, the third is the SLAB_THREAD_REGION
+    // boundary which can't back a print buffer.
+    if ptr < 0xffffffff_8000_0000 {
         return;
     }
     for b in s.bytes() {
