@@ -9010,6 +9010,25 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         let kbase = next_t.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
         if !is_idle && (next_sp < kbase as u64 || next_sp >= kend) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::arch::x86_64::serial::{put_bytes, put_hex_u64, put_dec_u64};
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"BUG: park_ipc: tid=");
+                put_dec_u64(&mut buf, &mut k, next_id as u64);
+                put_bytes(&mut buf, &mut k, b" saved_sp=");
+                put_hex_u64(&mut buf, &mut k, next_sp);
+                put_bytes(&mut buf, &mut k, b" OUTSIDE kstack ");
+                put_hex_u64(&mut buf, &mut k, kbase as u64);
+                put_bytes(&mut buf, &mut k, b"..");
+                put_hex_u64(&mut buf, &mut k, kend);
+                put_bytes(&mut buf, &mut k, b" (source=");
+                put_dec_u64(&mut buf, &mut k, next_t.saved_sp_source as u64);
+                put_bytes(&mut buf, &mut k, b")\n");
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             crate::println!(
                 "BUG: park_ipc: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 next_id, next_sp, kbase, kend, next_t.saved_sp_source
@@ -11051,6 +11070,25 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         let kbase = receiver.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
         if !is_idle && (recv_sp < kbase as u64 || recv_sp >= kend) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::arch::x86_64::serial::{put_bytes, put_hex_u64, put_dec_u64};
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"BUG: handoff_to: tid=");
+                put_dec_u64(&mut buf, &mut k, receiver_tid as u64);
+                put_bytes(&mut buf, &mut k, b" saved_sp=");
+                put_hex_u64(&mut buf, &mut k, recv_sp);
+                put_bytes(&mut buf, &mut k, b" OUTSIDE kstack ");
+                put_hex_u64(&mut buf, &mut k, kbase as u64);
+                put_bytes(&mut buf, &mut k, b"..");
+                put_hex_u64(&mut buf, &mut k, kend);
+                put_bytes(&mut buf, &mut k, b" (source=");
+                put_dec_u64(&mut buf, &mut k, receiver.saved_sp_source as u64);
+                put_bytes(&mut buf, &mut k, b")\n");
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             crate::println!(
                 "BUG: handoff_to: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 receiver_tid, recv_sp, kbase, kend, receiver.saved_sp_source
