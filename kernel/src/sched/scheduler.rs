@@ -4755,6 +4755,27 @@ pub fn tick(current_sp: u64) -> u64 {
                             let cy = pc.cli_top[i].cycles.load(Ordering::Relaxed);
                             let ct = pc.cli_top[i].count.load(Ordering::Relaxed);
                             if r == 0 || cy == 0 { continue; }
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                                let mut buf = [0u8; 160];
+                                let mut k = 0;
+                                put_bytes(&mut buf, &mut k, b"CLI-TOP-TICK: cpu=");
+                                put_dec_u64(&mut buf, &mut k, c as u64);
+                                put_bytes(&mut buf, &mut k, b" tick=");
+                                put_dec_u64(&mut buf, &mut k, n);
+                                put_bytes(&mut buf, &mut k, b" slot=");
+                                put_dec_u64(&mut buf, &mut k, printed as u64);
+                                put_bytes(&mut buf, &mut k, b" rip=");
+                                put_hex_u64(&mut buf, &mut k, r);
+                                put_bytes(&mut buf, &mut k, b" max=");
+                                put_dec_u64(&mut buf, &mut k, cy);
+                                put_bytes(&mut buf, &mut k, b" count=");
+                                put_dec_u64(&mut buf, &mut k, ct);
+                                put_byte(&mut buf, &mut k, b'\n');
+                                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
                             crate::println!(
                                 "CLI-TOP-TICK: cpu={} tick={} slot={} rip=0x{:x} max={} count={}",
                                 c, n, printed, r, cy, ct,
@@ -5210,6 +5231,28 @@ pub fn tick(current_sp: u64) -> u64 {
                 #[cfg(not(target_arch = "x86_64"))]
                 let apf: u64 = 0;
                 if frt | cfb | sar | isr | apf | hpd | hps != 0 {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                        let mut buf = [0u8; 256];
+                        let mut k = 0;
+                        let fields: [(&[u8], u64); 7] = [
+                            (b"LAYER3-DIAG: fast_takeover=", frt),
+                            (b" cas_fail_bail=", cfb),
+                            (b" wake_reroute=", sar),
+                            (b" ipi_stale_reroute=", isr),
+                            (b" async_pf=", apf),
+                            (b" host_pause_peers=", hpd),
+                            (b" host_pause_steals=", hps),
+                        ];
+                        for (label, val) in fields {
+                            put_bytes(&mut buf, &mut k, label);
+                            put_dec_u64(&mut buf, &mut k, val);
+                        }
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
                     crate::println!(
                         "LAYER3-DIAG: fast_takeover={} cas_fail_bail={} wake_reroute={} ipi_stale_reroute={} async_pf={} host_pause_peers={} host_pause_steals={}",
                         frt, cfb, sar, isr, apf, hpd, hps,
