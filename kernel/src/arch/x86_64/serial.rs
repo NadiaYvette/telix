@@ -504,6 +504,12 @@ pub fn _print(args: fmt::Arguments) {
         let mut w = SliceWriter { buf: fmt_buf, len: &mut fmt_len };
         let _ = w.write_fmt(args);
     }
+    // #208 Pattern A guard: fmt_len lives on _print's stack frame and
+    // can be scribbled by format_args Argument-array temporaries (boot
+    // 11amfsq3274 panicked at serial.rs:563 with fmt_len=2^64-near).
+    // Clamp to fmt_buf bounds at every read so a corrupted value can
+    // only truncate the print, never out-of-bounds-slice the buffer.
+    let fmt_len = fmt_len.min(fmt_buf.len());
 
     // CRLF-expand into wire_buf.
     for i in 0..fmt_len {
@@ -527,6 +533,9 @@ pub fn _print(args: fmt::Arguments) {
     // and push directly.  The IRQ's bytes will interleave with the
     // outer call's output but no deadlock and no IRQ-blocking wait.
     let my_cpu = crate::sched::smp::cpu_id() as i32;
+    // #208 Pattern A guard: clamp wire_len to wire_buf bounds at the
+    // slice site, same rationale as the fmt_len clamp earlier.
+    let wire_len = wire_len.min(wire_buf.len());
     let wire_slice = &wire_buf[..wire_len];
     if PRINT_HOLDER_CPU.load(AOrdering::Acquire) == my_cpu {
         Serial.push_bytes(wire_slice);
