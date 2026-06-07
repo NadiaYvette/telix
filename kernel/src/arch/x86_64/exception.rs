@@ -1451,11 +1451,26 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                 } else {
                     (3u32, crate::arch::x86_64::gdt::SLOT_WATCH_VA_3)
                 };
-                crate::println!(
-                    "DR-HIT-SLOT: dr={} va={:#x} rip={:#x} cpu={} tid={} cs={:#x} ts_ns={}",
-                    which, va, rip, cpu_id, tid, frame.cs(),
-                    crate::arch::timer::monotonic_ns(),
-                );
+                {
+                    let mut buf = [0u8; 192];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"DR-HIT-SLOT: dr=");
+                    put_dec_u64(&mut buf, &mut k, which as u64);
+                    put_bytes(&mut buf, &mut k, b" va=");
+                    put_hex_u64(&mut buf, &mut k, va);
+                    put_bytes(&mut buf, &mut k, b" rip=");
+                    put_hex_u64(&mut buf, &mut k, rip);
+                    put_bytes(&mut buf, &mut k, b" cpu=");
+                    put_dec_u64(&mut buf, &mut k, cpu_id as u64);
+                    put_bytes(&mut buf, &mut k, b" tid=");
+                    put_dec_u64(&mut buf, &mut k, tid as u64);
+                    put_bytes(&mut buf, &mut k, b" cs=");
+                    put_hex_u64(&mut buf, &mut k, frame.cs());
+                    put_bytes(&mut buf, &mut k, b" ts_ns=");
+                    put_dec_u64(&mut buf, &mut k, crate::arch::timer::monotonic_ns());
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
                 if b1 {
                     crate::arch::x86_64::gdt::dr1_set_watch_write_qword(
                         crate::arch::x86_64::gdt::SLOT_WATCH_VA);
@@ -1511,19 +1526,51 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     let rsp_entry = frame_sp + 22 * 8;
                     let rdi = frame.regs[12]; // GPR push order check
                     let rax = frame.regs[14];
-                    crate::println!(
-                        "DR0-HIT-OFF-PATH-OVERLAP: watched={:#x} dr0_reg={:#x} kbase={:#x}..{:#x} in_kstack={} rsp_entry={:#x} rdi={:#x} rax={:#x}",
-                        watched, dr0_reg, kbase, kbase + ksize, in_kstack, rsp_entry, rdi, rax,
-                    );
+                    {
+                        let mut buf = [0u8; 256];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"DR0-HIT-OFF-PATH-OVERLAP: watched=");
+                        put_hex_u64(&mut buf, &mut k, watched);
+                        put_bytes(&mut buf, &mut k, b" dr0_reg=");
+                        put_hex_u64(&mut buf, &mut k, dr0_reg);
+                        put_bytes(&mut buf, &mut k, b" kbase=");
+                        put_hex_u64(&mut buf, &mut k, kbase);
+                        put_bytes(&mut buf, &mut k, b"..");
+                        put_hex_u64(&mut buf, &mut k, kbase + ksize);
+                        put_bytes(&mut buf, &mut k, b" in_kstack=");
+                        put_bytes(&mut buf, &mut k, if in_kstack { b"true" } else { b"false" });
+                        put_bytes(&mut buf, &mut k, b" rsp_entry=");
+                        put_hex_u64(&mut buf, &mut k, rsp_entry);
+                        put_bytes(&mut buf, &mut k, b" rdi=");
+                        put_hex_u64(&mut buf, &mut k, rdi);
+                        put_bytes(&mut buf, &mut k, b" rax=");
+                        put_hex_u64(&mut buf, &mut k, rax);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
                     // #208 ts probe: timestamp DR0 hits so a post-mortem can
                     // sort by time and look for overlapping write windows
                     // from different CPUs on the same tid — signature of
                     // concurrent dispatch of the same thread.
                     let ts_ns = crate::arch::timer::monotonic_ns();
-                    crate::println!(
-                        "DR0-HIT-OFF-PATH: dr6={:#x} rip={:#x} tid={} cpu={} cs={:#x} ts_ns={}",
-                        dr6, rip, tid, cpu, frame.cs(), ts_ns,
-                    );
+                    {
+                        let mut buf = [0u8; 192];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"DR0-HIT-OFF-PATH: dr6=");
+                        put_hex_u64(&mut buf, &mut k, dr6);
+                        put_bytes(&mut buf, &mut k, b" rip=");
+                        put_hex_u64(&mut buf, &mut k, rip);
+                        put_bytes(&mut buf, &mut k, b" tid=");
+                        put_dec_u64(&mut buf, &mut k, tid as u64);
+                        put_bytes(&mut buf, &mut k, b" cpu=");
+                        put_dec_u64(&mut buf, &mut k, cpu as u64);
+                        put_bytes(&mut buf, &mut k, b" cs=");
+                        put_hex_u64(&mut buf, &mut k, frame.cs());
+                        put_bytes(&mut buf, &mut k, b" ts_ns=");
+                        put_dec_u64(&mut buf, &mut k, ts_ns);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
                     crate::arch::x86_64::gdt::dr0_clear();
                 }
                 return validate_iretq_frame(frame_sp, frame_sp, 1);
@@ -1594,11 +1641,16 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                 // Currently we exit the thread, so this is for
                 // diagnostic consistency only.
                 frame.set_rip(frame.rip() + 1);
-                crate::println!(
-                    "USER #BP (INT 3) at RIP={:#x} tid={} → exit SIGTRAP(5)",
-                    frame.rip() - 1,
-                    crate::sched::scheduler::current_thread_id(),
-                );
+                {
+                    let mut buf = [0u8; 96];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"USER #BP (INT 3) at RIP=");
+                    put_hex_u64(&mut buf, &mut k, frame.rip() - 1);
+                    put_bytes(&mut buf, &mut k, b" tid=");
+                    put_dec_u64(&mut buf, &mut k, crate::sched::scheduler::current_thread_id() as u64);
+                    put_bytes(&mut buf, &mut k, b" -> exit SIGTRAP(5)\n");
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
                 crate::sched::scheduler::exit_current_thread(-5);
                 // exit_current_thread is divergent; unreachable below.
             }
@@ -1659,16 +1711,24 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                                     let final_frame = unsafe {
                                         &*(final_sp as *const ExceptionFrame)
                                     };
-                                    crate::println!(
-                                        "IRETQ: tid={} task={} sp={:#x} \
-                                         rip={:#x} cs={:#x} rax={:#x} \
-                                         pending={}",
-                                        tid, task_id, final_sp,
-                                        final_frame.rip(),
-                                        final_frame.cs(),
-                                        final_frame.rax(),
-                                        if pending != 0 { "yes" } else { "no" }
-                                    );
+                                    let mut buf = [0u8; 192];
+                                    let mut k = 0;
+                                    put_bytes(&mut buf, &mut k, b"IRETQ: tid=");
+                                    put_dec_u64(&mut buf, &mut k, tid as u64);
+                                    put_bytes(&mut buf, &mut k, b" task=");
+                                    put_dec_u64(&mut buf, &mut k, task_id as u64);
+                                    put_bytes(&mut buf, &mut k, b" sp=");
+                                    put_hex_u64(&mut buf, &mut k, final_sp);
+                                    put_bytes(&mut buf, &mut k, b" rip=");
+                                    put_hex_u64(&mut buf, &mut k, final_frame.rip());
+                                    put_bytes(&mut buf, &mut k, b" cs=");
+                                    put_hex_u64(&mut buf, &mut k, final_frame.cs());
+                                    put_bytes(&mut buf, &mut k, b" rax=");
+                                    put_hex_u64(&mut buf, &mut k, final_frame.rax());
+                                    put_bytes(&mut buf, &mut k, b" pending=");
+                                    put_bytes(&mut buf, &mut k, if pending != 0 { b"yes" } else { b"no" });
+                                    put_byte(&mut buf, &mut k, b'\n');
+                                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
                                 }
                             }
                         }
@@ -1693,14 +1753,20 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                 for i in 0..16 {
                     bytes[i] = unsafe { *rip.add(i) };
                 }
-                crate::println!(
-                    "  #UD bytes at RIP: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} \
-                     {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
-                    bytes[8], bytes[9], bytes[10], bytes[11],
-                    bytes[12], bytes[13], bytes[14], bytes[15]
-                );
+                {
+                    let mut buf = [0u8; 96];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"  #UD bytes at RIP:");
+                    for &b in bytes.iter() {
+                        put_byte(&mut buf, &mut k, b' ');
+                        let hi = b >> 4;
+                        let lo = b & 0xf;
+                        put_byte(&mut buf, &mut k, if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) });
+                        put_byte(&mut buf, &mut k, if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) });
+                    }
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
             }
             exception_fault("Invalid Opcode (#UD)", frame)
         }
@@ -1781,11 +1847,27 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                         let rip = frame.rip();
                         let cpu_id = crate::sched::smp::cpu_id();
                         let tid = crate::sched::scheduler::current_thread_id();
-                        let alias = if hit_dm { "DM" } else { "KSTACK" };
-                        crate::println!(
-                            "PF-WPROT-HIT: alias={} cr2={:#x} rip={:#x} cpu={} tid={} cs={:#x} ec={:#x}",
-                            alias, cr2, rip, cpu_id, tid, frame.cs(), ec,
-                        );
+                        let alias: &[u8] = if hit_dm { b"DM" } else { b"KSTACK" };
+                        {
+                            let mut buf = [0u8; 192];
+                            let mut k = 0;
+                            put_bytes(&mut buf, &mut k, b"PF-WPROT-HIT: alias=");
+                            put_bytes(&mut buf, &mut k, alias);
+                            put_bytes(&mut buf, &mut k, b" cr2=");
+                            put_hex_u64(&mut buf, &mut k, cr2);
+                            put_bytes(&mut buf, &mut k, b" rip=");
+                            put_hex_u64(&mut buf, &mut k, rip);
+                            put_bytes(&mut buf, &mut k, b" cpu=");
+                            put_dec_u64(&mut buf, &mut k, cpu_id as u64);
+                            put_bytes(&mut buf, &mut k, b" tid=");
+                            put_dec_u64(&mut buf, &mut k, tid as u64);
+                            put_bytes(&mut buf, &mut k, b" cs=");
+                            put_hex_u64(&mut buf, &mut k, frame.cs());
+                            put_bytes(&mut buf, &mut k, b" ec=");
+                            put_hex_u64(&mut buf, &mut k, ec);
+                            put_byte(&mut buf, &mut k, b'\n');
+                            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                        }
                         let boot_pml4 = {
                             let cr3: u64;
                             unsafe { core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nomem, nostack)); }
@@ -1925,7 +2007,12 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         33..=47 => {
             let irq = (vector - 32) as u8;
             if !crate::io::irq_dispatch::handle_irq(irq as u32) {
-                crate::println!("Unhandled IRQ {}", irq);
+                let mut buf = [0u8; 48];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"Unhandled IRQ ");
+                put_dec_u64(&mut buf, &mut k, irq as u64);
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
             }
             if super::ioapic::available() {
                 super::lapic::eoi();
@@ -1935,7 +2022,12 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         }
 
         _ => {
-            crate::println!("Unhandled interrupt vector {}", vector);
+            let mut buf = [0u8; 64];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"Unhandled interrupt vector ");
+            put_dec_u64(&mut buf, &mut k, vector as u64);
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
         }
     }
 
@@ -2421,10 +2513,16 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
                     for tid in 1u32..100u32 {
                         let tp = crate::sched::scheduler::THREAD_TABLE.get(tid);
                         if !tp.is_null() && (tp as u64) == val {
-                            crate::println!(
-                                "  REG-IS-THREAD: {}={:#x} = THREAD_TABLE[{}]",
-                                name, val, tid,
-                            );
+                            let mut buf = [0u8; 96];
+                            let mut k = 0;
+                            put_bytes(&mut buf, &mut k, b"  REG-IS-THREAD: ");
+                            put_bytes(&mut buf, &mut k, name.as_bytes());
+                            put_byte(&mut buf, &mut k, b'=');
+                            put_hex_u64(&mut buf, &mut k, val);
+                            put_bytes(&mut buf, &mut k, b" = THREAD_TABLE[");
+                            put_dec_u64(&mut buf, &mut k, tid as u64);
+                            put_bytes(&mut buf, &mut k, b"]\n");
+                            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
                             break;
                         }
                     }
