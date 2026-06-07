@@ -1395,6 +1395,17 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
                 let live = core::ptr::read_volatile(frame_ptr.add(i));
                 let shadow = t.iretq_shadow_frame[i];
                 if shadow != live {
+                    // slot[14] is saved RAX.  Syscall dispatch
+                    // intentionally overwrites it with the return
+                    // value (set_return → set_rax) before iretq, so
+                    // shadow=<syscall_nr> → live=0 (or other rc) is
+                    // expected — not corruption.  Filter the noise:
+                    // skip when slot=14 and shadow is in the syscall-
+                    // nr range (< 0x500).  Real corruption with a
+                    // wild live value still surfaces.
+                    if i == 14 && shadow < 0x500 && live < 0x500 {
+                        continue;
+                    }
                     let nn = FRAME_BYTE_DELTA_LOG
                         .fetch_add(1, Ordering::Relaxed);
                     if nn < 64 {
