@@ -5668,11 +5668,29 @@ fn try_switch(current_sp: u64) -> u64 {
         // Idle threads run on boot stacks (ring 0), not their allocated kstack.
         // Their saved_sp is legitimately outside the kstack range — skip the check.
         if !is_idle && (sp < kbase as u64 || sp >= kend) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::arch::x86_64::serial::{put_bytes, put_hex_u64, put_dec_u64};
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"BUG: try_switch: tid=");
+                put_dec_u64(&mut buf, &mut k, next_id as u64);
+                put_bytes(&mut buf, &mut k, b" saved_sp=");
+                put_hex_u64(&mut buf, &mut k, sp);
+                put_bytes(&mut buf, &mut k, b" OUTSIDE kstack ");
+                put_hex_u64(&mut buf, &mut k, kbase as u64);
+                put_bytes(&mut buf, &mut k, b"..");
+                put_hex_u64(&mut buf, &mut k, kend);
+                put_bytes(&mut buf, &mut k, b" (source=");
+                put_dec_u64(&mut buf, &mut k, next_t.saved_sp_source as u64);
+                put_bytes(&mut buf, &mut k, b")\n");
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             crate::println!(
                 "BUG: try_switch: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 next_id, sp, kbase, kend, next_t.saved_sp_source
             );
-            // #206: dump the last saved_sp writer to attribute the bad value.
             dump_saved_sp_log(next_id);
             crate::println!(
                 "  prev={} next={} task={} state={:?}",
@@ -5697,10 +5715,27 @@ fn try_switch(current_sp: u64) -> u64 {
             let bad_cs = cs != 0x08 && cs != 0x23;
             let bad_rip = rip < 0x10000; // no code below 64K in kernel or user
             if bad_cs || bad_rip {
-                crate::println!(
-                    "BUG: try_switch: tid={} bad frame RIP={:#x} CS={:#x} sp={:#x} src={} prev={} task={}",
-                    next_id, rip, cs, sp, next_t.saved_sp_source, prev_id, next_t.task_id
-                );
+                {
+                    use crate::arch::x86_64::serial::{put_bytes, put_hex_u64, put_dec_u64};
+                    let mut buf = [0u8; 224];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"BUG: try_switch: tid=");
+                    put_dec_u64(&mut buf, &mut k, next_id as u64);
+                    put_bytes(&mut buf, &mut k, b" bad frame RIP=");
+                    put_hex_u64(&mut buf, &mut k, rip);
+                    put_bytes(&mut buf, &mut k, b" CS=");
+                    put_hex_u64(&mut buf, &mut k, cs);
+                    put_bytes(&mut buf, &mut k, b" sp=");
+                    put_hex_u64(&mut buf, &mut k, sp);
+                    put_bytes(&mut buf, &mut k, b" src=");
+                    put_dec_u64(&mut buf, &mut k, next_t.saved_sp_source as u64);
+                    put_bytes(&mut buf, &mut k, b" prev=");
+                    put_dec_u64(&mut buf, &mut k, prev_id as u64);
+                    put_bytes(&mut buf, &mut k, b" task=");
+                    put_dec_u64(&mut buf, &mut k, next_t.task_id as u64);
+                    put_bytes(&mut buf, &mut k, b"\n");
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
                 // Skip this thread — mark killed and pick idle instead.
                 thread_ref(next_id).killed.store(true, Ordering::Release);
                 let idle_sp = thread_ref(idle_id).saved_sp;
@@ -5717,10 +5752,21 @@ fn try_switch(current_sp: u64) -> u64 {
                 let idle_sp_in_kstack =
                     idle_sp >= idle_kbase && idle_sp < idle_kend;
                 if !idle_sp_in_kstack {
-                    crate::println!(
-                        "BUG: try_switch fallback: idle saved_sp={:#x} also OUTSIDE idle kstack {:#x}..{:#x} — halting CPU {}",
-                        idle_sp, idle_kbase, idle_kend, cpu
-                    );
+                    {
+                        use crate::arch::x86_64::serial::{put_bytes, put_hex_u64, put_dec_u64};
+                        let mut buf = [0u8; 224];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"BUG: try_switch fallback: idle saved_sp=");
+                        put_hex_u64(&mut buf, &mut k, idle_sp);
+                        put_bytes(&mut buf, &mut k, b" also OUTSIDE idle kstack ");
+                        put_hex_u64(&mut buf, &mut k, idle_kbase);
+                        put_bytes(&mut buf, &mut k, b"..");
+                        put_hex_u64(&mut buf, &mut k, idle_kend);
+                        put_bytes(&mut buf, &mut k, b" -- halting CPU ");
+                        put_dec_u64(&mut buf, &mut k, cpu as u64);
+                        put_bytes(&mut buf, &mut k, b"\n");
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
                     crate::arch::irq::disable();
                     loop {
                         unsafe { core::arch::asm!("hlt"); }

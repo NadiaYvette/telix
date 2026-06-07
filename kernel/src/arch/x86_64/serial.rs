@@ -191,6 +191,50 @@ pub fn handler_write_bytes(bytes: &[u8]) {
     PRINT_LOCK.store(0, AOrdering::Release);
 }
 
+// #208 Pattern A escape helpers — let fault-path code emit log lines
+// that share NO state with format_args!() / Argument arrays.  Callers
+// build the whole line into a stack `[u8; N]`, then pass it to
+// handler_write_bytes for an atomic PRINT_LOCK-guarded emit.  Avoids
+// the optimizer-overlap where format Argument storage shadows a
+// caller's locals during a fault dump.
+//
+// All take `(buf, &mut n, ...)` and append to buf, capping writes at
+// buf.len() so the caller's `n.min(buf.len())` slice is always sound.
+#[inline]
+pub fn put_byte(buf: &mut [u8], n: &mut usize, b: u8) {
+    if *n < buf.len() { buf[*n] = b; *n += 1; }
+}
+#[inline]
+pub fn put_bytes(buf: &mut [u8], n: &mut usize, s: &[u8]) {
+    for &b in s { put_byte(buf, n, b); }
+}
+#[inline]
+pub fn put_hex_u64(buf: &mut [u8], n: &mut usize, mut v: u64) {
+    put_bytes(buf, n, b"0x");
+    if v == 0 { put_byte(buf, n, b'0'); return; }
+    let mut digits = [0u8; 16];
+    let mut k = 0;
+    while v > 0 {
+        let d = (v & 0xf) as u8;
+        digits[k] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        v >>= 4;
+        k += 1;
+    }
+    for i in (0..k).rev() { put_byte(buf, n, digits[i]); }
+}
+#[inline]
+pub fn put_dec_u64(buf: &mut [u8], n: &mut usize, mut v: u64) {
+    if v == 0 { put_byte(buf, n, b'0'); return; }
+    let mut digits = [0u8; 20];
+    let mut k = 0;
+    while v > 0 {
+        digits[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        k += 1;
+    }
+    for i in (0..k).rev() { put_byte(buf, n, digits[i]); }
+}
+
 /// Atomically format and emit `args` under the global PRINT_LOCK using
 /// DirectUart's byte-by-byte writes (no per-CPU buffer, no internal
 /// state).  Holds PRINT_LOCK with IRQs disabled across the whole emit
