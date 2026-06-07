@@ -2193,11 +2193,14 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
     }
     let aspace_id = crate::sched::current_aspace_id();
     if aspace_id == 0 {
-        crate::println!(
-            "User #PF with no address space: CR2={:#x} RIP={:#x}",
-            cr2,
-            frame.rip()
-        );
+        let mut buf = [0u8; 128];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"User #PF with no address space: CR2=");
+        put_hex_u64(&mut buf, &mut k, cr2);
+        put_bytes(&mut buf, &mut k, b" RIP=");
+        put_hex_u64(&mut buf, &mut k, frame.rip());
+        put_byte(&mut buf, &mut k, b'\n');
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
         loop {
             core::hint::spin_loop();
         }
@@ -2211,15 +2214,26 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             return if pending != 0 { pending } else { frame_sp };
         }
         crate::mm::fault::FaultResult::Failed => {
-            crate::println!(
-                "Unhandled #PF: CR2={:#x} RIP={:#x} RSP={:#x} error={:#x} tid={} task={}",
-                cr2,
-                frame.rip(),
-                frame.rsp(),
-                error,
-                crate::sched::scheduler::current_thread_id(),
-                crate::sched::scheduler::thread_ref(crate::sched::scheduler::current_thread_id()).task_id,
-            );
+            let tid_u = crate::sched::scheduler::current_thread_id();
+            let task_u = crate::sched::scheduler::thread_ref(tid_u).task_id;
+            let rip_u = frame.rip();
+            let rsp_u = frame.rsp();
+            let mut buf = [0u8; 192];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"Unhandled #PF: CR2=");
+            put_hex_u64(&mut buf, &mut k, cr2);
+            put_bytes(&mut buf, &mut k, b" RIP=");
+            put_hex_u64(&mut buf, &mut k, rip_u);
+            put_bytes(&mut buf, &mut k, b" RSP=");
+            put_hex_u64(&mut buf, &mut k, rsp_u);
+            put_bytes(&mut buf, &mut k, b" error=");
+            put_hex_u64(&mut buf, &mut k, error);
+            put_bytes(&mut buf, &mut k, b" tid=");
+            put_dec_u64(&mut buf, &mut k, tid_u as u64);
+            put_bytes(&mut buf, &mut k, b" task=");
+            put_dec_u64(&mut buf, &mut k, task_u as u64);
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
             // Tier-3 core dump for unhandled user-space page faults.
             // Vector 14 = #PF.
             crate::arch::x86_64::coredump::dump_user_fault(frame, 14);
@@ -2233,10 +2247,17 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
                     rsp.wrapping_add((i * 8) as u64),
                 ).unwrap_or(0);
             }
-            crate::println!(
-                "  STACK[0..8]@RSP: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-                sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]
-            );
+            {
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"  STACK[0..8]@RSP:");
+                for w in &sw {
+                    put_byte(&mut buf, &mut k, b' ');
+                    put_hex_u64(&mut buf, &mut k, *w);
+                }
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
             let mut rbp = frame.rbp();
             for f in 0..6 {
                 if rbp < 0x1000 { break; }
@@ -2246,10 +2267,18 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
                 let saved_rip = match crate::arch::x86_64::coredump::safe_read_user_u64(rbp.wrapping_add(8)) {
                     Some(v) => v, None => break,
                 };
-                crate::println!(
-                    "  FRAME[{}]: rbp={:#x} caller_rip={:#x}",
-                    f, saved_rbp, saved_rip
-                );
+                {
+                    let mut buf = [0u8; 96];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"  FRAME[");
+                    put_dec_u64(&mut buf, &mut k, f as u64);
+                    put_bytes(&mut buf, &mut k, b"]: rbp=");
+                    put_hex_u64(&mut buf, &mut k, saved_rbp);
+                    put_bytes(&mut buf, &mut k, b" caller_rip=");
+                    put_hex_u64(&mut buf, &mut k, saved_rip);
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
                 if saved_rbp == 0 || saved_rbp <= rbp { break; }
                 rbp = saved_rbp;
             }
