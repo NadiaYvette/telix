@@ -884,6 +884,33 @@ static SAVED_SP_LAST_META: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
 /// where `thread` is a stale/corrupted pointer landing on a kstack frame
 /// or radix L1 slot instead of a real Thread struct.  This wrapper catches
 /// the bad write AT WRITE TIME with the call-site identified.
+#[cold]
+#[track_caller]
+fn log_saved_sp_out_of_range(tid: u32, new_value: u64, kbase: u64, ksize: u64) {
+    // Skip per-CPU idle threads.  Each CPU's pcpu.idle_thread_id
+    // is a tid that runs on boot/AP stack — its saved_sp lands in
+    // PHYS_DIRECT_MAP or the high-half kernel-data range, not in
+    // the allocated kstack window.
+    let ncpus = smp::num_cpus() as u32;
+    for cpu in 0..ncpus {
+        let pcpu = smp::get(cpu);
+        if pcpu.idle_thread_id.load(Ordering::Relaxed) == tid {
+            return;
+        }
+    }
+    let caller = core::panic::Location::caller();
+    static BAD_RANGE_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = BAD_RANGE_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 32 {
+        crate::println!(
+            "SAVED-SP-WRITE-OUT-OF-RANGE: tid={} new_sp={:#x} kbase={:#x} kend={:#x} caller={}:{} n={}",
+            tid, new_value, kbase, kbase.wrapping_add(ksize),
+            caller.file(), caller.line(), n,
+        );
+    }
+}
+
 #[inline]
 #[track_caller]
 pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
@@ -911,6 +938,18 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
                     n,
                 );
             }
+        }
+    }
+    // #227 saved_sp range invariant — cheap pre-check, deferred body
+    // for cold path so the helper stays inline-cheap.  Filter idles
+    // in the cold body since they legitimately run on boot/AP stack.
+    {
+        let kbase = thread.stack_base as u64;
+        let ksize = kstack_size() as u64;
+        let in_own_kstack = new_value != 0 && new_value >= kbase
+            && new_value < kbase.wrapping_add(ksize);
+        if !in_own_kstack && new_value != 0 && kbase != 0 {
+            log_saved_sp_out_of_range(thread.id, new_value, kbase, ksize);
         }
     }
     thread.saved_sp = new_value;
