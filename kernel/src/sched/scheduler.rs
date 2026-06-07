@@ -1550,15 +1550,22 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
                     if i == 14 && shadow < 0x500 && live < 0x500 {
                         continue;
                     }
-                    // #227 VA→PA continuity check on slot[17] (saved RIP),
-                    // guarded by IRETQ_SHADOW_SEQ to suppress torn-snapshot
-                    // false positives (commit 8c3369b caught this).
+                    // #227 VA→PA continuity check on slot[17] (saved RIP).
+                    // Guarded by IRETQ_SHADOW_SEQ AND a re-read of
+                    // iretq_shadow_sp inside the seqlock window — the
+                    // function-level gate at line 1467 reads
+                    // iretq_shadow_sp BEFORE this probe, so a writer
+                    // between the gate and seq_a could update
+                    // {iretq_shadow_sp, PA} together and the gate's view
+                    // would be stale.  Re-checking shadow_sp_now == sp
+                    // inside the seqlock window catches that race.
                     #[cfg(target_arch = "x86_64")]
                     if i == 17 && (tid as usize) < SAVED_SP_LOG_CAP {
                         let ti = tid as usize;
                         let seq_a = IRETQ_SHADOW_SEQ[ti].load(Ordering::Acquire);
                         if seq_a & 1 == 0 {
                             // Not in-progress at the start — read pair.
+                            let shadow_sp_now = t.iretq_shadow_sp;
                             let park_pa = IRETQ_SHADOW_SLOT17_PA[ti]
                                 .load(Ordering::Relaxed);
                             let cr3: u64;
@@ -1576,6 +1583,7 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
                             let seq_b = IRETQ_SHADOW_SEQ[ti]
                                 .load(Ordering::Acquire);
                             if seq_a == seq_b
+                                && shadow_sp_now == sp
                                 && park_pa != 0
                                 && park_pa != dispatch_pa
                             {
