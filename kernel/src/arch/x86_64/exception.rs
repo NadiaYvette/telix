@@ -2246,39 +2246,90 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             bp = unsafe { *(bp as *const u64) };
         }
 
-        // Use dump_atomic! — holds PRINT_LOCK across the whole emit so
-        // other CPUs' prints cannot interleave (regular println! showed
-        // mid-dump truncation in boot 1786 even with a coalesced single
-        // call; bytes from peer CPUs appeared after ~250 bytes of cpu=1's
-        // dump despite the lock).
-        crate::dump_atomic!(
-"Kernel #PF at RIP={:#x} CR2={:#x} error={:#x} cpu={} cr3={:#x} pml4_e={:#x} pdpt_e={:#x} pd_e={:#x} pt_e={:#x}
-  rsp={:#x} rbp={:#x} cs={:#x} ss={:#x} rflags={:#x}
-  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}
-  rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}
-  r10={:#x} r11={:#x} r12={:#x} r13={:#x}
-  r14={:#x} r15={:#x}
-  stk[0..4]={:#x} {:#x} {:#x} {:#x}
-  stk[4..8]={:#x} {:#x} {:#x} {:#x}
-  stk[8..12]={:#x} {:#x} {:#x} {:#x}
-  stk[12..16]={:#x} {:#x} {:#x} {:#x}
-  below[1..4]={:#x} {:#x} {:#x} {:#x}
-  below[5..8]={:#x} {:#x} {:#x} {:#x}
-  backtrace={:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-            frame.rip(), cr2, error, cpu, cr3, pml4_e, pdpt_e, pd_e, pt_e,
-            frame.rsp(), frame.rbp(), frame.cs(), frame.ss(), frame.rflags(),
-            frame.rax(), frame.rbx(), frame.rcx(), frame.rdx(),
-            frame.rsi(), frame.rdi(), frame.r8(), frame.r9(),
-            frame.r10(), frame.r11(), frame.r12(), frame.r13(),
-            frame.r14(), frame.r15(),
-            stack_words[0], stack_words[1], stack_words[2], stack_words[3],
-            stack_words[4], stack_words[5], stack_words[6], stack_words[7],
-            stack_words[8], stack_words[9], stack_words[10], stack_words[11],
-            stack_words[12], stack_words[13], stack_words[14], stack_words[15],
-            stack_words_below[0], stack_words_below[1], stack_words_below[2], stack_words_below[3],
-            stack_words_below[4], stack_words_below[5], stack_words_below[6], stack_words_below[7],
-            backtrace[0], backtrace[1], backtrace[2], backtrace[3], backtrace[4], backtrace[5],
-        );
+        // Replaced dump_atomic! (which uses format_args!() internally and
+        // had ~58 args) with atomic put_* into a stack buffer.  Boot
+        // 11amfsq3243 captured the Pattern A cascade: original PF →
+        // x86_exception_handler → dump_atomic → wild RIP=0x4 fetch.
+        // The format_args Argument array (~58 × 16 B = ~928 B of stack
+        // temporaries) overlapped caller frame slots, corrupting the
+        // print-path dispatch.  Atomic put_* avoids the temporaries.
+        {
+            let mut buf = [0u8; 2048];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"Kernel #PF at RIP=");
+            put_hex_u64(&mut buf, &mut k, frame.rip());
+            put_bytes(&mut buf, &mut k, b" CR2=");
+            put_hex_u64(&mut buf, &mut k, cr2);
+            put_bytes(&mut buf, &mut k, b" error=");
+            put_hex_u64(&mut buf, &mut k, error);
+            put_bytes(&mut buf, &mut k, b" cpu=");
+            put_dec_u64(&mut buf, &mut k, cpu as u64);
+            put_bytes(&mut buf, &mut k, b" cr3=");
+            put_hex_u64(&mut buf, &mut k, cr3);
+            put_bytes(&mut buf, &mut k, b" pml4_e=");
+            put_hex_u64(&mut buf, &mut k, pml4_e);
+            put_bytes(&mut buf, &mut k, b" pdpt_e=");
+            put_hex_u64(&mut buf, &mut k, pdpt_e);
+            put_bytes(&mut buf, &mut k, b" pd_e=");
+            put_hex_u64(&mut buf, &mut k, pd_e);
+            put_bytes(&mut buf, &mut k, b" pt_e=");
+            put_hex_u64(&mut buf, &mut k, pt_e);
+            put_bytes(&mut buf, &mut k, b"\n  rsp=");
+            put_hex_u64(&mut buf, &mut k, frame.rsp());
+            put_bytes(&mut buf, &mut k, b" rbp=");
+            put_hex_u64(&mut buf, &mut k, frame.rbp());
+            put_bytes(&mut buf, &mut k, b" cs=");
+            put_hex_u64(&mut buf, &mut k, frame.cs());
+            put_bytes(&mut buf, &mut k, b" ss=");
+            put_hex_u64(&mut buf, &mut k, frame.ss());
+            put_bytes(&mut buf, &mut k, b" rflags=");
+            put_hex_u64(&mut buf, &mut k, frame.rflags());
+            // GPR block (4 per line).
+            let gprs: [(&[u8], u64); 14] = [
+                (b"\n  rax=", frame.rax()), (b" rbx=", frame.rbx()),
+                (b" rcx=", frame.rcx()), (b" rdx=", frame.rdx()),
+                (b"\n  rsi=", frame.rsi()), (b" rdi=", frame.rdi()),
+                (b" r8=",  frame.r8()),  (b" r9=",  frame.r9()),
+                (b"\n  r10=", frame.r10()), (b" r11=", frame.r11()),
+                (b" r12=", frame.r12()), (b" r13=", frame.r13()),
+                (b"\n  r14=", frame.r14()), (b" r15=", frame.r15()),
+            ];
+            for (label, val) in gprs {
+                put_bytes(&mut buf, &mut k, label);
+                put_hex_u64(&mut buf, &mut k, val);
+            }
+            // stk[0..16] in 4-quad rows.
+            for row in 0..4 {
+                let b = row * 4;
+                put_bytes(&mut buf, &mut k, b"\n  stk[");
+                put_dec_u64(&mut buf, &mut k, b as u64);
+                put_bytes(&mut buf, &mut k, b"..");
+                put_dec_u64(&mut buf, &mut k, (b + 4) as u64);
+                put_bytes(&mut buf, &mut k, b"]=");
+                for j in 0..4 {
+                    if j > 0 { put_byte(&mut buf, &mut k, b' '); }
+                    put_hex_u64(&mut buf, &mut k, stack_words[b + j]);
+                }
+            }
+            // below[1..4] and below[5..8].
+            put_bytes(&mut buf, &mut k, b"\n  below[1..4]=");
+            for j in 0..4 {
+                if j > 0 { put_byte(&mut buf, &mut k, b' '); }
+                put_hex_u64(&mut buf, &mut k, stack_words_below[j]);
+            }
+            put_bytes(&mut buf, &mut k, b"\n  below[5..8]=");
+            for j in 4..8 {
+                if j > 4 { put_byte(&mut buf, &mut k, b' '); }
+                put_hex_u64(&mut buf, &mut k, stack_words_below[j]);
+            }
+            put_bytes(&mut buf, &mut k, b"\n  backtrace=");
+            for j in 0..6 {
+                if j > 0 { put_byte(&mut buf, &mut k, b' '); }
+                put_hex_u64(&mut buf, &mut k, backtrace[j]);
+            }
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+        }
         loop {
             core::hint::spin_loop();
         }
