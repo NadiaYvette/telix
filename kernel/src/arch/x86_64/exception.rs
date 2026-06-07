@@ -2349,12 +2349,21 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
             }
             for row in 0..2 {
                 let b = row * 8;
-                crate::println!(
-                    "  KSTACK[{}..{}]@RSP+{:#x}: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-                    b, b + 8, (b * 8) as u64,
-                    sw[b], sw[b+1], sw[b+2], sw[b+3],
-                    sw[b+4], sw[b+5], sw[b+6], sw[b+7]
-                );
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"  KSTACK[");
+                put_dec_u64(&mut buf, &mut k, b as u64);
+                put_bytes(&mut buf, &mut k, b"..");
+                put_dec_u64(&mut buf, &mut k, (b + 8) as u64);
+                put_bytes(&mut buf, &mut k, b"]@RSP+");
+                put_hex_u64(&mut buf, &mut k, (b * 8) as u64);
+                put_byte(&mut buf, &mut k, b':');
+                for off in 0..8 {
+                    put_byte(&mut buf, &mut k, b' ');
+                    put_hex_u64(&mut buf, &mut k, sw[b + off]);
+                }
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
             }
             // #233 RBP backtrace extended to ~10 frames + accept kstack VAs.
             // Each frame: [RBP] = caller RBP, [RBP+8] = caller RIP.
@@ -2371,10 +2380,18 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
                 let saved_rip = unsafe {
                     core::ptr::read_volatile(rbp.wrapping_add(8) as *const u64)
                 };
-                crate::println!(
-                    "  KFRAME[{}]: rbp={:#x} caller_rip={:#x}",
-                    f, saved_rbp, saved_rip
-                );
+                {
+                    let mut buf = [0u8; 96];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"  KFRAME[");
+                    put_dec_u64(&mut buf, &mut k, f as u64);
+                    put_bytes(&mut buf, &mut k, b"]: rbp=");
+                    put_hex_u64(&mut buf, &mut k, saved_rbp);
+                    put_bytes(&mut buf, &mut k, b" caller_rip=");
+                    put_hex_u64(&mut buf, &mut k, saved_rip);
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
                 if saved_rbp == 0 || saved_rbp <= rbp {
                     break;
                 }
@@ -2452,20 +2469,37 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
                         // PREVIOUS CS (whatever was running when fault fired).
                         let cur_cs = frame.cs();
                         let cur_ring = (cur_cs & 3) as u32;
-                        crate::println!(
-                            "  IRETQ-FRAME @RSP: RIP={:#x} CS={:#x}{} RFLAGS={:#x} RSP={:#x} SS={:#x} (cur_cs={:#x} ring={} {})",
-                            s0, s1, if cs_legit { "" } else { " GARBAGE" },
-                            s2, s3, s4, cur_cs, cur_ring,
-                            if outermost { "outermost" } else { "nested" },
-                        );
+                        let mut buf = [0u8; 256];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"  IRETQ-FRAME @RSP: RIP=");
+                        put_hex_u64(&mut buf, &mut k, s0);
+                        put_bytes(&mut buf, &mut k, b" CS=");
+                        put_hex_u64(&mut buf, &mut k, s1);
+                        if !cs_legit { put_bytes(&mut buf, &mut k, b" GARBAGE"); }
+                        put_bytes(&mut buf, &mut k, b" RFLAGS=");
+                        put_hex_u64(&mut buf, &mut k, s2);
+                        put_bytes(&mut buf, &mut k, b" RSP=");
+                        put_hex_u64(&mut buf, &mut k, s3);
+                        put_bytes(&mut buf, &mut k, b" SS=");
+                        put_hex_u64(&mut buf, &mut k, s4);
+                        put_bytes(&mut buf, &mut k, b" (cur_cs=");
+                        put_hex_u64(&mut buf, &mut k, cur_cs);
+                        put_bytes(&mut buf, &mut k, b" ring=");
+                        put_dec_u64(&mut buf, &mut k, cur_ring as u64);
+                        put_byte(&mut buf, &mut k, b' ');
+                        put_bytes(&mut buf, &mut k, if outermost { b"outermost" } else { b"nested" });
+                        put_bytes(&mut buf, &mut k, b")\n");
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
                     }
                 }
             }
         } else {
-            crate::println!(
-                "  KSTACK skipped: RSP={:#x} out of kernel range / misaligned",
-                rsp
-            );
+            let mut buf = [0u8; 96];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"  KSTACK skipped: RSP=");
+            put_hex_u64(&mut buf, &mut k, rsp);
+            put_bytes(&mut buf, &mut k, b" out of kernel range / misaligned\n");
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
         }
     }
     if is_user {
@@ -2488,12 +2522,21 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         }
         for row in 0..4 {
             let b = row * 8;
-            crate::println!(
-                "  STACK[{}..{}]@RSP+{:#x}: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-                b, b + 8, (b * 8) as u64,
-                sw[b], sw[b+1], sw[b+2], sw[b+3],
-                sw[b+4], sw[b+5], sw[b+6], sw[b+7]
-            );
+            let mut buf = [0u8; 256];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"  STACK[");
+            put_dec_u64(&mut buf, &mut k, b as u64);
+            put_bytes(&mut buf, &mut k, b"..");
+            put_dec_u64(&mut buf, &mut k, (b + 8) as u64);
+            put_bytes(&mut buf, &mut k, b"]@RSP+");
+            put_hex_u64(&mut buf, &mut k, (b * 8) as u64);
+            put_bytes(&mut buf, &mut k, b": ");
+            for j in 0..8 {
+                if j > 0 { put_byte(&mut buf, &mut k, b' '); }
+                put_hex_u64(&mut buf, &mut k, sw[b + j]);
+            }
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
         }
         // Code-pointer scan: walk one 4 KiB page above RSP and print every
         // qword that falls into a plausible user-text range.  The pre-fault
@@ -2511,9 +2554,16 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
             // userspace text typically lives in 0x100000000..0x500000000).
             let hi = v >> 32;
             if hi == 0x4 || hi == 0x2 || hi == 0x1 {
-                crate::println!("  CODE@RSP+{:#x}: {:#x}", (i * 8) as u64, v);
+                let mut buf = [0u8; 64];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"  CODE@RSP+");
+                put_hex_u64(&mut buf, &mut k, (i * 8) as u64);
+                put_bytes(&mut buf, &mut k, b": ");
+                put_hex_u64(&mut buf, &mut k, v);
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
                 printed += 1;
-                if printed >= 16 { break; } // cap to avoid log flood
+                if printed >= 16 { break; }
             }
         }
         // RBP chain walk: print the saved-RIP at each frame for up
@@ -2533,10 +2583,16 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
             let saved_rip = match crate::arch::x86_64::coredump::safe_read_user_u64(rbp.wrapping_add(8)) {
                 Some(v) => v, None => break,
             };
-            crate::println!(
-                "  FRAME[{}]: rbp={:#x} caller_rip={:#x}",
-                f, saved_rbp, saved_rip
-            );
+            let mut buf = [0u8; 96];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"  FRAME[");
+            put_dec_u64(&mut buf, &mut k, f as u64);
+            put_bytes(&mut buf, &mut k, b"]: rbp=");
+            put_hex_u64(&mut buf, &mut k, saved_rbp);
+            put_bytes(&mut buf, &mut k, b" caller_rip=");
+            put_hex_u64(&mut buf, &mut k, saved_rip);
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
             // Stop if RBP didn't decrease (corrupted chain or top of stack).
             if saved_rbp == 0 || saved_rbp <= rbp {
                 break;
