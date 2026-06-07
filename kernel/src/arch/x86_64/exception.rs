@@ -1247,6 +1247,84 @@ impl Drop for RetScribbleCheck {
 /// For timer IRQ (vector 32), returns potentially new SP for context switch.
 #[unsafe(no_mangle)]
 extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
+    // #208 STACK-NEAR-GUARD probe: at handler entry, frame_sp is the lowest
+    // address of the current kstack usage (just-pushed GPRs).  If
+    // frame_sp - stack_base is small, the next CALL/PUSH could touch the
+    // guard page.  Boot 11amfsq3243 caught a real overflow on tid=4
+    // zero_daemon (kstack window 0xfffffe0000b00000..0xfffffe0000c00000,
+    // guard hit at 0xfffffe0000c00000 — *upward* off the top, suggesting
+    // an asm-stub frame-pushed-past-allocation pattern).  This probe fires
+    // BEFORE that page-fault state: catches "stack distance to base/top
+    // boundary smaller than safety margin" so we see a warning ahead of
+    // the cascade.  One-shot per tid to avoid storms.
+    {
+        let tid = crate::sched::scheduler::current_thread_id();
+        if tid != 0 && (tid as usize) < 256 {
+            let tref = crate::sched::scheduler::thread_ref(tid);
+            let kbase = tref.stack_base as u64;
+            let ksize = crate::sched::scheduler::kstack_size() as u64;
+            let ktop = kbase.wrapping_add(ksize);
+            // Skip per-CPU idle threads — they run on the boot/AP stacks
+            // in PHYS_DIRECT_MAP, legitimately outside their allocated
+            // kstack window.  Same filter as the SAVED-SP-WRITE-OUT-OF-
+            // RANGE probe (commit b766f91).
+            let mut is_idle = false;
+            let ncpus = crate::sched::smp::num_cpus() as u32;
+            for cpu in 0..ncpus {
+                let pcpu = crate::sched::smp::get(cpu);
+                if pcpu.idle_thread_id
+                    .load(core::sync::atomic::Ordering::Relaxed) == tid
+                {
+                    is_idle = true;
+                    break;
+                }
+            }
+            // Stack grows DOWN from top toward base.  Near the top is
+            // healthy (just-started frame); near the base is dangerous
+            // (deep recursion approaching guard).  Warn only when RSP
+            // is within 16 KiB of the base — that's the real
+            // overflow-imminent signal.
+            const MARGIN: u64 = 16 * 1024;
+            let near_base = frame_sp > kbase
+                && frame_sp.wrapping_sub(kbase) < MARGIN;
+            // Explicit out-of-range (already overflow / wild sp).
+            let out_of_range = frame_sp < kbase || frame_sp > ktop;
+            let near_top = false; // legacy field, kept for the log path
+            if (near_base || out_of_range) && kbase != 0 && !is_idle {
+                static STACK_NEAR_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = STACK_NEAR_LOG
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 16 {
+                    let mut buf = [0u8; 192];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"STACK-NEAR-GUARD: tid=");
+                    put_dec_u64(&mut buf, &mut k, tid as u64);
+                    put_bytes(&mut buf, &mut k, b" rsp=");
+                    put_hex_u64(&mut buf, &mut k, frame_sp);
+                    put_bytes(&mut buf, &mut k, b" kstack=[");
+                    put_hex_u64(&mut buf, &mut k, kbase);
+                    put_bytes(&mut buf, &mut k, b"..");
+                    put_hex_u64(&mut buf, &mut k, ktop);
+                    put_bytes(&mut buf, &mut k, b") edge=");
+                    put_bytes(&mut buf, &mut k,
+                        if out_of_range { b"OOR" }
+                        else if near_base { b"base" }
+                        else { b"top" });
+                    put_bytes(&mut buf, &mut k, b" margin_left=");
+                    let dist = if frame_sp > kbase {
+                        frame_sp.wrapping_sub(kbase)
+                    } else { 0 };
+                    put_dec_u64(&mut buf, &mut k, dist);
+                    put_bytes(&mut buf, &mut k, b" n=");
+                    put_dec_u64(&mut buf, &mut k, n as u64);
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(
+                        &buf[..k.min(buf.len())]);
+                }
+            }
+        }
+    }
     // #233 ret-addr scribble check: __isr_common does `call x86_exception_handler`,
     // which pushes its return address onto frame_sp.  So [frame_sp - 8] is the
     // return-address slot; expected value is RIP-after-call in __isr_common.
