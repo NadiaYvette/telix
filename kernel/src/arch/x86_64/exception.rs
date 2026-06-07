@@ -565,7 +565,7 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             put_bytes(&mut buf, &mut n, b" cur_cpu=");
             put_dec_u64(&mut buf, &mut n, cur_cpu as u64);
             put_byte(&mut buf, &mut n, b'\n');
-            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
         }
         {
             let mut buf = [0u8; 128];
@@ -577,7 +577,7 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             put_bytes(&mut buf, &mut n, b" task=");
             put_dec_u64(&mut buf, &mut n, tref.task_id as u64);
             put_byte(&mut buf, &mut n, b'\n');
-            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
         }
         // Raw dump: 22 u64 values at [sp..sp+176).  Annotate any value
         // that falls in a live thread's kstack range (#208 ladder
@@ -600,7 +600,7 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                 put_byte(&mut buf, &mut n, b']');
             }
             put_byte(&mut buf, &mut n, b'\n');
-            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
         }
         // #208 H-A vs H-B probe: also dump the frame at tref.saved_sp.
         // If validate's sp ≠ saved_sp, we're checking the wrong frame.
@@ -622,7 +622,7 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                 put_hex_u64(&mut buf, &mut n, d as u64);
             }
             put_bytes(&mut buf, &mut n, b"]\n");
-            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
             for i in 17..22u64 {
                 let val = unsafe { *((saved_sp + i * 8) as *const u64) };
                 let label: &[u8] = match i {
@@ -642,7 +642,7 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                 put_bytes(&mut buf, &mut n, b"]=");
                 put_hex_018(&mut buf, &mut n, val);
                 put_byte(&mut buf, &mut n, b'\n');
-                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
             }
         }
         // #208 shadow + saved_sp last-writer dump.
@@ -662,7 +662,7 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             put_bytes(&mut buf, &mut n, b" shadow.ss=");
             put_hex_u64(&mut buf, &mut n, tref.iretq_shadow_ss);
             put_byte(&mut buf, &mut n, b'\n');
-            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
         }
         crate::sched::scheduler::dump_saved_sp_log(tid);
         // #208 saved_sp watchpoint: arm GLOBAL DR0 to catch the next
@@ -770,7 +770,7 @@ fn handler_log_iretq(tag: &str, cpu: u32, tid: u32, slots: &[u64; 5], frame_va: 
     put_str(&mut buf, &mut n, " SS=");  put_hex(&mut buf, &mut n, slots[4]);
     put_str(&mut buf, &mut n, " frame_va="); put_hex(&mut buf, &mut n, frame_va);
     put(&mut buf, &mut n, b'\n');
-    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
 }
 
 /// Thin hex writer for ret-scribble with frame.rip + shadow_rip correlation.
@@ -836,7 +836,7 @@ fn handler_log_ret_scribble_ctx2(
     put_str(&mut buf, &mut n, " match=");
     put_dec_u32(&mut buf, &mut n, match_src);
     put(&mut buf, &mut n, b'\n');
-    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
 }
 
 /// Thin hex writer for ret-scribble events with correlation context.
@@ -896,7 +896,7 @@ fn handler_log_ret_scribble_ctx(
     put_str(&mut buf, &mut n, " print_holder=");
     put_dec_i32(&mut buf, &mut n, print_holder);
     put(&mut buf, &mut n, b'\n');
-    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
 }
 
 /// Thin hex writer for ret-scribble events (legacy, no context).
@@ -945,7 +945,7 @@ fn handler_log_ret_scribble(cpu: u32, tid: u32, slot: u64, was: u64, now: u64) {
     put_str(&mut buf, &mut n, " now=");
     put_hex(&mut buf, &mut n, now);
     put(&mut buf, &mut n, b'\n');
-    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
 }
 
 /// #233 PRE-IRETQ probe: called from __isr_common JUST BEFORE iretq when
