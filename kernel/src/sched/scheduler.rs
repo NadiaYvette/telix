@@ -888,6 +888,20 @@ static IRETQ_SHADOW_SLOT17_PA: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP]
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     [Z; SAVED_SP_LOG_CAP]
 };
+/// Per-tid seqlock guarding the {iretq_shadow_sp, IRETQ_SHADOW_SLOT17_PA}
+/// pair.  Boot 11amfsq3179 (commit 8c3369b probe) caught a torn write
+/// where iretq_shadow_sp was updated to a new value but
+/// IRETQ_SHADOW_SLOT17_PA was stale from a prior snapshot — proving
+/// concurrent snapshot updates for the same tid can interleave their
+/// stores.  Writer wraps the field updates with seq += 1 / seq += 1
+/// (odd while in-progress, even when consistent).  Reader at FBD
+/// captures the seq before and after reading; if it changed or was
+/// odd, the read was torn and we suppress the SLOT17-VA-PA-REMAP log.
+#[cfg(target_arch = "x86_64")]
+static IRETQ_SHADOW_SEQ: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; SAVED_SP_LOG_CAP]
+};
 
 /// Validated write to `Thread.saved_sp`.  Verifies the Thread* address is
 /// in SLAB_REGION (PML4[509]) before writing; logs SAVED-SP-WRITE-BAD-THREAD
@@ -1239,6 +1253,18 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
     {
         return;
     }
+    // #227 seqlock: bump to odd before any field write so concurrent
+    // readers (FBD / watchdog) can detect a torn snapshot.  We bump
+    // unconditionally even when the slot index is out of range so the
+    // even-on-exit invariant holds.
+    #[cfg(target_arch = "x86_64")]
+    let seq_idx = {
+        let i = tid as usize;
+        if i < SAVED_SP_LOG_CAP {
+            IRETQ_SHADOW_SEQ[i].fetch_add(1, Ordering::Release);
+            Some(i)
+        } else { None }
+    };
     unsafe {
         let frame = sp as *const u64;
         t.iretq_shadow_rip = *frame.add(17);
@@ -1250,11 +1276,11 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
     }
     // #227 VA→PA continuity: capture the PA backing slot[17] at park
     // time.  Compared at FBD slot[17] mismatch to detect kstack VA
-    // remap-while-parked.
+    // remap-while-parked.  Held inside the seqlock so the {sp, PA}
+    // pair is observed atomically by the reader.
     #[cfg(target_arch = "x86_64")]
     {
-        let i = tid as usize;
-        if i < SAVED_SP_LOG_CAP {
+        if let Some(i) = seq_idx {
             let cr3: u64;
             unsafe {
                 core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
@@ -1265,6 +1291,12 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
                 .unwrap_or(0) as u64;
             IRETQ_SHADOW_SLOT17_PA[i].store(pa, Ordering::Relaxed);
         }
+    }
+    // #227 seqlock: bump again to return to even.  Total += 2 per
+    // snapshot keeps the parity invariant.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(i) = seq_idx {
+        IRETQ_SHADOW_SEQ[i].fetch_add(1, Ordering::Release);
     }
     unsafe {
         let frame = sp as *const u64;
@@ -1478,32 +1510,40 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
                     if i == 14 && shadow < 0x500 && live < 0x500 {
                         continue;
                     }
-                    // #227 VA→PA continuity check on slot[17] (saved RIP).
-                    // If kstack VA window was remapped while parked, the
-                    // VA's PA at dispatch differs from at park.  Log to
-                    // confirm the VA aliasing hypothesis for Pattern B.
+                    // #227 VA→PA continuity check on slot[17] (saved RIP),
+                    // guarded by IRETQ_SHADOW_SEQ to suppress torn-snapshot
+                    // false positives (commit 8c3369b caught this).
                     #[cfg(target_arch = "x86_64")]
-                    if i == 17 {
-                        let park_pa = if (tid as usize) < SAVED_SP_LOG_CAP {
-                            IRETQ_SHADOW_SLOT17_PA[tid as usize]
-                                .load(Ordering::Relaxed)
-                        } else { 0 };
-                        let cr3: u64;
-                        core::arch::asm!(
-                            "mov {}, cr3", out(reg) cr3,
-                            options(nomem, nostack),
-                        );
-                        let pml4 = (cr3 & !0xfff) as usize;
-                        let slot17_va =
-                            (frame_ptr as u64).wrapping_add(17 * 8) as usize;
-                        let dispatch_pa = crate::arch::x86_64::mm::translate_va(
-                            pml4, slot17_va,
-                        ).unwrap_or(0) as u64;
-                        if park_pa != 0 && park_pa != dispatch_pa {
-                            crate::println!(
-                                "SLOT17-VA-PA-REMAP: tid={} va={:#x} park_pa={:#x} dispatch_pa={:#x}",
-                                tid, slot17_va, park_pa, dispatch_pa,
+                    if i == 17 && (tid as usize) < SAVED_SP_LOG_CAP {
+                        let ti = tid as usize;
+                        let seq_a = IRETQ_SHADOW_SEQ[ti].load(Ordering::Acquire);
+                        if seq_a & 1 == 0 {
+                            // Not in-progress at the start — read pair.
+                            let park_pa = IRETQ_SHADOW_SLOT17_PA[ti]
+                                .load(Ordering::Relaxed);
+                            let cr3: u64;
+                            core::arch::asm!(
+                                "mov {}, cr3", out(reg) cr3,
+                                options(nomem, nostack),
                             );
+                            let pml4 = (cr3 & !0xfff) as usize;
+                            let slot17_va = (frame_ptr as u64)
+                                .wrapping_add(17 * 8) as usize;
+                            let dispatch_pa =
+                                crate::arch::x86_64::mm::translate_va(
+                                    pml4, slot17_va,
+                                ).unwrap_or(0) as u64;
+                            let seq_b = IRETQ_SHADOW_SEQ[ti]
+                                .load(Ordering::Acquire);
+                            if seq_a == seq_b
+                                && park_pa != 0
+                                && park_pa != dispatch_pa
+                            {
+                                crate::println!(
+                                    "SLOT17-VA-PA-REMAP: tid={} va={:#x} park_pa={:#x} dispatch_pa={:#x} seq={}",
+                                    tid, slot17_va, park_pa, dispatch_pa, seq_a,
+                                );
+                            }
                         }
                     }
                     let nn = FRAME_BYTE_DELTA_LOG
