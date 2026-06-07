@@ -166,6 +166,18 @@ static mut IST_STACKS: [IstStack; MAX_IST_CPUS] = {
     [EMPTY; MAX_IST_CPUS]
 };
 
+/// IST slot 2 — used for #SS (Stack Segment Fault, vector 12).  Phase 1 of
+/// #216 per-CPU IRQ stacks per the slot-allocation policy in task #239.
+/// #SS is a fatal class (calls exit_current_thread → context switch on
+/// the next thread's kstack), so even without #237 asm-stub awareness
+/// the existing `mov rsp, rax` at __isr_common's tail correctly switches
+/// off the IST stack onto the next thread's kstack.  Same shape as #DF
+/// on IST 1.
+static mut IST_STACKS_SS: [IstStack; MAX_IST_CPUS] = {
+    const EMPTY: IstStack = IstStack { data: [0; IST_STACK_SIZE] };
+    [EMPTY; MAX_IST_CPUS]
+};
+
 /// Pointer to this CPU's TSS storage. BSP uses bootstrap, APs use the
 /// dynamic slice.
 #[inline]
@@ -447,6 +459,9 @@ pub fn init() {
         // IST[0] → dedicated double-fault stack (stack grows down, so point to top).
         (*tss_for(0)).ist[0] =
             IST_STACKS[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+        // IST[1] → dedicated #SS stack (#216 Phase 1).
+        (*tss_for(0)).ist[1] =
+            IST_STACKS_SS[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
     }
 
     load_gdt_for_cpu(0);
@@ -465,6 +480,9 @@ pub fn init_ap(cpu: u32) {
         if cpu < MAX_IST_CPUS {
             (*tss_for(cpu)).ist[0] =
                 IST_STACKS[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+            // IST[1] → dedicated #SS stack (#216 Phase 1).
+            (*tss_for(cpu)).ist[1] =
+                IST_STACKS_SS[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
         }
     }
 

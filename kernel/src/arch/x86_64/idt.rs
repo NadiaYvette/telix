@@ -89,6 +89,13 @@ pub fn init() {
         // Vector 8 (#DF) uses IST 1 → TSS.ist[0] so it gets a clean stack
         // even when the current kernel stack is corrupted/overflowed.
         idt[8].set_ist(1);
+        // Vector 12 (#SS Stack Segment) uses IST 2 → TSS.ist[1].  #216
+        // Phase 1 per the slot-allocation policy in task #239.  #SS is a
+        // fatal class (exit_current_thread, no resume on this thread), so
+        // the __isr_common `mov rsp, rax` switch onto the next thread's
+        // kstack correctly drops the IST stack contents — same shape as
+        // #DF on IST 1.
+        idt[12].set_ist(2);
 
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
