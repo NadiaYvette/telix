@@ -1540,6 +1540,36 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
     if core_changed || ext_changed {
         let n = FRAME_DELTA_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 100 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                let mut buf = [0u8; 320];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"FRAME-DELTA: tid=");
+                put_dec_u64(&mut buf, &mut k, tid as u64);
+                put_bytes(&mut buf, &mut k, b" sp=");
+                put_hex_u64(&mut buf, &mut k, sp);
+                put_bytes(&mut buf, &mut k, b" src=");
+                put_dec_u64(&mut buf, &mut k, t.saved_sp_source as u64);
+                let pairs: [(&[u8], u64, u64); 5] = [
+                    (b" RIP=", t.iretq_shadow_rip, rip),
+                    (b" CS=", t.iretq_shadow_cs, cs),
+                    (b" RFLAGS=", t.iretq_shadow_rflags, rflags),
+                    (b" RSP=", t.iretq_shadow_rsp, rsp),
+                    (b" SS=", t.iretq_shadow_ss, ss),
+                ];
+                for (label, before, after) in pairs {
+                    put_bytes(&mut buf, &mut k, label);
+                    put_hex_u64(&mut buf, &mut k, before);
+                    put_bytes(&mut buf, &mut k, b"->");
+                    put_hex_u64(&mut buf, &mut k, after);
+                }
+                put_bytes(&mut buf, &mut k, b" n=");
+                put_dec_u64(&mut buf, &mut k, n as u64);
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             crate::println!(
                 "FRAME-DELTA: tid={} sp={:#x} src={} RIP={:#x}->{:#x} CS={:#x}->{:#x} RFLAGS={:#x}->{:#x} RSP={:#x}->{:#x} SS={:#x}->{:#x} n={}",
                 tid, sp, t.saved_sp_source,
@@ -3143,6 +3173,27 @@ fn rescue_host_paused_peers() {
         if migrated > 0 {
             let n = LOG_COUNT.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                    let mut buf = [0u8; 160];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"HOST-PAUSE-RESCUE: my_cpu=");
+                    put_dec_u64(&mut buf, &mut k, my_cpu as u64);
+                    put_bytes(&mut buf, &mut k, b" paused_peer=");
+                    put_dec_u64(&mut buf, &mut k, c as u64);
+                    put_bytes(&mut buf, &mut k, b" ts_age_ms=");
+                    put_dec_u64(&mut buf, &mut k, ts_age / 1_000_000);
+                    put_bytes(&mut buf, &mut k, b" irq_age_ms=");
+                    put_dec_u64(&mut buf, &mut k, irq_age / 1_000_000);
+                    put_bytes(&mut buf, &mut k, b" migrated=");
+                    put_dec_u64(&mut buf, &mut k, migrated as u64);
+                    put_bytes(&mut buf, &mut k, b" (n=");
+                    put_dec_u64(&mut buf, &mut k, (n + 1) as u64);
+                    put_bytes(&mut buf, &mut k, b")\n");
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 crate::println!(
                     "HOST-PAUSE-RESCUE: my_cpu={} paused_peer={} ts_age_ms={} irq_age_ms={} migrated={} (n={})",
                     my_cpu, c, ts_age / 1_000_000, irq_age / 1_000_000,
@@ -3589,6 +3640,23 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
     if id < 100 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+            let mut buf = [0u8; 96];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"KTHREAD-SPAWN: tid=");
+            put_dec_u64(&mut buf, &mut k, id as u64);
+            put_bytes(&mut buf, &mut k, b" entry=");
+            put_hex_u64(&mut buf, &mut k, entry as usize as u64);
+            put_bytes(&mut buf, &mut k, b" prio=");
+            put_dec_u64(&mut buf, &mut k, priority as u64);
+            put_bytes(&mut buf, &mut k, b" q=");
+            put_dec_u64(&mut buf, &mut k, quantum as u64);
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "KTHREAD-SPAWN: tid={} entry={:#x} prio={} q={}",
             id, entry as usize, priority, quantum,
