@@ -431,22 +431,49 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                         )
                     };
                     let all_zero = bytes.iter().all(|&b| b == 0);
-                    crate::println!(
-                        "FIRST-IRETQ-USER: tid={} cpu={} vec={} sp={:#x} \
-                         rip={:#x} cs={:#x} ss={:#x} rax={:#x} rsp={:#x} \
-                         rip_bytes_ok={} rip_bytes_zero={} rip_bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                        tid,
-                        crate::sched::smp::cpu_id(),
-                        vector, sp,
-                        rip,
-                        cs_peek,
-                        frame_peek.ss(),
-                        frame_peek.rax(),
-                        frame_peek.rsp(),
-                        ok, all_zero,
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                    );
+                    // #208 Pattern A sweep: 19-arg println! → atomic put_*.
+                    let cpu = crate::sched::smp::cpu_id();
+                    let ss = frame_peek.ss();
+                    let rax_v = frame_peek.rax();
+                    let rsp_v = frame_peek.rsp();
+                    let mut buf = [0u8; 256];
+                    let mut n = 0;
+                    put_bytes(&mut buf, &mut n, b"FIRST-IRETQ-USER: tid=");
+                    put_dec_u64(&mut buf, &mut n, tid as u64);
+                    put_bytes(&mut buf, &mut n, b" cpu=");
+                    put_dec_u64(&mut buf, &mut n, cpu as u64);
+                    put_bytes(&mut buf, &mut n, b" vec=");
+                    put_dec_u64(&mut buf, &mut n, vector);
+                    put_bytes(&mut buf, &mut n, b" sp=");
+                    put_hex_u64(&mut buf, &mut n, sp);
+                    put_bytes(&mut buf, &mut n, b" rip=");
+                    put_hex_u64(&mut buf, &mut n, rip);
+                    put_bytes(&mut buf, &mut n, b" cs=");
+                    put_hex_u64(&mut buf, &mut n, cs_peek);
+                    put_bytes(&mut buf, &mut n, b" ss=");
+                    put_hex_u64(&mut buf, &mut n, ss);
+                    put_bytes(&mut buf, &mut n, b" rax=");
+                    put_hex_u64(&mut buf, &mut n, rax_v);
+                    put_bytes(&mut buf, &mut n, b" rsp=");
+                    put_hex_u64(&mut buf, &mut n, rsp_v);
+                    put_bytes(&mut buf, &mut n, b" rip_bytes_ok=");
+                    put_bytes(&mut buf, &mut n, if ok { b"1" } else { b"0" });
+                    put_bytes(&mut buf, &mut n, b" rip_bytes_zero=");
+                    put_bytes(&mut buf, &mut n, if all_zero { b"1" } else { b"0" });
+                    put_bytes(&mut buf, &mut n, b" rip_bytes=[");
+                    for i in 0..8 {
+                        if i > 0 { put_byte(&mut buf, &mut n, b' '); }
+                        let b = bytes[i];
+                        // 2-digit hex (no 0x).
+                        let hi = (b >> 4) & 0xF;
+                        let lo = b & 0xF;
+                        put_byte(&mut buf, &mut n,
+                            if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) });
+                        put_byte(&mut buf, &mut n,
+                            if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) });
+                    }
+                    put_bytes(&mut buf, &mut n, b"]\n");
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
                 }
             }
         }
