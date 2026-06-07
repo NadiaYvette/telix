@@ -482,10 +482,17 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
     // saved_sp=0 or any pointer into the real-mode IVT / BIOS data area.
     if sp < 0x10000 {
         let tid = crate::sched::scheduler::current_thread_id();
-        crate::println!(
-            "BAD frame: sp={:#x} (below 64K) vec={} tid={}",
-            sp, vector, tid
-        );
+        // #208 Pattern A sweep: atomic put_*.
+        let mut buf = [0u8; 96];
+        let mut n = 0;
+        put_bytes(&mut buf, &mut n, b"BAD frame: sp=");
+        put_hex_u64(&mut buf, &mut n, sp);
+        put_bytes(&mut buf, &mut n, b" (below 64K) vec=");
+        put_dec_u64(&mut buf, &mut n, vector);
+        put_bytes(&mut buf, &mut n, b" tid=");
+        put_dec_u64(&mut buf, &mut n, tid as u64);
+        put_byte(&mut buf, &mut n, b'\n');
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..n.min(buf.len())]);
         crate::sched::scheduler::thread_ref(tid)
             .killed.store(true, core::sync::atomic::Ordering::Release);
         crate::arch::irq::enable();
@@ -1309,19 +1316,26 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                 1, core::sync::atomic::Ordering::Relaxed,
             );
             if n < 50 {
-                crate::println!(
-                    "EARLY-BAD-CS: vec={} cs={:#x} rip={:#x} frame_sp={:#x} cpu={} n={}",
-                    vector,
-                    cs_early,
-                    unsafe {
-                        core::ptr::read_volatile(
-                            &frame.regs[17] as *const u64,
-                        )
-                    },
-                    frame_sp,
-                    cpu,
-                    n,
-                );
+                let rip_early = unsafe {
+                    core::ptr::read_volatile(&frame.regs[17] as *const u64)
+                };
+                // #208 Pattern A sweep: atomic put_*.
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"EARLY-BAD-CS: vec=");
+                put_dec_u64(&mut buf, &mut k, vector);
+                put_bytes(&mut buf, &mut k, b" cs=");
+                put_hex_u64(&mut buf, &mut k, cs_early);
+                put_bytes(&mut buf, &mut k, b" rip=");
+                put_hex_u64(&mut buf, &mut k, rip_early);
+                put_bytes(&mut buf, &mut k, b" frame_sp=");
+                put_hex_u64(&mut buf, &mut k, frame_sp);
+                put_bytes(&mut buf, &mut k, b" cpu=");
+                put_dec_u64(&mut buf, &mut k, cpu as u64);
+                put_bytes(&mut buf, &mut k, b" n=");
+                put_dec_u64(&mut buf, &mut k, n as u64);
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
             }
         }
     }
@@ -1365,12 +1379,32 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     if n < 100 {
                         let tss_rsp0 = crate::arch::x86_64::gdt::get_rsp0();
                         let expected_rsp0 = sb + sz;
-                        crate::println!(
-                            "RSP0-MISMATCH: tid={} cpu={} vec={} frame_sp={:#x} expected_kstack=[{:#x}..{:#x}) tss_rsp0={:#x} expected_rsp0={:#x} cs={:#x} n={}",
-                            tid, cpu, vector, frame_sp, sb, sb + sz,
-                            tss_rsp0, expected_rsp0,
-                            frame.cs(), n,
-                        );
+                        let cs_val = frame.cs();
+                        // #208 Pattern A sweep: atomic put_*.
+                        let mut buf = [0u8; 256];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"RSP0-MISMATCH: tid=");
+                        put_dec_u64(&mut buf, &mut k, tid as u64);
+                        put_bytes(&mut buf, &mut k, b" cpu=");
+                        put_dec_u64(&mut buf, &mut k, cpu as u64);
+                        put_bytes(&mut buf, &mut k, b" vec=");
+                        put_dec_u64(&mut buf, &mut k, vector);
+                        put_bytes(&mut buf, &mut k, b" frame_sp=");
+                        put_hex_u64(&mut buf, &mut k, frame_sp);
+                        put_bytes(&mut buf, &mut k, b" expected_kstack=[");
+                        put_hex_u64(&mut buf, &mut k, sb);
+                        put_bytes(&mut buf, &mut k, b"..");
+                        put_hex_u64(&mut buf, &mut k, sb + sz);
+                        put_bytes(&mut buf, &mut k, b") tss_rsp0=");
+                        put_hex_u64(&mut buf, &mut k, tss_rsp0);
+                        put_bytes(&mut buf, &mut k, b" expected_rsp0=");
+                        put_hex_u64(&mut buf, &mut k, expected_rsp0);
+                        put_bytes(&mut buf, &mut k, b" cs=");
+                        put_hex_u64(&mut buf, &mut k, cs_val);
+                        put_bytes(&mut buf, &mut k, b" n=");
+                        put_dec_u64(&mut buf, &mut k, n as u64);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
                         crate::sched::scheduler::dump_rsp0_ring(cpu as u32);
                         crate::sched::scheduler::dump_ct_ring(cpu as u32);
                     }
