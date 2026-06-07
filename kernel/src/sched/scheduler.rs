@@ -1441,6 +1441,29 @@ pub fn check_park_stack_ext(tid: ThreadId, sp: u64) {
             if live != snap {
                 let n = PARK_EXT_DELTA_LOG.fetch_add(1, Ordering::Relaxed);
                 if n < 32 {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                        let mut buf = [0u8; 192];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"PARK-EXT-DELTA: tid=");
+                        put_dec_u64(&mut buf, &mut k, tid as u64);
+                        put_bytes(&mut buf, &mut k, b" sp=");
+                        put_hex_u64(&mut buf, &mut k, sp);
+                        put_bytes(&mut buf, &mut k, b" quad=");
+                        put_dec_u64(&mut buf, &mut k, q as u64);
+                        put_bytes(&mut buf, &mut k, b" addr=");
+                        put_hex_u64(&mut buf, &mut k, sp + (q as u64 * 8));
+                        put_bytes(&mut buf, &mut k, b" was=");
+                        put_hex_u64(&mut buf, &mut k, snap);
+                        put_bytes(&mut buf, &mut k, b" now=");
+                        put_hex_u64(&mut buf, &mut k, live);
+                        put_bytes(&mut buf, &mut k, b" n=");
+                        put_dec_u64(&mut buf, &mut k, n as u64);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
                     crate::println!(
                         "PARK-EXT-DELTA: tid={} sp={:#x} quad={} addr={:#x} was={:#x} now={:#x} n={}",
                         tid, sp, q, sp + (q as u64 * 8), snap, live, n,
@@ -1681,6 +1704,29 @@ pub fn validate_kstack_inject(
     if !ok {
         let n = KEPOCH_BAIL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 100 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                let mut buf = [0u8; 160];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"KEPOCH-BAIL: site=");
+                put_bytes(&mut buf, &mut k, site.as_bytes());
+                put_bytes(&mut buf, &mut k, b" tid=");
+                put_dec_u64(&mut buf, &mut k, tid as u64);
+                put_bytes(&mut buf, &mut k, b" sp=");
+                put_hex_u64(&mut buf, &mut k, sp);
+                put_bytes(&mut buf, &mut k, b" stack_base=");
+                put_hex_u64(&mut buf, &mut k, sb as u64);
+                put_bytes(&mut buf, &mut k, b" size=");
+                put_hex_u64(&mut buf, &mut k, sz);
+                put_bytes(&mut buf, &mut k, b" epoch=");
+                put_dec_u64(&mut buf, &mut k, epoch as u64);
+                put_bytes(&mut buf, &mut k, b" n=");
+                put_dec_u64(&mut buf, &mut k, n as u64);
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             crate::println!(
                 "KEPOCH-BAIL: site={} tid={} sp={:#x} stack_base={:#x} size={:#x} epoch={} n={}",
                 site, tid, sp, sb, sz, epoch, n
@@ -4688,6 +4734,21 @@ pub fn tick(current_sp: u64) -> u64 {
                     let n = TICK_GAP_LOG_COUNT[slot]
                         .fetch_add(1, Ordering::Relaxed);
                     if n < 30 {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                            let mut buf = [0u8; 128];
+                            let mut k = 0;
+                            put_bytes(&mut buf, &mut k, b"TICK-GAP: cpu=");
+                            put_dec_u64(&mut buf, &mut k, cpu as u64);
+                            put_bytes(&mut buf, &mut k, b" gap_ms=");
+                            put_dec_u64(&mut buf, &mut k, gap / 1_000_000);
+                            put_bytes(&mut buf, &mut k, b" (n=");
+                            put_dec_u64(&mut buf, &mut k, (n + 1) as u64);
+                            put_bytes(&mut buf, &mut k, b") -- host vCPU likely descheduled\n");
+                            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
                         crate::println!(
                             "TICK-GAP: cpu={} gap_ms={} (n={}) — host vCPU likely descheduled",
                             cpu, gap / 1_000_000, n + 1,
@@ -4950,6 +5011,21 @@ pub fn tick(current_sp: u64) -> u64 {
                 }
                 let nlog = SWEEP_SCAN_LOG.fetch_add(1, Ordering::Relaxed);
                 if nlog < 3 || nlog % 10 == 0 {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                        let mut buf = [0u8; 96];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"PERIODIC-SHADOW-SWEEP: tick=");
+                        put_dec_u64(&mut buf, &mut k, n);
+                        put_bytes(&mut buf, &mut k, b" checked=");
+                        put_dec_u64(&mut buf, &mut k, checked as u64);
+                        put_bytes(&mut buf, &mut k, b" max_tid=");
+                        put_dec_u64(&mut buf, &mut k, max_tid as u64);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
                     crate::println!(
                         "PERIODIC-SHADOW-SWEEP: tick={} checked={} max_tid={}",
                         n, checked, max_tid,
@@ -6440,6 +6516,21 @@ pub fn block_current(_reason: BlockReason) {
                     BlockReason::SuspendedMemPressure => 15,
                 };
                 let task_id = thread_ref(tid).task_id;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                    let mut buf = [0u8; 64];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"BC: tid=");
+                    put_dec_u64(&mut buf, &mut k, tid as u64);
+                    put_bytes(&mut buf, &mut k, b" task=");
+                    put_dec_u64(&mut buf, &mut k, task_id as u64);
+                    put_bytes(&mut buf, &mut k, b" reason=");
+                    put_dec_u64(&mut buf, &mut k, reason_tag as u64);
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 crate::println!(
                     "BC: tid={} task={} reason={}",
                     tid, task_id, reason_tag
@@ -10039,6 +10130,35 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     let inq_now = t.in_queue.load(Ordering::Relaxed);
                     let enq_n = t.enqueue_count.load(Ordering::Relaxed);
                     let (tevt, tcpu, tseq) = trace_last(tid as u32);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                        let mut buf = [0u8; 256];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"PENDING-STUCK-LOW: tid=");
+                        put_dec_u64(&mut buf, &mut k, tid as u64);
+                        put_bytes(&mut buf, &mut k, b" task=");
+                        put_dec_u64(&mut buf, &mut k, t.task_id as u64);
+                        put_bytes(&mut buf, &mut k, b" age_ns=");
+                        put_dec_u64(&mut buf, &mut k, age_ns);
+                        put_bytes(&mut buf, &mut k, b" last_cpu=");
+                        put_dec_u64(&mut buf, &mut k, target as u64);
+                        put_bytes(&mut buf, &mut k, b" prio=");
+                        put_dec_u64(&mut buf, &mut k, prio as u64);
+                        put_bytes(&mut buf, &mut k, b" inq=");
+                        put_bytes(&mut buf, &mut k, if inq_now { b"true" } else { b"false" });
+                        put_bytes(&mut buf, &mut k, b" enq_n=");
+                        put_dec_u64(&mut buf, &mut k, enq_n);
+                        put_bytes(&mut buf, &mut k, b" trace=(evt=");
+                        put_dec_u64(&mut buf, &mut k, tevt as u64);
+                        put_bytes(&mut buf, &mut k, b" cpu=");
+                        put_dec_u64(&mut buf, &mut k, tcpu as u64);
+                        put_bytes(&mut buf, &mut k, b" seq=");
+                        put_dec_u64(&mut buf, &mut k, tseq as u64);
+                        put_bytes(&mut buf, &mut k, b")\n");
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
                     crate::println!(
                         "PENDING-STUCK-LOW: tid={} task={} age_ns={} last_cpu={} prio={} inq={} enq_n={} trace=(evt={} cpu={} seq={})",
                         tid, t.task_id, age_ns, target, prio, inq_now, enq_n,
