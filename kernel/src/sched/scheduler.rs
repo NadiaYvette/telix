@@ -903,6 +903,24 @@ static IRETQ_SHADOW_SEQ: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
     [Z; SAVED_SP_LOG_CAP]
 };
 
+/// #227 concurrent-snapshot detection.  Post-seqlock survey (boots
+/// 3189-3204) still caught REMAP fires — proving two writers
+/// simultaneously call snapshot_iretq_shadow for the same tid, which
+/// the SeqLock can't catch because both writers bump the seq
+/// (odd→even→odd→even) without mutual exclusion of the field writes.
+///
+/// write_saved_sp takes `&mut Thread`, so this should be impossible
+/// under sound Rust — but the persistent fires imply a raw-pointer
+/// path bypasses the borrow guard.  This counter increments on
+/// snapshot entry and decrements on exit; a value > 1 at entry
+/// catches the offending caller pair directly, with the caller
+/// location reported via #[track_caller].
+#[cfg(target_arch = "x86_64")]
+static SNAPSHOT_INFLIGHT: [core::sync::atomic::AtomicU32; SAVED_SP_LOG_CAP] = {
+    const Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    [Z; SAVED_SP_LOG_CAP]
+};
+
 /// Validated write to `Thread.saved_sp`.  Verifies the Thread* address is
 /// in SLAB_REGION (PML4[509]) before writing; logs SAVED-SP-WRITE-BAD-THREAD
 /// with the caller location if not.  Hypothesis: the wild-RIP / iretq-zero
@@ -982,6 +1000,7 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
 }
 
 #[inline]
+#[track_caller]
 pub fn record_saved_sp_write(tid: ThreadId, new_value: u64, callsite_tag: u8) {
     let i = tid as usize;
     if i >= SAVED_SP_LOG_CAP {
@@ -1240,6 +1259,7 @@ pub fn dump_rsp0_ring(cpu: u32) {
 /// RIP / CS / RFLAGS / RSP / SS into the Thread's shadow fields.  No-op
 /// if `sp` is not within `tid`'s current kstack.
 #[inline]
+#[track_caller]
 pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
     if sp < 0x10000 {
         return;
@@ -1261,6 +1281,24 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
     let seq_idx = {
         let i = tid as usize;
         if i < SAVED_SP_LOG_CAP {
+            // #227 concurrent-snapshot detection: increment inflight
+            // counter; >0 prior value means another writer is in the
+            // critical region NOW.  Log the caller (via #[track_caller])
+            // so the offending bypass of `&mut Thread` can be identified.
+            let prev = SNAPSHOT_INFLIGHT[i].fetch_add(1, Ordering::AcqRel);
+            if prev != 0 {
+                static CONCURRENT_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = CONCURRENT_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    let caller = core::panic::Location::caller();
+                    let cpu = smp::cpu_id();
+                    crate::println!(
+                        "CONCURRENT-SNAPSHOT: tid={} prev={} cpu={} caller={}:{} n={}",
+                        tid, prev, cpu, caller.file(), caller.line(), n,
+                    );
+                }
+            }
             IRETQ_SHADOW_SEQ[i].fetch_add(1, Ordering::Release);
             Some(i)
         } else { None }
@@ -1293,10 +1331,12 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
         }
     }
     // #227 seqlock: bump again to return to even.  Total += 2 per
-    // snapshot keeps the parity invariant.
+    // snapshot keeps the parity invariant.  Also release the
+    // concurrent-snapshot counter.
     #[cfg(target_arch = "x86_64")]
     if let Some(i) = seq_idx {
         IRETQ_SHADOW_SEQ[i].fetch_add(1, Ordering::Release);
+        SNAPSHOT_INFLIGHT[i].fetch_sub(1, Ordering::Release);
     }
     unsafe {
         let frame = sp as *const u64;
