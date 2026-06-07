@@ -1609,6 +1609,33 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
                         let cpu = smp::cpu_id();
                         let cur = smp::current().current_thread
                             .load(Ordering::Relaxed);
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                            let mut buf = [0u8; 192];
+                            let mut k = 0;
+                            put_bytes(&mut buf, &mut k, b"FRAME-BYTE-DELTA: tid=");
+                            put_dec_u64(&mut buf, &mut k, tid as u64);
+                            put_bytes(&mut buf, &mut k, b" sp=");
+                            put_hex_u64(&mut buf, &mut k, sp);
+                            put_bytes(&mut buf, &mut k, b" src=");
+                            put_dec_u64(&mut buf, &mut k, t.saved_sp_source as u64);
+                            put_bytes(&mut buf, &mut k, b" slot[");
+                            put_dec_u64(&mut buf, &mut k, i as u64);
+                            put_bytes(&mut buf, &mut k, b"]: shadow=");
+                            put_hex_u64(&mut buf, &mut k, shadow);
+                            put_bytes(&mut buf, &mut k, b" live=");
+                            put_hex_u64(&mut buf, &mut k, live);
+                            put_bytes(&mut buf, &mut k, b" cpu=");
+                            put_dec_u64(&mut buf, &mut k, cpu as u64);
+                            put_bytes(&mut buf, &mut k, b" cur=");
+                            put_dec_u64(&mut buf, &mut k, cur as u64);
+                            put_bytes(&mut buf, &mut k, b" n=");
+                            put_dec_u64(&mut buf, &mut k, nn as u64);
+                            put_byte(&mut buf, &mut k, b'\n');
+                            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
                         crate::println!(
                             "FRAME-BYTE-DELTA: tid={} sp={:#x} src={} slot[{}]: shadow={:#x} live={:#x} cpu={} cur={} n={}",
                             tid, sp, t.saved_sp_source, i, shadow, live, cpu, cur, nn
@@ -4724,6 +4751,25 @@ pub fn tick(current_sp: u64) -> u64 {
                         let max = pc.cli_max_cycles.load(Ordering::Relaxed);
                         let tot = pc.cli_total_cycles.load(Ordering::Relaxed);
                         let cnt = pc.cli_count.load(Ordering::Relaxed);
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                            let mut buf = [0u8; 128];
+                            let mut k = 0;
+                            put_bytes(&mut buf, &mut k, b"CLI-MAX-TICK: cpu=");
+                            put_dec_u64(&mut buf, &mut k, c as u64);
+                            put_bytes(&mut buf, &mut k, b" tick=");
+                            put_dec_u64(&mut buf, &mut k, n);
+                            put_bytes(&mut buf, &mut k, b" max=");
+                            put_dec_u64(&mut buf, &mut k, max);
+                            put_bytes(&mut buf, &mut k, b" total=");
+                            put_dec_u64(&mut buf, &mut k, tot);
+                            put_bytes(&mut buf, &mut k, b" count=");
+                            put_dec_u64(&mut buf, &mut k, cnt);
+                            put_byte(&mut buf, &mut k, b'\n');
+                            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
                         crate::println!(
                             "CLI-MAX-TICK: cpu={} tick={} max={} total={} count={}",
                             c, n, max, tot, cnt,
@@ -5683,6 +5729,29 @@ fn try_switch(current_sp: u64) -> u64 {
                     let kbase = prev_t.stack_base;
                     let kend = kbase as u64 + kstack_size() as u64;
                     let in_kstack = (current_sp >= kbase as u64) && (current_sp < kend);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                        let mut buf = [0u8; 192];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"IDLE-SP-WRITE: cpu=");
+                        put_dec_u64(&mut buf, &mut k, cpu as u64);
+                        put_bytes(&mut buf, &mut k, b" prev=");
+                        put_dec_u64(&mut buf, &mut k, prev_id as u64);
+                        put_bytes(&mut buf, &mut k, b" new_sp=");
+                        put_hex_u64(&mut buf, &mut k, current_sp);
+                        put_bytes(&mut buf, &mut k, b" idle_kstack=[");
+                        put_hex_u64(&mut buf, &mut k, kbase as u64);
+                        put_bytes(&mut buf, &mut k, b"..");
+                        put_hex_u64(&mut buf, &mut k, kend);
+                        put_bytes(&mut buf, &mut k, b") in_kstack=");
+                        put_bytes(&mut buf, &mut k, if in_kstack { b"true" } else { b"false" });
+                        put_bytes(&mut buf, &mut k, b" n=");
+                        put_dec_u64(&mut buf, &mut k, n as u64);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
                     crate::println!(
                         "IDLE-SP-WRITE: cpu={} prev={} new_sp={:#x} idle_kstack=[{:#x}..{:#x}) in_kstack={} n={}",
                         cpu, prev_id, current_sp, kbase, kend, in_kstack, n

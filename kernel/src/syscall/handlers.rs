@@ -270,6 +270,25 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             T34_RING_RIP[pos].store(crate::arch::trapframe::frame_pc(frame), O::Relaxed);
             let n = T34_LOG.fetch_add(1, O::Relaxed);
             if n < 64 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                    let mut buf = [0u8; 160];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"T34-SYSCALL: nr=");
+                    put_dec_u64(&mut buf, &mut k, nr as u64);
+                    put_bytes(&mut buf, &mut k, b" rip=");
+                    put_hex_u64(&mut buf, &mut k, crate::arch::trapframe::frame_pc(frame));
+                    put_bytes(&mut buf, &mut k, b" a0=");
+                    put_hex_u64(&mut buf, &mut k, a0);
+                    put_bytes(&mut buf, &mut k, b" a1=");
+                    put_hex_u64(&mut buf, &mut k, a1);
+                    put_bytes(&mut buf, &mut k, b" n=");
+                    put_dec_u64(&mut buf, &mut k, n as u64);
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 crate::println!(
                     "T34-SYSCALL: nr={} rip={:#x} a0={:#x} a1={:#x} n={}",
                     nr, crate::arch::trapframe::frame_pc(frame), a0, a1, n,
