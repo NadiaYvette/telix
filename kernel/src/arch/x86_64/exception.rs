@@ -846,16 +846,22 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             && tref_addr < crate::arch::x86_64::mm::SLAB_REGION_BASE
                 .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE);
         if !tref_ok {
-            crate::dump_atomic!(
-                "VALIDATOR-BAD-TREF: tid={} tref={:#x} (NOT in SLAB_REGION \
-                 {:#x}..{:#x}) — THREAD_TABLE[{}] corrupted; skipping \
-                 killed.store and DR0-arm",
-                tid, tref_addr,
-                crate::arch::x86_64::mm::SLAB_REGION_BASE,
+            let mut buf = [0u8; 256];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"VALIDATOR-BAD-TREF: tid=");
+            put_dec_u64(&mut buf, &mut k, tid as u64);
+            put_bytes(&mut buf, &mut k, b" tref=");
+            put_hex_u64(&mut buf, &mut k, tref_addr);
+            put_bytes(&mut buf, &mut k, b" (NOT in SLAB_REGION ");
+            put_hex_u64(&mut buf, &mut k, crate::arch::x86_64::mm::SLAB_REGION_BASE);
+            put_bytes(&mut buf, &mut k, b"..");
+            put_hex_u64(&mut buf, &mut k,
                 crate::arch::x86_64::mm::SLAB_REGION_BASE
-                    .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE),
-                tid,
-            );
+                    .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE));
+            put_bytes(&mut buf, &mut k, b") -- THREAD_TABLE[");
+            put_dec_u64(&mut buf, &mut k, tid as u64);
+            put_bytes(&mut buf, &mut k, b"] corrupted; skipping killed.store and DR0-arm\n");
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
             // Dump the SET-LOG trajectory for this tid to discriminate
             // set-side bug (prev_val already wrong) vs post-set scribble
             // (prev_val was SLAB_REGION on the last set).
@@ -866,10 +872,16 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             // a DR0 watch on the OLD L1[4] slot doesn't fire.
             let (l0_addr, l0_entry_0, l1_4_val) =
                 crate::sched::scheduler::THREAD_TABLE.raw_l0_slots();
-            crate::dump_atomic!(
-                "VALIDATOR-RAW-RADIX: l0={:#x} l0[0]={:#x} *(l0[0]+0x20)={:#x}",
-                l0_addr, l0_entry_0, l1_4_val
-            );
+            let mut buf = [0u8; 128];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"VALIDATOR-RAW-RADIX: l0=");
+            put_hex_u64(&mut buf, &mut k, l0_addr as u64);
+            put_bytes(&mut buf, &mut k, b" l0[0]=");
+            put_hex_u64(&mut buf, &mut k, l0_entry_0 as u64);
+            put_bytes(&mut buf, &mut k, b" *(l0[0]+0x20)=");
+            put_hex_u64(&mut buf, &mut k, l1_4_val as u64);
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
         } else {
             // (Old saved_sp DR0-arm removed: it overrode the TT4 L1-slot
             // watch in radix.rs, redirecting DR0 to legitimate try_switch
@@ -2451,26 +2463,66 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
     let ss_bogus = ss_v > 0xffff || (ss_v != 0 && ss_v != 0x10 && ss_v != 0x18
         && ss_v != 0x1b && ss_v != 0x23 && ss_v != 0x2b && ss_v != 0x33);
     if cs_bogus || ss_bogus {
-        crate::dump_atomic!(
-            "CORRUPTED-FRAME: vec={} cs={:#x} ss={:#x} rip={:#x} rsp={:#x} tid={}",
-            name, cs_v, ss_v, frame.rip(), frame.rsp(),
-            crate::sched::scheduler::current_thread_id(),
-        );
+        let mut buf = [0u8; 192];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"CORRUPTED-FRAME: vec=");
+        put_bytes(&mut buf, &mut k, name.as_bytes());
+        put_bytes(&mut buf, &mut k, b" cs=");
+        put_hex_u64(&mut buf, &mut k, cs_v);
+        put_bytes(&mut buf, &mut k, b" ss=");
+        put_hex_u64(&mut buf, &mut k, ss_v);
+        put_bytes(&mut buf, &mut k, b" rip=");
+        put_hex_u64(&mut buf, &mut k, frame.rip());
+        put_bytes(&mut buf, &mut k, b" rsp=");
+        put_hex_u64(&mut buf, &mut k, frame.rsp());
+        put_bytes(&mut buf, &mut k, b" tid=");
+        put_dec_u64(&mut buf, &mut k, crate::sched::scheduler::current_thread_id() as u64);
+        put_byte(&mut buf, &mut k, b'\n');
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
     }
     // Coalesced atomic dump — peer CPUs cannot interleave this block.
-    crate::dump_atomic!(
-        "EXCEPTION: {} at RIP={:#x} error_code={:#x} tid={} {}\n\
-         \x20 RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}\n\
-         \x20 RSP={:#x} RBP={:#x} RSI={:#x} RDI={:#x}\n\
-         \x20 CS={:#x} RFLAGS={:#x} SS={:#x}",
-        name,
-        frame.rip(), frame.error_code(),
-        crate::sched::scheduler::current_thread_id(),
-        if is_user { "(user)" } else { "(KERNEL)" },
-        frame.rax(), frame.rbx(), frame.rcx(), frame.rdx(),
-        frame.rsp(), frame.rbp(), frame.rsi(), frame.rdi(),
-        frame.cs(), frame.rflags(), frame.ss(),
-    );
+    // Converted from dump_atomic! to atomic put_* (Pattern A fix, same
+    // family as commit 0d50618 kernel-#PF-dump conversion).
+    {
+        let mut buf = [0u8; 512];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"EXCEPTION: ");
+        put_bytes(&mut buf, &mut k, name.as_bytes());
+        put_bytes(&mut buf, &mut k, b" at RIP=");
+        put_hex_u64(&mut buf, &mut k, frame.rip());
+        put_bytes(&mut buf, &mut k, b" error_code=");
+        put_hex_u64(&mut buf, &mut k, frame.error_code());
+        put_bytes(&mut buf, &mut k, b" tid=");
+        put_dec_u64(&mut buf, &mut k, crate::sched::scheduler::current_thread_id() as u64);
+        put_byte(&mut buf, &mut k, b' ');
+        put_bytes(&mut buf, &mut k, if is_user { b"(user)" } else { b"(KERNEL)" });
+        let row1: [(&[u8], u64); 4] = [
+            (b"\n  RAX=", frame.rax()), (b" RBX=", frame.rbx()),
+            (b" RCX=", frame.rcx()), (b" RDX=", frame.rdx()),
+        ];
+        for (label, val) in row1 {
+            put_bytes(&mut buf, &mut k, label);
+            put_hex_u64(&mut buf, &mut k, val);
+        }
+        let row2: [(&[u8], u64); 4] = [
+            (b"\n  RSP=", frame.rsp()), (b" RBP=", frame.rbp()),
+            (b" RSI=", frame.rsi()), (b" RDI=", frame.rdi()),
+        ];
+        for (label, val) in row2 {
+            put_bytes(&mut buf, &mut k, label);
+            put_hex_u64(&mut buf, &mut k, val);
+        }
+        let row3: [(&[u8], u64); 3] = [
+            (b"\n  CS=", frame.cs()), (b" RFLAGS=", frame.rflags()),
+            (b" SS=", frame.ss()),
+        ];
+        for (label, val) in row3 {
+            put_bytes(&mut buf, &mut k, label);
+            put_hex_u64(&mut buf, &mut k, val);
+        }
+        put_byte(&mut buf, &mut k, b'\n');
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+    }
     // Kernel-fault stack dump: 16 quads from RSP.  At #UD time, an indirect
     // call through a corrupted function pointer has just pushed its return
     // address (the instruction after the bad `call *reg`) to [RSP], then
