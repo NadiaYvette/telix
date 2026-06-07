@@ -24,6 +24,47 @@
 
 use super::exception::ExceptionFrame;
 
+// Atomic put_* helpers — same shape as exception.rs (#208 Pattern A).
+// Build an entire log line in a stack buffer with no format_args!()
+// Argument-array temporaries, then emit via handler_write_bytes so the
+// PRINT_LOCK + IRQ-disable guard delivers it atomically.  Avoids the
+// optimizer-overlap where Argument storage shadows a caller stack
+// slot during the kernel-fault dump path.
+#[inline]
+fn put_byte(buf: &mut [u8], n: &mut usize, b: u8) {
+    if *n < buf.len() { buf[*n] = b; *n += 1; }
+}
+#[inline]
+fn put_bytes(buf: &mut [u8], n: &mut usize, s: &[u8]) {
+    for &b in s { put_byte(buf, n, b); }
+}
+#[inline]
+fn put_hex_u64(buf: &mut [u8], n: &mut usize, mut v: u64) {
+    put_bytes(buf, n, b"0x");
+    if v == 0 { put_byte(buf, n, b'0'); return; }
+    let mut digits = [0u8; 16];
+    let mut k = 0;
+    while v > 0 {
+        let d = (v & 0xf) as u8;
+        digits[k] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        v >>= 4;
+        k += 1;
+    }
+    for i in (0..k).rev() { put_byte(buf, n, digits[i]); }
+}
+#[inline]
+fn put_dec_u64(buf: &mut [u8], n: &mut usize, mut v: u64) {
+    if v == 0 { put_byte(buf, n, b'0'); return; }
+    let mut digits = [0u8; 20];
+    let mut k = 0;
+    while v > 0 {
+        digits[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        k += 1;
+    }
+    for i in (0..k).rev() { put_byte(buf, n, digits[i]); }
+}
+
 /// How many stack pages to dump around RSP.  4 KiB × 2 = 8 KiB:
 /// captures the entire frame chain we'd reasonably want plus saved
 /// caller state.  Trade-off: serial port is slow, so each extra page
@@ -301,24 +342,53 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
     let rbp = frame.rbp();
     let error = frame.error_code();
 
-    crate::println!(
-        "[CORE-START tid={} task={} vector={} error={:#x} rip={:#x} rsp={:#x} rbp={:#x}]",
-        tid, task, vector, error, rip, rsp, rbp
-    );
+    {
+        let mut buf = [0u8; 192];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"[CORE-START tid=");
+        put_dec_u64(&mut buf, &mut k, tid as u64);
+        put_bytes(&mut buf, &mut k, b" task=");
+        put_dec_u64(&mut buf, &mut k, task as u64);
+        put_bytes(&mut buf, &mut k, b" vector=");
+        put_dec_u64(&mut buf, &mut k, vector);
+        put_bytes(&mut buf, &mut k, b" error=");
+        put_hex_u64(&mut buf, &mut k, error);
+        put_bytes(&mut buf, &mut k, b" rip=");
+        put_hex_u64(&mut buf, &mut k, rip);
+        put_bytes(&mut buf, &mut k, b" rsp=");
+        put_hex_u64(&mut buf, &mut k, rsp);
+        put_bytes(&mut buf, &mut k, b" rbp=");
+        put_hex_u64(&mut buf, &mut k, rbp);
+        put_bytes(&mut buf, &mut k, b"]\n");
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+    }
 
     // Full register block — values match the user_regs_struct order
     // so the host script can build NT_PRSTATUS without re-mapping.
-    crate::println!(
-        "[CORE-REGS r15={:#x} r14={:#x} r13={:#x} r12={:#x} r11={:#x} r10={:#x} r9={:#x} r8={:#x} \
-         rbp={:#x} rbx={:#x} rax={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} \
-         rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}]",
-        frame.r15(), frame.r14(), frame.r13(), frame.r12(), frame.r11(),
-        frame.r10(), frame.r9(),  frame.r8(),
-        frame.rbp(), frame.rbx(), frame.rax(), frame.rcx(),
-        frame.rdx(), frame.rsi(), frame.rdi(),
-        frame.rip(), frame.cs(),  frame.rflags(),
-        frame.rsp(), frame.ss()
-    );
+    {
+        let mut buf = [0u8; 512];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"[CORE-REGS");
+        let regs: [(&[u8], u64); 20] = [
+            (b" r15=", frame.r15()), (b" r14=", frame.r14()),
+            (b" r13=", frame.r13()), (b" r12=", frame.r12()),
+            (b" r11=", frame.r11()), (b" r10=", frame.r10()),
+            (b" r9=",  frame.r9()),  (b" r8=",  frame.r8()),
+            (b" rbp=", frame.rbp()), (b" rbx=", frame.rbx()),
+            (b" rax=", frame.rax()), (b" rcx=", frame.rcx()),
+            (b" rdx=", frame.rdx()), (b" rsi=", frame.rsi()),
+            (b" rdi=", frame.rdi()),
+            (b" rip=", frame.rip()), (b" cs=",  frame.cs()),
+            (b" rflags=", frame.rflags()),
+            (b" rsp=", frame.rsp()), (b" ss=",  frame.ss()),
+        ];
+        for (label, val) in regs {
+            put_bytes(&mut buf, &mut k, label);
+            put_hex_u64(&mut buf, &mut k, val);
+        }
+        put_bytes(&mut buf, &mut k, b"]\n");
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+    }
 
     // (A) PTE snapshot at fault.  Walks the active PML4 (CR3) to the
     // leaf entry for each anchor VA and dumps the raw 64-bit PTE
@@ -335,10 +405,20 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
         let rsp_page = rsp & !(PAGE_SIZE as u64 - 1);
         let pte_rip = pte_for(pml4, rip_page);
         let pte_rsp = pte_for(pml4, rsp_page);
-        crate::println!(
-            "[CORE-PTE pml4={:#x} rip_page={:#x} pte_rip={:#x} rsp_page={:#x} pte_rsp={:#x}]",
-            pml4 as u64, rip_page, pte_rip, rsp_page, pte_rsp,
-        );
+        let mut buf = [0u8; 192];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"[CORE-PTE pml4=");
+        put_hex_u64(&mut buf, &mut k, pml4 as u64);
+        put_bytes(&mut buf, &mut k, b" rip_page=");
+        put_hex_u64(&mut buf, &mut k, rip_page);
+        put_bytes(&mut buf, &mut k, b" pte_rip=");
+        put_hex_u64(&mut buf, &mut k, pte_rip);
+        put_bytes(&mut buf, &mut k, b" rsp_page=");
+        put_hex_u64(&mut buf, &mut k, rsp_page);
+        put_bytes(&mut buf, &mut k, b" pte_rsp=");
+        put_hex_u64(&mut buf, &mut k, pte_rsp);
+        put_bytes(&mut buf, &mut k, b"]\n");
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
     }
 
     // Faulting-instruction hint: read 16 bytes at RIP and decode just
@@ -358,8 +438,17 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
             hex[hi + 2] = b' ';
             hi += 3;
         }
-        let hex_str = unsafe { core::str::from_utf8_unchecked(&hex[..hi.saturating_sub(1)]) };
-        crate::println!("[CORE-INSN-HINT rip={:#x} bytes={} mnem=\"{}\"]", rip, hex_str, mnem);
+        let hex_str = &hex[..hi.saturating_sub(1)];
+        let mut buf = [0u8; 256];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"[CORE-INSN-HINT rip=");
+        put_hex_u64(&mut buf, &mut k, rip);
+        put_bytes(&mut buf, &mut k, b" bytes=");
+        put_bytes(&mut buf, &mut k, hex_str);
+        put_bytes(&mut buf, &mut k, b" mnem=\"");
+        put_bytes(&mut buf, &mut k, mnem.as_bytes());
+        put_bytes(&mut buf, &mut k, b"\"]\n");
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
     }
 
     // Code-page snapshot: dump the page containing RIP.  Critical for
@@ -375,22 +464,28 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
             let mut buf = [0u8; 256];
             let got = user_read_block(rip_page + off as u64, &mut buf);
             if got == 0 {
-                crate::println!(
-                    "[CORE-MEM-GAP va={:#x} len={}]",
-                    rip_page + off as u64,
-                    chunk_size
-                );
+                let mut hbuf = [0u8; 96];
+                let mut hk = 0;
+                put_bytes(&mut hbuf, &mut hk, b"[CORE-MEM-GAP va=");
+                put_hex_u64(&mut hbuf, &mut hk, rip_page + off as u64);
+                put_bytes(&mut hbuf, &mut hk, b" len=");
+                put_dec_u64(&mut hbuf, &mut hk, chunk_size as u64);
+                put_bytes(&mut hbuf, &mut hk, b"]\n");
+                crate::arch::x86_64::serial::handler_write_bytes(&hbuf[..hk.min(hbuf.len())]);
                 break;
             }
             let mut b64 = [0u8; 352];
             let n = b64_encode(&buf[..got], &mut b64);
-            let s = unsafe { core::str::from_utf8_unchecked(&b64[..n]) };
-            crate::println!(
-                "[CORE-MEM va={:#x} len={} b64={}]",
-                rip_page + off as u64,
-                got,
-                s
-            );
+            let mut hbuf = [0u8; 512];
+            let mut hk = 0;
+            put_bytes(&mut hbuf, &mut hk, b"[CORE-MEM va=");
+            put_hex_u64(&mut hbuf, &mut hk, rip_page + off as u64);
+            put_bytes(&mut hbuf, &mut hk, b" len=");
+            put_dec_u64(&mut hbuf, &mut hk, got as u64);
+            put_bytes(&mut hbuf, &mut hk, b" b64=");
+            put_bytes(&mut hbuf, &mut hk, &b64[..n]);
+            put_bytes(&mut hbuf, &mut hk, b"]\n");
+            crate::arch::x86_64::serial::handler_write_bytes(&hbuf[..hk.min(hbuf.len())]);
             off += chunk_size;
             if got < chunk_size {
                 break;
@@ -418,23 +513,29 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
             if got == 0 {
                 // Hit an unmapped page; emit a marker and stop this
                 // page so the host knows there's a gap.
-                crate::println!(
-                    "[CORE-MEM-GAP va={:#x} len={}]",
-                    page_va + off as u64,
-                    CHUNK_SIZE
-                );
+                let mut hbuf = [0u8; 96];
+                let mut hk = 0;
+                put_bytes(&mut hbuf, &mut hk, b"[CORE-MEM-GAP va=");
+                put_hex_u64(&mut hbuf, &mut hk, page_va + off as u64);
+                put_bytes(&mut hbuf, &mut hk, b" len=");
+                put_dec_u64(&mut hbuf, &mut hk, CHUNK_SIZE as u64);
+                put_bytes(&mut hbuf, &mut hk, b"]\n");
+                crate::arch::x86_64::serial::handler_write_bytes(&hbuf[..hk.min(hbuf.len())]);
                 break;
             }
             // base64 expansion: ⌈n/3⌉ × 4.  256 → 344 chars.
             let mut b64 = [0u8; 352];
             let n = b64_encode(&buf[..got], &mut b64);
-            let s = unsafe { core::str::from_utf8_unchecked(&b64[..n]) };
-            crate::println!(
-                "[CORE-MEM va={:#x} len={} b64={}]",
-                page_va + off as u64,
-                got,
-                s
-            );
+            let mut hbuf = [0u8; 512];
+            let mut hk = 0;
+            put_bytes(&mut hbuf, &mut hk, b"[CORE-MEM va=");
+            put_hex_u64(&mut hbuf, &mut hk, page_va + off as u64);
+            put_bytes(&mut hbuf, &mut hk, b" len=");
+            put_dec_u64(&mut hbuf, &mut hk, got as u64);
+            put_bytes(&mut hbuf, &mut hk, b" b64=");
+            put_bytes(&mut hbuf, &mut hk, &b64[..n]);
+            put_bytes(&mut hbuf, &mut hk, b"]\n");
+            crate::arch::x86_64::serial::handler_write_bytes(&hbuf[..hk.min(hbuf.len())]);
             off += CHUNK_SIZE;
             if got < CHUNK_SIZE {
                 break;
@@ -446,7 +547,21 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
     // boot log via linux_srv's [lib-load] lines (tagged by pid).
     // The host script greps those out on its own; just emit a
     // pointer for clarity.
-    crate::println!("[CORE-LIB-REF tid={}]", tid);
+    {
+        let mut buf = [0u8; 64];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"[CORE-LIB-REF tid=");
+        put_dec_u64(&mut buf, &mut k, tid as u64);
+        put_bytes(&mut buf, &mut k, b"]\n");
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+    }
 
-    crate::println!("[CORE-END tid={}]", tid);
+    {
+        let mut buf = [0u8; 64];
+        let mut k = 0;
+        put_bytes(&mut buf, &mut k, b"[CORE-END tid=");
+        put_dec_u64(&mut buf, &mut k, tid as u64);
+        put_bytes(&mut buf, &mut k, b"]\n");
+        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+    }
 }
