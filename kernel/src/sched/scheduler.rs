@@ -876,6 +876,18 @@ static SAVED_SP_LAST_META: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     [Z; SAVED_SP_LOG_CAP]
 };
+/// VA→PA continuity probe: at park-time snapshot, capture the PA backing
+/// slot[17] (saved RIP) of the iretq frame.  At dispatch-time FBD slot[17]
+/// mismatch, walk PT again and compare.  If PAs differ, the kstack VA
+/// window was remapped to a different PA while the thread was parked —
+/// reading the live frame sees a different physical page than was
+/// written at park.  Eliminates the byte-level scribble hypothesis;
+/// confirms the VA aliasing hypothesis.
+#[cfg(target_arch = "x86_64")]
+static IRETQ_SHADOW_SLOT17_PA: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; SAVED_SP_LOG_CAP]
+};
 
 /// Validated write to `Thread.saved_sp`.  Verifies the Thread* address is
 /// in SLAB_REGION (PML4[509]) before writing; logs SAVED-SP-WRITE-BAD-THREAD
@@ -1235,6 +1247,27 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
         t.iretq_shadow_rsp = *frame.add(20);
         t.iretq_shadow_ss = *frame.add(21);
         t.iretq_shadow_sp = sp;
+    }
+    // #227 VA→PA continuity: capture the PA backing slot[17] at park
+    // time.  Compared at FBD slot[17] mismatch to detect kstack VA
+    // remap-while-parked.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let i = tid as usize;
+        if i < SAVED_SP_LOG_CAP {
+            let cr3: u64;
+            unsafe {
+                core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+            }
+            let pml4 = (cr3 & !0xfff) as usize;
+            let slot17_va = sp.wrapping_add(17 * 8) as usize;
+            let pa = crate::arch::x86_64::mm::translate_va(pml4, slot17_va)
+                .unwrap_or(0) as u64;
+            IRETQ_SHADOW_SLOT17_PA[i].store(pa, Ordering::Relaxed);
+        }
+    }
+    unsafe {
+        let frame = sp as *const u64;
         // #208 full-frame snapshot — captures all 22 u64 slots so the
         // dispatch-time byte-compare can pinpoint ANY changed slot.
         for i in 0..22 {
@@ -1444,6 +1477,34 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
                     // wild live value still surfaces.
                     if i == 14 && shadow < 0x500 && live < 0x500 {
                         continue;
+                    }
+                    // #227 VA→PA continuity check on slot[17] (saved RIP).
+                    // If kstack VA window was remapped while parked, the
+                    // VA's PA at dispatch differs from at park.  Log to
+                    // confirm the VA aliasing hypothesis for Pattern B.
+                    #[cfg(target_arch = "x86_64")]
+                    if i == 17 {
+                        let park_pa = if (tid as usize) < SAVED_SP_LOG_CAP {
+                            IRETQ_SHADOW_SLOT17_PA[tid as usize]
+                                .load(Ordering::Relaxed)
+                        } else { 0 };
+                        let cr3: u64;
+                        core::arch::asm!(
+                            "mov {}, cr3", out(reg) cr3,
+                            options(nomem, nostack),
+                        );
+                        let pml4 = (cr3 & !0xfff) as usize;
+                        let slot17_va =
+                            (frame_ptr as u64).wrapping_add(17 * 8) as usize;
+                        let dispatch_pa = crate::arch::x86_64::mm::translate_va(
+                            pml4, slot17_va,
+                        ).unwrap_or(0) as u64;
+                        if park_pa != 0 && park_pa != dispatch_pa {
+                            crate::println!(
+                                "SLOT17-VA-PA-REMAP: tid={} va={:#x} park_pa={:#x} dispatch_pa={:#x}",
+                                tid, slot17_va, park_pa, dispatch_pa,
+                            );
+                        }
                     }
                     let nn = FRAME_BYTE_DELTA_LOG
                         .fetch_add(1, Ordering::Relaxed);
