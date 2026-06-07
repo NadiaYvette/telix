@@ -433,10 +433,19 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
                 core::sync::atomic::AtomicU32::new(0);
             let n = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if n < 256 {
-                crate::println!(
-                    "KSTACK-ALLOC: seq={} va_base={:#x} va_top={:#x} pa={:#x}",
-                    n, va_base, va_top, pa.as_usize(),
-                );
+                use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+                let mut buf = [0u8; 128];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"KSTACK-ALLOC: seq=");
+                put_dec_u64(&mut buf, &mut k, n as u64);
+                put_bytes(&mut buf, &mut k, b" va_base=");
+                put_hex_u64(&mut buf, &mut k, va_base as u64);
+                put_bytes(&mut buf, &mut k, b" va_top=");
+                put_hex_u64(&mut buf, &mut k, va_top as u64);
+                put_bytes(&mut buf, &mut k, b" pa=");
+                put_hex_u64(&mut buf, &mut k, pa.as_usize() as u64);
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
             }
         }
         Some(KStackHandle { va_base, pa_base: pa })
@@ -3306,6 +3315,37 @@ fn create_idle_thread() -> Option<ThreadId> {
     Some(id)
 }
 
+/// #208 Pattern A: atomic-emit helper for KUSER-SPAWN to replace the
+/// 5 format_args!() callsites scattered through scheduler.rs.  Caller
+/// passes the entry-tag bytes (b"spawn_user" / b"fork" / etc.) plus an
+/// optional numeric entry address (Some for the userspace entry RIP).
+#[inline]
+#[cfg(target_arch = "x86_64")]
+fn log_kuser_spawn(
+    tid: ThreadId, task: TaskId, entry: &[u8],
+    entry_addr: Option<u64>, prio: u8, q: u32,
+) {
+    use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+    let mut buf = [0u8; 128];
+    let mut k = 0;
+    put_bytes(&mut buf, &mut k, b"KUSER-SPAWN: tid=");
+    put_dec_u64(&mut buf, &mut k, tid as u64);
+    put_bytes(&mut buf, &mut k, b" task=");
+    put_dec_u64(&mut buf, &mut k, task as u64);
+    put_bytes(&mut buf, &mut k, b" entry=");
+    if let Some(addr) = entry_addr {
+        put_hex_u64(&mut buf, &mut k, addr);
+    } else {
+        put_bytes(&mut buf, &mut k, entry);
+    }
+    put_bytes(&mut buf, &mut k, b" prio=");
+    put_dec_u64(&mut buf, &mut k, prio as u64);
+    put_bytes(&mut buf, &mut k, b" q=");
+    put_dec_u64(&mut buf, &mut k, q as u64);
+    put_byte(&mut buf, &mut k, b'\n');
+    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+}
+
 /// Find a reusable (Dead) thread slot, or allocate a new one.
 /// Caller serializes thread-ART writes via `SPAWN_LOCK`.
 fn alloc_thread_id() -> Option<ThreadId> {
@@ -3783,6 +3823,9 @@ fn finalize_spawn(
     write_saved_sp(thread, frame_sp);
     record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
     if thread_id < 100 {
+        #[cfg(target_arch = "x86_64")]
+        log_kuser_spawn(thread_id, task_id, b"spawn_user", None, priority, quantum);
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "KUSER-SPAWN: tid={} task={} entry=spawn_user prio={} q={}",
             thread_id, task_id, priority, quantum,
@@ -3876,6 +3919,9 @@ fn create_thread_in_task(
     write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
     if id < 100 {
+        #[cfg(target_arch = "x86_64")]
+        log_kuser_spawn(id, task_id, b"", Some(entry as u64), priority, quantum);
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "KUSER-SPAWN: tid={} task={} entry={:#x} prio={} q={}",
             id, task_id, entry, priority, quantum,
@@ -5373,6 +5419,19 @@ fn try_switch(current_sp: u64) -> u64 {
             if !FIRST_DISPATCH_LOGGED[tid as usize]
                 .swap(true, Ordering::Relaxed)
             {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                    let mut buf = [0u8; 64];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"FIRST-DISP: cpu=");
+                    put_dec_u64(&mut buf, &mut k, cpu as u64);
+                    put_bytes(&mut buf, &mut k, b" tid=");
+                    put_dec_u64(&mut buf, &mut k, tid as u64);
+                    put_byte(&mut buf, &mut k, b'\n');
+                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 crate::println!("FIRST-DISP: cpu={} tid={}", cpu, tid);
             }
         }
@@ -7869,6 +7928,9 @@ pub fn fork_current() -> u64 {
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
     if child_tid < 100 {
+        #[cfg(target_arch = "x86_64")]
+        log_kuser_spawn(child_tid, child_task_id, b"fork", None, parent_priority, parent_quantum);
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "KUSER-SPAWN: tid={} task={} entry=fork prio={} q={}",
             child_tid, child_task_id, parent_priority, parent_quantum,
@@ -8122,6 +8184,9 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
     if child_tid < 100 {
+        #[cfg(target_arch = "x86_64")]
+        log_kuser_spawn(child_tid, child_task_id, b"clone", None, parent_priority, parent_quantum);
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "KUSER-SPAWN: tid={} task={} entry=clone prio={} q={}",
             child_tid, child_task_id, parent_priority, parent_quantum,
@@ -8252,6 +8317,9 @@ pub fn clone_thread_in_task(
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
     if child_tid < 100 {
+        #[cfg(target_arch = "x86_64")]
+        log_kuser_spawn(child_tid, task_id, b"clone3", None, parent_priority, parent_quantum);
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "KUSER-SPAWN: tid={} task={} entry=clone3 prio={} q={}",
             child_tid, task_id, parent_priority, parent_quantum,
