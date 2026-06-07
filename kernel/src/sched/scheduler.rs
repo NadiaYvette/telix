@@ -5331,6 +5331,29 @@ fn try_switch(current_sp: u64) -> u64 {
         let quantum = thread_ref(cur_tid).quantum;
         let dq = thread_ref(cur_tid).default_quantum;
         let yield_asap = thread_ref(cur_tid).yield_asap.load(Ordering::Acquire);
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+            let mut buf = [0u8; 128];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"TS-IN: cpu=");
+            put_dec_u64(&mut buf, &mut k, cpu as u64);
+            put_bytes(&mut buf, &mut k, b" prev=");
+            put_dec_u64(&mut buf, &mut k, cur_tid as u64);
+            put_bytes(&mut buf, &mut k, b" idle=");
+            put_dec_u64(&mut buf, &mut k, idle_id_for_load as u64);
+            put_bytes(&mut buf, &mut k, b" has_ready=");
+            put_bytes(&mut buf, &mut k, if rq_has_ready { b"true" } else { b"false" });
+            put_bytes(&mut buf, &mut k, b" quantum=");
+            put_dec_u64(&mut buf, &mut k, quantum as u64);
+            put_bytes(&mut buf, &mut k, b" dq=");
+            put_dec_u64(&mut buf, &mut k, dq as u64);
+            put_bytes(&mut buf, &mut k, b" yield=");
+            put_bytes(&mut buf, &mut k, if yield_asap { b"true" } else { b"false" });
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "TS-IN: cpu={} prev={} idle={} has_ready={} quantum={} dq={} yield={}",
             cpu, cur_tid, idle_id_for_load, rq_has_ready, quantum, dq, yield_asap,
@@ -8313,6 +8336,26 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     {
         let _tmp_tid = smp::current().current_thread.load(Ordering::Relaxed);
         let _tmp_task = thread_ref(_tmp_tid).task_id;
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
+            let mut buf = [0u8; 96];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"EXIT-THREAD-ENTRY: tid=");
+            put_dec_u64(&mut buf, &mut k, _tmp_tid as u64);
+            put_bytes(&mut buf, &mut k, b" task=");
+            put_dec_u64(&mut buf, &mut k, _tmp_task as u64);
+            put_bytes(&mut buf, &mut k, b" exit=");
+            if exit_code < 0 {
+                put_byte(&mut buf, &mut k, b'-');
+                put_dec_u64(&mut buf, &mut k, (-(exit_code as i64)) as u64);
+            } else {
+                put_dec_u64(&mut buf, &mut k, exit_code as u64);
+            }
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         crate::println!(
             "EXIT-THREAD-ENTRY: tid={} task={} exit={}",
             _tmp_tid, _tmp_task, exit_code
