@@ -96,6 +96,16 @@ pub fn init() {
         // kstack correctly drops the IST stack contents — same shape as
         // #DF on IST 1.
         idt[12].set_ist(2);
+        // Vector 2 (NMI) uses IST 3 → TSS.ist[2].  #216 Phase 2 per the
+        // slot-allocation policy in task #239.  See gdt.rs IST_STACKS_NMI
+        // for why no asm trampoline is required at this stage: Telix's
+        // current NMI handler reaches `exception_fault` which panics +
+        // halts, so the outer NMI never executes the iretq that would
+        // consume the saved iretq frame — meaning the classic nested-
+        // NMI corruption pattern (single-shot rsp store at IST3_TOP)
+        // can't affect us today.  #241's NMI_NEST_DEPTH short-circuits
+        // the nested case before it recurses into exception_fault.
+        idt[2].set_ist(3);
 
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,

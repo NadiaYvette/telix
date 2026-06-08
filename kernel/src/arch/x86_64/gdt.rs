@@ -189,19 +189,44 @@ static mut IST_STACKS_SS: [IstStack; MAX_IST_CPUS] = {
     [EMPTY; MAX_IST_CPUS]
 };
 
+/// IST slot 3 — used for NMI (vector 2).  #216 Phase 2 per the slot-
+/// allocation policy in task #239.
+///
+/// The classic Linux nested-NMI worry — inner NMI's single-shot rsp
+/// store at IST3_TOP overwriting the outer's saved iretq frame — does
+/// NOT apply to Telix's current NMI handler because the outer path
+/// always reaches `exception_fault` which panics + halts (the CPU
+/// never executes the iretq that would consume the saved frame).
+/// `#241` already short-circuits the nested case before exception_fault
+/// recurses, so the only iretq we actually perform from IST 3 is the
+/// inner-NMI return through `validate_iretq_frame`, which pops the
+/// inner's own just-pushed frame — uncorrupted by definition.
+///
+/// When Telix grows an NMI handler that wants to cleanly resume the
+/// interrupted thread (rather than panic), the asm trampoline that
+/// snapshots the iretq frame into NMI_OUTERMOST_IRETQ_FRAME on entry
+/// and restores it on exit becomes mandatory.  Until then, this is a
+/// dedicated stack purely so an NMI that fires during stack-overflow
+/// or other corruption of the kstack has a clean place to land.
+static mut IST_STACKS_NMI: [IstStack; MAX_IST_CPUS] = {
+    const EMPTY: IstStack = IstStack { data: [0; IST_STACK_SIZE] };
+    [EMPTY; MAX_IST_CPUS]
+};
+
 /// #237 IST detection: check whether `rsp` falls inside any per-CPU IST
 /// stack's range.  Called from `x86_exception_handler` at entry to set
 /// the is_on_ist flag that probes can use to skip kstack-bound checks.
 ///
 /// Returns Some((slot_index, cpu)) when rsp is on an IST stack, or None
-/// otherwise.  slot_index = 1 for #DF stack, 2 for #SS stack.  cpu is
-/// the IST_STACKS index (= logical CPU for the current setup).
+/// otherwise.  slot_index = 1 for #DF stack, 2 for #SS stack, 3 for NMI
+/// stack.  cpu is the IST_STACKS index (= logical CPU for the current
+/// setup).
 #[inline]
 pub fn is_on_ist(rsp: u64) -> Option<(u8, u8)> {
-    // SAFETY: IST_STACKS / IST_STACKS_SS are static mut arrays in .bss.
-    // We only read the slice metadata (pointer + length) here — no
-    // mutation, no synchronization needed beyond Acquire-equivalent
-    // semantics of the kernel-image .bss after early init.
+    // SAFETY: IST_STACKS / IST_STACKS_SS / IST_STACKS_NMI are static mut
+    // arrays in .bss.  We only read the slice metadata (pointer + length)
+    // here — no mutation, no synchronization needed beyond Acquire-
+    // equivalent semantics of the kernel-image .bss after early init.
     unsafe {
         let stack_size = IST_STACK_SIZE as u64;
         for slot in 0..MAX_IST_CPUS {
@@ -212,6 +237,10 @@ pub fn is_on_ist(rsp: u64) -> Option<(u8, u8)> {
             let base = IST_STACKS_SS[slot].data.as_ptr() as u64;
             if rsp >= base && rsp < base + stack_size {
                 return Some((2, slot as u8));
+            }
+            let base = IST_STACKS_NMI[slot].data.as_ptr() as u64;
+            if rsp >= base && rsp < base + stack_size {
+                return Some((3, slot as u8));
             }
         }
         None
@@ -502,6 +531,9 @@ pub fn init() {
         // IST[1] → dedicated #SS stack (#216 Phase 1).
         (*tss_for(0)).ist[1] =
             IST_STACKS_SS[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+        // IST[2] → dedicated NMI stack (#216 Phase 2).
+        (*tss_for(0)).ist[2] =
+            IST_STACKS_NMI[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
     }
 
     load_gdt_for_cpu(0);
@@ -523,6 +555,9 @@ pub fn init_ap(cpu: u32) {
             // IST[1] → dedicated #SS stack (#216 Phase 1).
             (*tss_for(cpu)).ist[1] =
                 IST_STACKS_SS[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+            // IST[2] → dedicated NMI stack (#216 Phase 2).
+            (*tss_for(cpu)).ist[2] =
+                IST_STACKS_NMI[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
         }
     }
 
