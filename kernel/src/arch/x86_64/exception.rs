@@ -2559,6 +2559,45 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             put_byte(&mut buf, &mut k, b'\n');
             crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
         }
+        // #216 Phase 3 follow-up: wild-RIP byte-decomposition probe.
+        // When the kernel-mode #PF was caused by an instr-fetch on a
+        // bogus RIP (error bit 4 = I/D set), the popped-from slot at
+        // `frame.rsp() - 8` held the wild value.  Today's 4-multi
+        // survey (boots 3406/3407) showed RIPs with structure: lower
+        // 32 bits = a real kernel-text offset, upper 32 bits = 0.
+        // Log the slot's byte breakdown so the next investigation can
+        // confirm the upper4-zero hypothesis (a partial 32-bit write
+        // into a zero-initialized kstack slot) across more samples.
+        if (error & (1 << 4)) != 0 {
+            let mut buf2 = [0u8; 192];
+            let mut k = 0;
+            let popped_slot_addr = frame.rsp().wrapping_sub(8);
+            let popped: u64 = if (popped_slot_addr & 0xffffff8000000000) == 0xfffffe0000000000 {
+                unsafe { *(popped_slot_addr as *const u64) }
+            } else {
+                0xdeadbeefcafef00d
+            };
+            let upper4 = (popped >> 32) as u32;
+            let lower4 = popped as u32;
+            put_bytes(&mut buf2, &mut k, b"  PF-INSTRFETCH-RET-SLOT: addr=");
+            put_hex_u64(&mut buf2, &mut k, popped_slot_addr);
+            put_bytes(&mut buf2, &mut k, b" val=");
+            put_hex_u64(&mut buf2, &mut k, popped);
+            put_bytes(&mut buf2, &mut k, b" upper4=");
+            put_hex_u64(&mut buf2, &mut k, upper4 as u64);
+            put_bytes(&mut buf2, &mut k, b" lower4=");
+            put_hex_u64(&mut buf2, &mut k, lower4 as u64);
+            put_bytes(&mut buf2, &mut k, b" upper4_zero=");
+            put_bytes(&mut buf2, &mut k, if upper4 == 0 { b"YES" } else { b"NO" });
+            // If the lower-4 + kernel base looks like a plausible kernel
+            // text VA, hint at it for the post-mortem grep.
+            let kernel_base: u64 = 0xffffffff80000000;
+            let candidate = kernel_base | (lower4 as u64);
+            put_bytes(&mut buf2, &mut k, b" lower4_as_kvma=");
+            put_hex_u64(&mut buf2, &mut k, candidate);
+            put_byte(&mut buf2, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf2[..k.min(buf2.len())]);
+        }
         loop {
             core::hint::spin_loop();
         }
