@@ -2366,6 +2366,21 @@ pub fn async_pf_event_count() -> u64 {
 }
 
 fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
+    // #244 ARGS-PROBE: scan the kstack of the faulting thread on
+    // EVERY #PF.  This anchors the probe to a specific, low-frequency
+    // event class (page faults during normal kernel operation are
+    // rare — under 100 per boot in healthy runs), so we can scan
+    // unconditionally without rate-limiting overhead.  Each #PF is
+    // a real moment when a thread is actively running with a fresh
+    // call chain, so the kstack is in a state where partial-write
+    // slots from recent format_args/panic-Location constructions
+    // are likely present.  Skip when frame_sp is on an IST stack —
+    // the partial-write pattern only exists on alloc_kstack_zeroed
+    // kstacks (sentinel-filled), not IST stacks (zero-initialized).
+    if crate::arch::x86_64::gdt::is_on_ist(frame.rsp()).is_none() {
+        crate::arch::x86_64::serial::args_probe_scan(frame.rsp());
+    }
+
     // Layer 3 paravirt: KVM async-PF dispatch.  Before normal fault
     // handling, check whether the host posted an async-PF event for
     // this CPU.  If reason == NOT_PRESENT the host has started a swap-in

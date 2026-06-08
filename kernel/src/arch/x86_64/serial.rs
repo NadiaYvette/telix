@@ -475,16 +475,22 @@ const PRINT_CANARY: u64 = 0x504b4e413a3a0a13; // "PNA::\n\x13" — easy to grep
 #[inline(never)]
 pub fn args_probe_scan(rsp_at_probe: u64) {
     use core::sync::atomic::Ordering;
-    // Guard: only scan high-half VAs.
-    if (rsp_at_probe as i64) >= 0 {
+    // Guard: only scan addresses in the PML4[508] kstack region.
+    // Other paths (IST stacks, kernel image, user VAs) aren't
+    // sentinel-filled (no partial-write signature) or risk OOB reads —
+    // an earlier #PF-anchored probe re-faulted from reading past
+    // unmapped kstack pages.
+    const KSTACK_BASE: u64 = 0xfffffe0000000000;
+    const KSTACK_END:  u64 = 0xfffffe8000000000;
+    if rsp_at_probe < KSTACK_BASE || rsp_at_probe >= KSTACK_END {
         return;
     }
-    // Scan from current rsp upward by 8 KiB (= 1024 slots).  Stack
-    // grows DOWN so higher addresses = older callers.  8 KiB is
-    // typically enough to cover _print's frame + several caller
-    // frames in the typical println! call chain.
+    // Each kstack is the top 1 MiB of a 2 MiB-aligned VA window.
+    // Cap the scan at the kstack TOP so we don't read past mapped
+    // memory into the adjacent 2 MiB window's guard area.
+    let kstack_top = (rsp_at_probe + 0x1FFFFF) & !0x1FFFFF;
     let lo = rsp_at_probe & !0x7;
-    let hi = rsp_at_probe.saturating_add(8192) & !0x7;
+    let hi = (rsp_at_probe.saturating_add(2048) & !0x7).min(kstack_top);
     if hi <= lo {
         return;
     }
