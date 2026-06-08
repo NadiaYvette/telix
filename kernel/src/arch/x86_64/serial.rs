@@ -458,13 +458,135 @@ impl<'a> fmt::Write for SliceWriter<'a> {
 /// while _print runs, log the corrupted value to confirm the upstream
 /// writer's signature (or rule the theory out).
 const PRINT_CANARY: u64 = 0x504b4e413a3a0a13; // "PNA::\n\x13" — easy to grep
+
+/// #244 ARGS-PROBE helper: scan 256 bytes of kstack centered on
+/// `args_addr` (the in-stack location of the `Arguments` value passed
+/// to `_print`) for 8-byte slots that match the partial-write signature
+/// `(upper4 = 0xCAFEBABE) && (lower4 != 0)`.  Update the global
+/// counters; on the first 32 hits per boot also emit a short log line
+/// so we can see which call sites are accumulating partial slots.
+///
+/// All slot reads are bounded by the kstack VA range (PML4[508]
+/// `0xfffffe0000000000`..) so the probe cannot fault.
+#[inline(never)]
+fn args_probe_scan(args_addr: u64) {
+    use core::sync::atomic::Ordering;
+    // Guard: only scan if we're somewhere in the high-half VA window
+    // (kernel image, kstacks, PHYS_DIRECT_MAP, IST stacks all qualify).
+    // Excludes user-mode and obviously bogus pointers.
+    if (args_addr as i64) >= 0 {
+        return;
+    }
+    // Scan a 4 KiB window centered on `&args`.  rsp grows DOWN, so
+    // the caller's frame (with the println! format_args temporaries)
+    // is at HIGHER addresses, while _print's own locals and the
+    // kstack frames below are at lower addresses.  Scan both sides
+    // because the compiler's exact placement of the Argument array
+    // and its referenced u32 locals depends on inlining + call ABI.
+    let lo = args_addr.saturating_sub(2048) & !0x7;
+    let hi = args_addr.saturating_add(2048) & !0x7;
+    if hi <= lo {
+        return;
+    }
+    let mut total: u32 = 0;
+    let mut partial: u32 = 0;
+    let mut addr = lo;
+    while addr < hi {
+        // Re-check each address is still high-half before deref.
+        if (addr as i64) >= 0 {
+            break;
+        }
+        let v: u64 = unsafe { core::ptr::read(addr as *const u64) };
+        total += 1;
+        let upper4 = (v >> 32) as u32;
+        let lower4 = v as u32;
+        if upper4 == 0xCAFEBABE && lower4 != 0 {
+            partial += 1;
+        }
+        addr = addr.wrapping_add(8);
+    }
+    if total > 0 {
+        ARGS_PROBE_TOTAL_SLOTS.fetch_add(total as u64, Ordering::Relaxed);
+        ARGS_PROBE_PARTIAL_SLOTS.fetch_add(partial as u64, Ordering::Relaxed);
+    }
+    if partial > 0 {
+        let n = ARGS_PROBE_HIT_PRINTS.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            // Emit via handler_write_bytes to share the re-entrant
+            // PRINT_LOCK protocol from #243.  Do NOT recurse into the
+            // crate::println! that just called us.
+            let mut buf = [0u8; 96];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"ARGS-PROBE-HIT: args=");
+            put_hex_u64(&mut buf, &mut k, args_addr);
+            put_bytes(&mut buf, &mut k, b" partial=");
+            put_dec_u64(&mut buf, &mut k, partial as u64);
+            put_bytes(&mut buf, &mut k, b"/");
+            put_dec_u64(&mut buf, &mut k, total as u64);
+            put_bytes(&mut buf, &mut k, b" n=");
+            put_dec_u64(&mut buf, &mut k, n);
+            put_byte(&mut buf, &mut k, b'\n');
+            handler_write_bytes(&buf[..k.min(buf.len())]);
+        }
+    }
+}
 static PRINT_CANARY_SCRIBBLE_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+
+/// #244 ARGS-PROBE: per-CPU rate-limited count of how many 8-byte slots
+/// near `format_args!`'s Arguments value have the "partial-write"
+/// signature (upper4 = sentinel `0xCAFEBABE`, lower4 != 0).  This is
+/// the experimental confirmation for hypothesis (1) in
+/// docs/wild-rip-mechanism.md: that `core::fmt::Arguments` and the
+/// supporting panic/format-spec machinery construct local stack values
+/// using 32-bit writes, leaving the upper half of each 8-byte slot at
+/// its kstack-init value.  If the probe reports a positive count
+/// consistently, hypothesis (1) is confirmed and the sentinel-fill
+/// mitigation in commit 9e9c4af is correctly addressing the right
+/// bug class.  See `args_probe_scan` below.
+pub static ARGS_PROBE_TOTAL_SLOTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static ARGS_PROBE_PARTIAL_SLOTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static ARGS_PROBE_HIT_PRINTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
     init_uart_fifo_once();
+
+    // #244 ARGS-PROBE: rate-limited stack scan around `args` for slots
+    // with the partial-32-bit-write signature.  Scan every 16th _print
+    // call; emit a heartbeat ARGS-PROBE-TICK line every 64 scans so
+    // we can confirm the probe is actually running even when no
+    // partial slots are present.
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static ARGS_PROBE_TICK: AtomicU32 = AtomicU32::new(0);
+        let n = ARGS_PROBE_TICK.fetch_add(1, Ordering::Relaxed);
+        if n & 0xF == 0 {
+            args_probe_scan(&args as *const _ as u64);
+            if (n >> 4) & 0x3F == 0 && (n >> 10) < 16 {
+                // Heartbeat: print every 64th probe run (= every 1024
+                // _print calls), capped at the first 16 heartbeats so
+                // the log doesn't fill up.
+                let mut buf = [0u8; 96];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"ARGS-PROBE-TICK: n=");
+                put_dec_u64(&mut buf, &mut k, n as u64);
+                put_bytes(&mut buf, &mut k, b" total_slots=");
+                put_dec_u64(&mut buf, &mut k,
+                    ARGS_PROBE_TOTAL_SLOTS.load(Ordering::Relaxed));
+                put_bytes(&mut buf, &mut k, b" partial_slots=");
+                put_dec_u64(&mut buf, &mut k,
+                    ARGS_PROBE_PARTIAL_SLOTS.load(Ordering::Relaxed));
+                put_byte(&mut buf, &mut k, b'\n');
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+        }
+    }
+
     let mut canary: u64 = PRINT_CANARY;
     // Force the canary to live on the stack across calls (otherwise
     // the optimizer collapses it to a register or a constant).
