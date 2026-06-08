@@ -473,7 +473,7 @@ const PRINT_CANARY: u64 = 0x504b4e413a3a0a13; // "PNA::\n\x13" — easy to grep
 /// All slot reads are bounded by the high-half VA range so the probe
 /// cannot fault on user pointers.
 #[inline(never)]
-fn args_probe_scan(rsp_at_probe: u64) {
+pub fn args_probe_scan(rsp_at_probe: u64) {
     use core::sync::atomic::Ordering;
     // Guard: only scan high-half VAs.
     if (rsp_at_probe as i64) >= 0 {
@@ -563,11 +563,16 @@ pub fn _print(args: fmt::Arguments) {
     // covers _print's frame plus all of the active call chain — every
     // caller's locals are at higher addresses, with the partial-write
     // u32 stack slots we're hunting interleaved in their frames.
+    //
+    // Rate-limited to every 64th _print call so heavy survey work
+    // doesn't stall normal kernel progress.  An additional probe call
+    // lives in x86_exception_handler (#244 follow-up) so we also see
+    // kstacks at IRQ-entry timing, not just println callers.
     {
         use core::sync::atomic::{AtomicU32, Ordering};
         static ARGS_PROBE_TICK: AtomicU32 = AtomicU32::new(0);
         let n = ARGS_PROBE_TICK.fetch_add(1, Ordering::Relaxed);
-        if n & 0xF == 0 {
+        if n & 0x3F == 0 {
             let rsp_now: u64;
             unsafe {
                 core::arch::asm!(

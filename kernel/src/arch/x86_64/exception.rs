@@ -1287,6 +1287,22 @@ impl Drop for RetScribbleCheck {
 /// For timer IRQ (vector 32), returns potentially new SP for context switch.
 #[unsafe(no_mangle)]
 extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
+    // #244 ARGS-PROBE: rate-limited scan of the interrupted thread's
+    // kstack starting at frame_sp.  Exceptions fire often (millions
+    // per boot) so we sample roughly every 1024th entry.  Skip when
+    // we're on an IST stack — the partial-write pattern only applies
+    // to alloc_kstack_zeroed kstacks, not IST stacks (which have
+    // their own initialization).
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static EXC_PROBE_TICK: AtomicU32 = AtomicU32::new(0);
+        let n = EXC_PROBE_TICK.fetch_add(1, Ordering::Relaxed);
+        if n & 0x3FF == 0 {
+            if crate::arch::x86_64::gdt::is_on_ist(frame_sp).is_none() {
+                crate::arch::x86_64::serial::args_probe_scan(frame_sp);
+            }
+        }
+    }
     // #237 IST detection: at handler entry, check whether we're running
     // on a per-CPU IST stack instead of the interrupted thread's kstack.
     // Probes that compare frame_sp against current_thread.stack_base
