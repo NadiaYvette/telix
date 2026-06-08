@@ -166,6 +166,36 @@ Most Type B sites are unchanged.  The four dispatch-arm CAS sites
   on_cpu=PENDING store on `cur` (line 6440) stays; only the `next`
   pick uses the new helper.
 
+**Phase 3a (`voluntary_reschedule`) landed 2026-06-08 commit `bf3d58d`.**
+**Phase 3b (`park_current_for_ipc`) landed 2026-06-08 commit `29f29f1`.**
+
+### Phase 3c — `try_switch` self-pick wrinkle
+
+`try_switch` is the timer-driven preemption path.  Legacy
+`percpu_pick_next_cosched` can return `prev_id` itself (when `prev_id`
+got concurrently re-enqueued while still running on this CPU); the
+legacy code detects this via `prev_id == next_id` and restores
+`on_cpu = cpu`, `pending_set_ns = 0`, and returns without switching.
+
+The claim helper handles this case BADLY:
+- Helper pops `prev_id` from the rq, then `CAS(on_cpu, PENDING, cpu)`.
+- `on_cpu` is currently `cpu` (prev is still running), NOT `PENDING`.
+- CAS fails → helper drops `prev_id` and retries.
+- If no other thread is ready → helper returns `idle_id`.
+- `try_switch` then switches to idle, incorrectly preempting prev.
+
+Two fix options for a future session:
+1. Teach the helper a "self-running detected" path: when CAS fails AND
+   the current `on_cpu` value equals `this_cpu`, return the tid back
+   (interpret as a no-op pick).  Costs one extra load per CAS-fail.
+2. Keep `try_switch` on the legacy protocol indefinitely.  The
+   refactor still covers `voluntary_reschedule`, `park_current_for_ipc`,
+   and the sleep wake path — meaningful coverage without touching the
+   highest-frequency arm.
+
+Recommendation: option 1.  Phase 3c implements the self-running detection
+and migrates `try_switch` after validating under stress.
+
 ### Phase 4 — Migrate the cosched path
 
 - `percpu_pick_next_cosched` is structurally identical to
