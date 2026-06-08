@@ -9682,7 +9682,16 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let sa_enabled = task_ref(parked_task_id).sa_enabled;
 
     // Pick next thread from per-CPU queue (don't re-enqueue current — it's Blocked).
-    let next_id = percpu_pick_next(cpu_idx, idle_id);
+    // #173 Phase 3: gated dispatch — same pattern as voluntary_reschedule
+    // (Phase 2).  Parker has no self-pick issue: tid is going Blocked, so
+    // it's not in the rq at this point.
+    let claimed_by_helper =
+        DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed);
+    let next_id = if claimed_by_helper {
+        percpu_pick_next_and_claim(cpu_idx, idle_id, pcpu, 3 /* park_ipc */)
+    } else {
+        percpu_pick_next(cpu_idx, idle_id)
+    };
     let prev_task = thread_ref(tid as ThreadId).task_id;
     let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
@@ -9709,7 +9718,9 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // on_cpu for parked thread was released above (before park_state CAS).
     // Claim on_cpu for next (ON_CPU_PENDING → cpu).
     if next_id != idle_id {
-        if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
+        if claimed_by_helper {
+            // Helper ran the CAS + bookkeeping under rq.lock already.
+        } else if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
         ) {
             record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
@@ -9721,13 +9732,14 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             set_current_thread(pcpu, idle_id);
             pending_switch_sp()[cpu].store(idle_sp2, Ordering::Release);
             return;
+        } else {
+            record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu_idx);
+            thread_ref(next_id).on_cpu_set_by.store(3, Ordering::Relaxed); // 3=park_ipc
+            // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
+            dispatch_cas_ok(pcpu, next_id);
+            // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
+            unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
         }
-        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu_idx);
-        thread_ref(next_id).on_cpu_set_by.store(3, Ordering::Relaxed); // 3=park_ipc
-        // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
-        dispatch_cas_ok(pcpu, next_id);
-        // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
-        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     } else {
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     }
