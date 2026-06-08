@@ -4165,7 +4165,7 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
     idle_id
 }
 
-/// #173 Phase 1: pop + CAS-claim in one critical section.
+/// #173 Phase 1+2: pop + CAS-claim in one critical section.
 ///
 /// The legacy `percpu_pick_next` pops a thread from the rq, drops the rq
 /// lock, then stamps `on_cpu = ON_CPU_PENDING`.  The caller (try_switch /
@@ -4175,15 +4175,21 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
 ///
 /// This helper collapses both steps under the rq lock: pop, then
 /// `CAS(on_cpu, PENDING, this_cpu)`.  On CAS success, the thread is
-/// claimed and `state = Running` is set here.  On CAS failure (another
-/// path — rescue, wake_thread direct — claimed the thread first), we
-/// drop it on the floor and try the next pick.  See
+/// claimed and `state = Running` is set here, alongside the matching
+/// bookkeeping the legacy CAS-OK path runs (TRANS_CAS_OK record,
+/// on_cpu_set_by, dispatch_cas_ok, dispatch_count).  On CAS failure
+/// (another path — rescue, wake_thread direct — claimed the thread
+/// first), we drop it on the floor and try the next pick.  See
 /// `docs/dispatch-protocol-refactor.md` for the full rationale.
 ///
-/// Phase 1 deliverable: helper exists, builds clean, has its own
-/// metrics counters.  No call site wired yet — that's Phase 2.
-#[allow(dead_code)]
-fn percpu_pick_next_and_claim(cpu: u32, idle_id: ThreadId) -> ThreadId {
+/// `set_by` tag matches the legacy path's `on_cpu_set_by` constants:
+///   1 = try_switch, 2 = vol_resched, 3 = park_ipc.
+fn percpu_pick_next_and_claim(
+    cpu: u32,
+    idle_id: ThreadId,
+    pcpu: &smp::PerCpuData,
+    set_by: u8,
+) -> ThreadId {
     let mut rq = percpu_rq()[cpu as usize].lock();
     loop {
         let tid = match rq.class_pick_next() {
@@ -4196,7 +4202,11 @@ fn percpu_pick_next_and_claim(cpu: u32, idle_id: ThreadId) -> ThreadId {
             .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+            thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
+            dispatch_cas_ok(pcpu, tid);
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+            pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
             trace_sched(tid, 3); // 3=pick_deq (same tag as legacy path)
             DISPATCH_CLAIM_LOCAL.fetch_add(1, Ordering::Relaxed);
             return tid;
@@ -4216,7 +4226,11 @@ fn percpu_pick_next_and_claim(cpu: u32, idle_id: ThreadId) -> ThreadId {
             .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+            thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
+            dispatch_cas_ok(pcpu, tid);
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+            pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
             trace_sched(tid, 12); // 12=steal_deq (same tag as legacy path)
             DISPATCH_CLAIM_STEAL.fetch_add(1, Ordering::Relaxed);
             return tid;
@@ -4227,6 +4241,13 @@ fn percpu_pick_next_and_claim(cpu: u32, idle_id: ThreadId) -> ThreadId {
     }
     idle_id
 }
+
+/// #173 Phase 2: A/B gate for the claim helper.  Default false → legacy
+/// pick + CAS path is used everywhere.  Flipping to true at boot exercises
+/// the new helper at any wired call site (currently just
+/// `voluntary_reschedule`).
+pub static DISPATCH_USE_CLAIM_HELPER: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// #173 Phase 1 metrics: count successful local claims, successful steal
 /// claims, and CAS failures inside `percpu_pick_next_and_claim`.  Used for
@@ -6467,7 +6488,17 @@ pub fn voluntary_reschedule() {
 
     // Check if there's another runnable thread before yielding.
     // We DON'T enqueue cur first — see below for why.
-    let next_id = percpu_pick_next(cpu, idle_id);
+    // #173 Phase 2: gated dispatch — when the claim helper is enabled,
+    // pop + CAS happen under the rq lock and we skip the post-pick CAS
+    // below.  Legacy path is the default until A/B validation confirms
+    // the new protocol under stress.
+    let claimed_by_helper =
+        DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed);
+    let next_id = if claimed_by_helper {
+        percpu_pick_next_and_claim(cpu, idle_id, pcpu, 2 /* vol_resched */)
+    } else {
+        percpu_pick_next(cpu, idle_id)
+    };
 
     if next_id == idle_id {
         // No other thread to run — stay Running.
@@ -6540,7 +6571,22 @@ pub fn voluntary_reschedule() {
     // Claim on_cpu for next (ON_CPU_PENDING → cpu).
     if next_id != idle_id {
         pcpu.dispatching_tid.store(next_id, Ordering::Release);
-        if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
+        // #173 Phase 2: when the claim helper ran above, it already
+        // CAS'd on_cpu PENDING→cpu under the rq lock and ran the matching
+        // bookkeeping (TRANS_CAS_OK, on_cpu_set_by, dispatch_cas_ok,
+        // dispatch_count, state=Running).  Skip the redundant CAS path.
+        // We still maintain dispatch_streak here for parity since the
+        // helper doesn't touch it.
+        if claimed_by_helper {
+            let prev_picked = pcpu
+                .last_dispatched_tid
+                .swap(next_id as u32, Ordering::Relaxed);
+            if prev_picked == next_id as u32 {
+                pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
+            } else {
+                pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+            }
+        } else if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
             record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
@@ -6575,20 +6621,21 @@ pub fn voluntary_reschedule() {
                 thread_ref(cur_id).stack_base + kstack_size(),
             );
             return;
-        }
-        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
-        thread_ref(next_id).on_cpu_set_by.store(2, Ordering::Relaxed); // 2=vol_resched
-        // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
-        dispatch_cas_ok(pcpu, next_id);
-        // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
-        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
-        // #120 dispatch-pattern diagnostic (vol_resched path).
-        pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
-        let prev_picked = pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
-        if prev_picked == next_id as u32 {
-            pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
         } else {
-            pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+            record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+            thread_ref(next_id).on_cpu_set_by.store(2, Ordering::Relaxed); // 2=vol_resched
+            // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
+            dispatch_cas_ok(pcpu, next_id);
+            // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
+            unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+            // #120 dispatch-pattern diagnostic (vol_resched path).
+            pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+            let prev_picked = pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
+            if prev_picked == next_id as u32 {
+                pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
+            } else {
+                pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+            }
         }
     } else {
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
