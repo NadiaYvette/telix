@@ -1288,16 +1288,17 @@ impl Drop for RetScribbleCheck {
 #[unsafe(no_mangle)]
 extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     // #244 ARGS-PROBE: rate-limited scan of the interrupted thread's
-    // kstack starting at frame_sp.  Exceptions fire often (millions
-    // per boot) so we sample roughly every 1024th entry.  Skip when
-    // we're on an IST stack — the partial-write pattern only applies
-    // to alloc_kstack_zeroed kstacks, not IST stacks (which have
-    // their own initialization).
+    // kstack starting at frame_sp.  Exceptions fire millions of times
+    // per boot, so sample every 65536th entry — heavy enough rates
+    // (e.g. 1024) kept the kernel from reaching Phase 5 under 4-multi
+    // stress.  Skip when we're on an IST stack — the partial-write
+    // pattern only applies to alloc_kstack_zeroed kstacks, not IST
+    // stacks (which have their own initialization).
     {
         use core::sync::atomic::{AtomicU32, Ordering};
         static EXC_PROBE_TICK: AtomicU32 = AtomicU32::new(0);
         let n = EXC_PROBE_TICK.fetch_add(1, Ordering::Relaxed);
-        if n & 0x3FF == 0 {
+        if n & 0xFFFF == 0 {
             if crate::arch::x86_64::gdt::is_on_ist(frame_sp).is_none() {
                 crate::arch::x86_64::serial::args_probe_scan(frame_sp);
             }
