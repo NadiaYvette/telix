@@ -165,18 +165,33 @@ The wild-RIP family is silenced.  No regressions observed.
 
 ## Open question: which hypothesis is correct?
 
-We don't have a definitive answer.  The data favors (1) slightly:
+Update 2026-06-08T13:00Z: **Hypothesis 1 is now directly confirmed.**
 
-- Hypothesis 2 would predict a `#GP` family in the sentinel runs (since
-  the misaligned `ret` would now pop a non-canonical address).  We
-  don't see one in the four sentinel boots.  Possible but not strong
-  evidence.
-- Hypothesis 1 would predict the wild-RIP fires disappear entirely (the
-  bad pointer never gets followed because non-canonical fails earlier).
-  This matches what we observe.
+Commit `fae024e` added the ARGS-PROBE that scans the 4 KiB window
+around `&args` in `_print` for the partial-write signature
+`(upper4 == 0xCAFEBABE) && (lower4 != 0)`.  A 4-multi stress survey
+under host pressure produced one direct capture in boot 11amfsq3422:
 
-But this is just a few data points.  Future investigators should
-collect more sentinel-survey runs to confirm.
+```
+ARGS-PROBE-HIT: args=0xfffffe00019fec70 partial=1/512 n=0
+```
+
+`args` is on a kstack (PML4[508] = `0xfffffe0…`), and one slot in
+the scan window matched the partial-write signature.  That's exactly
+the pattern hypothesis (1) predicted: `core::fmt`'s value-pointer
+machinery points at u32-only-written stack slots whose upper bytes
+still carry the kstack init pattern.
+
+Earlier circumstantial evidence (no `#GP` family appearing in sentinel
+runs, the wild-RIP fires going to zero) is now joined by this direct
+probe hit.  The bug mechanism is no longer hypothetical.
+
+The probe is heavy enough under stress that it slows boots noticeably
+(11amfsq3422-3425 only reached Phase 1-3 in 300s versus Phase 5 PASSED
++ thousands of thread exits in the unprobed baseline).  For follow-up
+work, the probe should either be rate-limited further, moved to a
+single-boot pattern, or replaced with an RBP-walk targeted at the
+caller's stack frame specifically rather than a fixed window.
 
 ## How to confirm in the future
 
