@@ -150,11 +150,22 @@ fn gdt_for(cpu: usize) -> *mut PerCpuGdt {
     }
 }
 
-/// Per-CPU IST stack for the double-fault handler (4 KiB each, up to 16 CPUs).
+/// Per-CPU IST stack for the double-fault handler, up to MAX_IST_CPUS CPUs.
 /// A dedicated stack is critical: without IST, a #DF caused by stack overflow
 /// or corruption tries to push onto the broken stack → triple fault → silent reboot.
+///
+/// Sized to match the kernel kstack (PAGE_SIZE × 2^KSTACK_ORDER per
+/// sched/scheduler.rs) so an exception handler that does the same kind
+/// of probe/dump/log work a kernel thread does has at least the same
+/// headroom.  IST is per-CPU, not per-thread, so the memory cost is
+/// bounded by MAX_IST_CPUS × number-of-IST-slots × IST_STACK_SIZE — it
+/// can't proliferate the way kernel-thread kstacks can.  Bump
+/// IST_STACK_ORDER (or PAGE_SIZE via the page_size_* cargo features) to
+/// give handlers more room without touching anything else; total cost
+/// is IST_STACK_SIZE × MAX_IST_CPUS × (number of populated IST slots).
 const MAX_IST_CPUS: usize = 16;
-const IST_STACK_SIZE: usize = 4096;
+const IST_STACK_ORDER: usize = 4;
+const IST_STACK_SIZE: usize = crate::mm::page::PAGE_SIZE << IST_STACK_ORDER;
 
 #[repr(C, align(4096))]
 struct IstStack {
