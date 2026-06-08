@@ -201,13 +201,46 @@ and migrates `try_switch` after validating under stress.
 - `percpu_pick_next_cosched` is structurally identical to
   `percpu_pick_next`; mirror the refactor.
 
-### Phase 5 — Reduce / remove fast-rescue PENDING claim
+### Phase 5 — Measure rescue burden offloaded by the helper
 
-- The `RESCUE-STUCK-PENDING` paths (10852, 10965, 10493) catch the bug
-  class this refactor eliminates.  Keep them as belt-and-suspenders for
-  a few release cycles, then remove.
-- Remove `dequeue_set_pending` and `pending_set_ns` once no caller
-  remains.
+Originally framed as "reduce / remove fast-rescue PENDING claim" — but
+the rescue paths serve a wider role than just the bug class this
+refactor closes.  Rescue catches:
+
+1. **Dispatch-side phantom-pending** (Type A): the bug class the helper
+   eliminates.  Closed when gate is ON.
+2. **Enqueue-side aged PENDING** (Type B): a thread enqueued with
+   `on_cpu = PENDING` then sits in an unpicked rq for long enough.  Can
+   happen when the picking CPU is hung, stalled, or simply has higher-
+   priority work.  Rescue's role here is unchanged by the refactor.
+
+To measure how much rescue burden the helper actually offloads, Phase 5
+adds two counters:
+
+- `RESCUE_STUCK_PENDING_FIRES_GATE_ON` — increments on rescue fire when
+  `DISPATCH_USE_CLAIM_HELPER == true`.
+- `RESCUE_STUCK_PENDING_FIRES_GATE_OFF` — increments otherwise.
+
+Across many stress boots, the ratio tells the story:
+- If GATE_ON ≪ GATE_OFF under matched stress → helper does real work
+  (Type A was a major rescue contributor).  Removing the legacy rescue
+  PENDING-claim becomes safe.
+- If GATE_ON ≈ GATE_OFF → Type A was a minor contributor; rescue stays
+  load-bearing for Type B.  The helper still closes a structural bug
+  class but isn't a performance win.
+
+**Decision criteria for flipping default gate to ON**:
+- Sustained host-pressure stress boots show zero correctness regressions.
+- `DISPATCH_CLAIM_FAIL` and `DISPATCH_CLAIM_SELF_PICK` counters fire
+  within expected ranges (CAS_FAIL bounded, self-pick rare).
+- `RESCUE_STUCK_PENDING_FIRES_GATE_ON` stays below baseline.
+
+**Decision criteria for removing rescue PENDING-claim**:
+- Several release cycles with default gate ON and zero observed
+  regressions or unexplained stuck-pending events.
+- `dequeue_set_pending` and `pending_set_ns` have no remaining callers
+  (would happen organically once all dispatch arms run helper-only).
+- Loom + Verus (Phase 6) prove the new protocol's invariants formally.
 
 ### Phase 6 — Loom + Verus
 

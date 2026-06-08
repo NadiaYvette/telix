@@ -4377,6 +4377,21 @@ fn percpu_pick_next_cosched_and_claim(
 pub static DISPATCH_CLAIM_SELF_PICK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// #173 Phase 5: rescue-fire splits by gate state.  Under gate ON the
+/// claim helper closes the dispatch-side phantom-pending window; any
+/// RESCUE-STUCK-PENDING fire is necessarily from an enqueue-side stuck
+/// PENDING (Type B in docs/dispatch-protocol-refactor.md).  Tracking
+/// the ratio over many stress boots tells us how much rescue burden
+/// the new protocol offloads.  When `GATE_ON` fires approach the
+/// `GATE_OFF` baseline under matched stress, the helper is not
+/// reducing rescue activity — meaning the bug class wasn't a major
+/// rescue contributor in practice.  When `GATE_ON` fires are much
+/// lower, the helper is doing real work.
+pub static RESCUE_STUCK_PENDING_FIRES_GATE_ON: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static RESCUE_STUCK_PENDING_FIRES_GATE_OFF: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// #173 Phase 1 metrics: count successful local claims, successful steal
 /// claims, and CAS failures inside `percpu_pick_next_and_claim`.  Used for
 /// A/B comparison against the legacy `dispatch_set_pending_count` /
@@ -10841,6 +10856,20 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // will check for actual queue membership and DOUBLE_ENQ
                 // before doing the percpu_enqueue, so this is safe.
                 RESCUE_STUCK_PENDING_FIRES.fetch_add(1, Ordering::Relaxed);
+                // #173 Phase 5: split rescue fires by claim-helper gate state.
+                // Gate ON closes the dispatch-side phantom-pending window;
+                // any rescue fire under gate ON is therefore from an
+                // enqueue-side PENDING that aged out (legitimate stuck-rq
+                // case, not the bug class this refactor targets).  Tracking
+                // the ratio across many stress boots tells us how much of
+                // the rescue burden the new protocol actually offloads.
+                if DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed) {
+                    RESCUE_STUCK_PENDING_FIRES_GATE_ON
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    RESCUE_STUCK_PENDING_FIRES_GATE_OFF
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 // Per-CPU asymmetry probe (#120 lead from
                 // project_120_eevdf_dispatch.md): attribute to the thread's
                 // last_cpu, since on_cpu == ON_CPU_PENDING here so the
