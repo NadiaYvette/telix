@@ -346,12 +346,26 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
     // Phase 5b: zero via the existing identity map (still active in
     // PML4[507] direct map) so the zero survives PML4[0] unmap (#235);
     // the subsequent VA window mapping below points to the same RAM.
+    //
+    // #244 wild-RIP probe (KSTACK_FILL_SENTINEL): when enabled, fill
+    // the kstack with a recognizable u64 sentinel pattern instead of
+    // zero.  Today's IST 4 captures showed wild RIPs with the pattern
+    // upper32=0, lower32=<small structured value>.  The hypothesis is
+    // that a Rust function's 32-bit write to a stack-local slot leaves
+    // the upper 4 bytes at their zero-fill value; when that slot is
+    // later RET'd, the popped pseudo-RIP has structure in the low 32
+    // bits and zero in the high 32.  With the sentinel fill, wild RIPs
+    // would instead show upper32=0xCAFEBABE which (a) confirms the
+    // zero-fill is the upper-byte source, and (b) lets the byte-decomp
+    // probe (PF-INSTRFETCH-RET-SLOT) attribute lower32 to a specific
+    // 32-bit-write site.
+    const KSTACK_FILL_SENTINEL: u64 = 0xCAFEBABE_00000000;
     unsafe {
-        core::ptr::write_bytes(
-            crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
-            0,
-            ksize,
-        );
+        let dst = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u64;
+        let n = ksize / 8;
+        for i in 0..n {
+            dst.add(i).write(KSTACK_FILL_SENTINEL);
+        }
     }
     // Phase 5b: reserve a 2 MiB VA window and map the phys pages into
     // its TOP `ksize` bytes.  The remaining VA below the kstack is
