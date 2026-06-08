@@ -10005,6 +10005,153 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let _ = irq_saved;
 }
 
+/// #240 / #216 follow-up: park the current thread on async-PF when the
+/// fault was taken on IST 4 (#216 Phase 3).
+///
+/// The standard `async_pf_park` → `block_current` path spin-WFIs on the
+/// caller's stack.  When the caller is on IST 4, a subsequent #PF on the
+/// same CPU pushes its CPU-saved iretq frame at IST4_TOP, overlaying
+/// ours — when we eventually resume, we iretq from a corrupted frame.
+///
+/// This helper avoids that by performing the park as a direct synthetic
+/// dispatch (no block_current):
+///
+///   1. Copies the 22-quad frame (15 gpregs from `__isr_common`'s
+///      prologue + 2 quads vector/error + 5-quad CPU iretq) from IST 4
+///      to the faulting thread's kstack at `stack_top - 22*8`.
+///   2. Sets the thread's `saved_sp` to the kstack copy.  When
+///      `wake_thread` re-enqueues us and a future `try_switch` picks us
+///      up, the asm postlude pops from the kstack copy and iretqs back
+///      to user mode — re-executing the faulting instruction with the
+///      page now present.
+///   3. Marks the thread `Blocked / PagerWait`, releases on_cpu.
+///   4. Picks the next thread and returns its `saved_sp`.  The asm
+///      postlude (`mov rsp, rax; pop gpregs; iretq`) lands us on the
+///      next thread's frame.
+///
+/// On failure (CAS race on next pick, or new_sp out of kstack range)
+/// returns the original `frame_sp` so the caller's normal path
+/// continues with the legacy block_current fallback.
+///
+/// Caller invariants: `frame_sp` is the SP at handle_page_fault_x86's
+/// entry (the same SP `__isr_common` saved into r12).  The full 22
+/// quads at that location are the live iretq+gpregs frame.  The thread
+/// is NOT idle.  IRQs may be either enabled or disabled on entry —
+/// this helper disables them for its duration.
+#[cfg(target_arch = "x86_64")]
+pub fn park_faulting_from_ist(frame_sp: u64) -> u64 {
+    let irq_saved = crate::arch::irq::disable();
+
+    let tid = current_thread_id();
+    let pcpu = smp::current();
+    let cpu = smp::cpu_id();
+    let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed) as ThreadId;
+
+    if tid == idle_id {
+        let _ = irq_saved;
+        return frame_sp;
+    }
+
+    let t = unsafe { thread_mut_from_ref(tid) };
+    let kbase = t.stack_base as u64;
+    let ksize = kstack_size() as u64;
+    let ktop = kbase + ksize;
+
+    // Frame layout per kernel/src/arch/x86_64/vectors.S:
+    //   15 gpregs + 2 quads (vector_number, error_code) + 5 iretq = 22 quads.
+    const FRAME_QUADS: usize = 22;
+    let frame_bytes = (FRAME_QUADS as u64) * 8;
+    let new_sp = ktop.saturating_sub(frame_bytes);
+
+    if new_sp < kbase || new_sp + frame_bytes > ktop {
+        // kstack too small for the frame — shouldn't happen at 1 MiB
+        // kstack sizes; fall back.
+        let _ = irq_saved;
+        return frame_sp;
+    }
+
+    // Copy the IST 4 frame contents to kstack.  Validated kstack range
+    // above so `new_sp` is in this thread's own kstack.
+    unsafe {
+        let src = frame_sp as *const u64;
+        let dst = new_sp as *mut u64;
+        for i in 0..FRAME_QUADS {
+            dst.add(i).write(src.add(i).read());
+        }
+    }
+
+    // Publish the kstack frame as the parked thread's saved state.
+    write_saved_sp(t, new_sp);
+    record_saved_sp_write(tid, new_sp, 13); // 13 = park_faulting_from_ist
+    t.saved_sp_source = 7; // 7 = park_faulting_from_ist
+    t.state = ThreadState::Blocked;
+    t.blocked_on = crate::sched::thread::BlockReason::PagerWait;
+
+    thread_ref(tid).on_cpu.store(u32::MAX, Ordering::Release);
+    record_trans(tid as u32, 22, ThreadState::Blocked, u32::MAX);
+
+    // Pick next and dispatch — mirrors park_current_for_ipc's tail
+    // without the IPC-specific arbitration (no port, no PARK_ENQUEUED
+    // CAS dance — this thread is being parked unconditionally on
+    // PagerWait, and only async_pf_wake will re-enqueue it).
+    let next_id = percpu_pick_next(cpu, idle_id);
+
+    let prev_task = t.task_id;
+    let next_task = thread_ref(next_id).task_id;
+    if prev_task != next_task {
+        let next_root = {
+            let tptr = TASK_TABLE.get(next_task) as *const Task;
+            if !tptr.is_null() {
+                unsafe { (*tptr).page_table_root }
+            } else {
+                0
+            }
+        };
+        if next_root != 0 {
+            crate::mm::hat::switch_page_table(next_root);
+        } else {
+            let kern_root = crate::mm::hat::kernel_pt_root();
+            if kern_root != 0 {
+                crate::mm::hat::switch_page_table(kern_root);
+            }
+        }
+    }
+
+    crate::arch::trapframe::update_kernel_stack(
+        next_id as u32,
+        thread_ref(next_id).stack_base + kstack_size(),
+    );
+
+    if next_id != idle_id {
+        pcpu.dispatching_tid.store(next_id, Ordering::Release);
+        if thread_ref(next_id)
+            .on_cpu
+            .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            CAS_FAIL_RESCUE_BAILS.fetch_add(1, Ordering::Relaxed);
+            pcpu.dispatching_tid.store(0, Ordering::Release);
+            let idle_sp = thread_ref(idle_id).saved_sp;
+            unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+            set_current_thread(pcpu, idle_id);
+            let _ = irq_saved;
+            return idle_sp;
+        }
+        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+        thread_ref(next_id).on_cpu_set_by.store(7, Ordering::Relaxed); // 7=park_from_ist
+        dispatch_cas_ok(pcpu, next_id);
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+        pcpu.dispatching_tid.store(0, Ordering::Release);
+    } else {
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+    }
+
+    set_current_thread(pcpu, next_id);
+    let next_sp = thread_ref(next_id).saved_sp;
+    let _ = irq_saved;
+    next_sp
+}
+
 /// Wake a parked thread by marking it Ready and enqueueing it.
 ///
 /// Uses a CAS-based state machine with `park_current_for_ipc`:

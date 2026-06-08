@@ -2361,22 +2361,6 @@ fn async_pf_remove(token: u32) -> Option<u32> {
     None
 }
 
-/// Park the current thread on `token`.  Called from the #PF handler
-/// when the host posted KVM_PV_REASON_PAGE_NOT_PRESENT.  Falls back
-/// to immediately retrying the fault if the map is full (rare).
-fn async_pf_park(token: u32) {
-    let tid = crate::sched::current_thread_id();
-    if !async_pf_insert(token, tid) {
-        // Map full — fall back to no-op.  The thread will refault
-        // and either the host's normal sync-PF path eventually
-        // delivers, or the next async-PF event reuses the map.
-        return;
-    }
-    // Block on a generic pager-wait.  When PAGE_READY arrives,
-    // async_pf_wake removes the entry and wake_thread runs.
-    crate::sched::block_current(crate::sched::thread::BlockReason::PagerWait);
-}
-
 /// Wake the thread parked on `token`, if any.
 fn async_pf_wake(token: u32) {
     if let Some(tid) = async_pf_remove(token) {
@@ -2416,11 +2400,26 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
         match reason {
             crate::arch::x86_64::hypervisor::ASYNC_PF_REASON_NOT_PRESENT => {
                 // Park the current thread on this token.  Will be woken
-                // when the matching PAGE_READY arrives.  block_current
-                // performs the dispatch internally.
-                async_pf_park(token);
-                // We return — block_current rescheduled.  frame_sp is
-                // updated via the existing pending-switch mechanism.
+                // when the matching PAGE_READY arrives.
+                //
+                // #216 / #240 follow-up: when handling on IST 4 (the
+                // dedicated #PF stack), the legacy block_current path
+                // would spin-WFI on IST 4 itself, and a subsequent #PF
+                // on the same CPU would push its CPU-saved iretq frame
+                // at IST4_TOP, overlaying ours.  park_faulting_from_ist
+                // copies the live 22-quad frame off IST 4 onto our
+                // kstack and performs a direct synthetic dispatch to
+                // the next thread.
+                let tid = crate::sched::current_thread_id();
+                if !async_pf_insert(token, tid) {
+                    return frame_sp;
+                }
+                if crate::arch::x86_64::gdt::is_on_ist(frame_sp).is_some() {
+                    return crate::sched::scheduler::park_faulting_from_ist(frame_sp);
+                }
+                crate::sched::block_current(
+                    crate::sched::thread::BlockReason::PagerWait,
+                );
                 let pending = crate::sched::scheduler::take_pending_switch();
                 return if pending != 0 { pending } else { frame_sp };
             }
