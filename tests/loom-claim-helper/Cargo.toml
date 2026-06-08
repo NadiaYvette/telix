@@ -1,0 +1,40 @@
+[package]
+name = "loom-claim-helper"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the #173 dispatch claim helper.
+#
+# Background: the legacy two-step dispatch protocol pops a thread from
+# the rq, drops the rq lock, stamps `on_cpu = ON_CPU_PENDING`, then
+# the caller does `CAS(PENDING → this_cpu)`.  Between the stamp and
+# the CAS, a host pause strands the picked thread.  See
+# docs/dispatch-protocol-refactor.md for the full rationale.
+#
+# The new helper collapses pop + CAS under the rq.lock.  On CAS
+# failure it inspects on_cpu: if it reads `this_cpu` the thread is
+# still running on us (self-pick) and we return it; otherwise some
+# other path won the lifecycle race and we drop+retry.
+#
+# This loom model checks:
+#   1. **CAS mutex** — at most one of {helper A, helper B (different
+#      CPU), fast-rescue} succeeds per claim attempt on a given thread.
+#   2. **Self-pick correctness** — when CAS fails and on_cpu reads
+#      as this_cpu, helper returns the tid (no spurious idle preempt).
+#   3. **Recoverability** — after all interleavings, the thread is in
+#      a state the scheduler can make progress on (Running on some
+#      CPU, or Ready+PENDING for next pick).
+#
+# Validates the #173 Phase 1-3c implementation.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]
