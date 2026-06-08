@@ -9534,6 +9534,23 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         if (tid as ThreadId) != idle_id {
             thread_ref(tid as ThreadId).on_cpu.store(cpu_idx, Ordering::Release);
         }
+        // #202 TS wake gap #4: if wake_parked_thread's `ts_blocked_on
+        // != 0` check ran BEFORE port_enqueue_with_check set the field,
+        // its defensive cleanup_blocked was skipped — and the early-wake
+        // CAS that put us here still won.  We now hold a non-zero
+        // ts_blocked_on but no actual park is going to happen.  Without
+        // cleanup, the next recv_or_park's ts_enqueue trips the
+        // TS-DOUBLE-ENQ guard on the same TS (boot 554 tid=19 pattern).
+        // cleanup_blocked is idempotent (swap-zero short-circuits when
+        // already 0), so this is safe even when the waker already
+        // cleaned up.
+        if thread_ref(tid as ThreadId)
+            .ts_blocked_on
+            .load(Ordering::Relaxed)
+            != 0
+        {
+            crate::sync::turnstile::cleanup_blocked(tid as u32);
+        }
         t.state = ThreadState::Running;
         return;
     }
