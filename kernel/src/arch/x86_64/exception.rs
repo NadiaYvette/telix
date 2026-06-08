@@ -1247,6 +1247,35 @@ impl Drop for RetScribbleCheck {
 /// For timer IRQ (vector 32), returns potentially new SP for context switch.
 #[unsafe(no_mangle)]
 extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
+    // #237 IST detection: at handler entry, check whether we're running
+    // on a per-CPU IST stack instead of the interrupted thread's kstack.
+    // Probes that compare frame_sp against current_thread.stack_base
+    // would mis-classify on an IST entry; this flag lets them branch.
+    // Log the first 8 IST entries for visibility.  Once Phase 2/3 of
+    // #216 land more vectors on IST, this will fire on every kstack
+    // overflow caught by #SS/#PF on IST — exactly the signal we want.
+    let ist_slot = crate::arch::x86_64::gdt::is_on_ist(frame_sp);
+    if let Some((slot, cpu)) = ist_slot {
+        static IST_ENTRY_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = IST_ENTRY_LOG
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 8 {
+            let mut buf = [0u8; 128];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"IST-ENTRY: slot=");
+            put_dec_u64(&mut buf, &mut k, slot as u64);
+            put_bytes(&mut buf, &mut k, b" cpu_idx=");
+            put_dec_u64(&mut buf, &mut k, cpu as u64);
+            put_bytes(&mut buf, &mut k, b" rsp=");
+            put_hex_u64(&mut buf, &mut k, frame_sp);
+            put_bytes(&mut buf, &mut k, b" n=");
+            put_dec_u64(&mut buf, &mut k, n as u64);
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(
+                &buf[..k.min(buf.len())]);
+        }
+    }
     // #208 STACK-NEAR-GUARD probe: at handler entry, frame_sp is the lowest
     // address of the current kstack usage (just-pushed GPRs).  If
     // frame_sp - stack_base is small, the next CALL/PUSH could touch the
@@ -1257,7 +1286,10 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     // BEFORE that page-fault state: catches "stack distance to base/top
     // boundary smaller than safety margin" so we see a warning ahead of
     // the cascade.  One-shot per tid to avoid storms.
-    {
+    //
+    // #237: skip when on IST — frame_sp is an IST stack address, not the
+    // thread's kstack, so the kbase/ksize comparison is meaningless.
+    if ist_slot.is_none() {
         let tid = crate::sched::scheduler::current_thread_id();
         if tid != 0 && (tid as usize) < 256 {
             let tref = crate::sched::scheduler::thread_ref(tid);
@@ -1324,7 +1356,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                 }
             }
         }
-    }
+    } // end if ist_slot.is_none()
     // #233 ret-addr scribble check: __isr_common does `call x86_exception_handler`,
     // which pushes its return address onto frame_sp.  So [frame_sp - 8] is the
     // return-address slot; expected value is RIP-after-call in __isr_common.

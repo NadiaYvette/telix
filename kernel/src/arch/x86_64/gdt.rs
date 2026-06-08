@@ -178,6 +178,35 @@ static mut IST_STACKS_SS: [IstStack; MAX_IST_CPUS] = {
     [EMPTY; MAX_IST_CPUS]
 };
 
+/// #237 IST detection: check whether `rsp` falls inside any per-CPU IST
+/// stack's range.  Called from `x86_exception_handler` at entry to set
+/// the is_on_ist flag that probes can use to skip kstack-bound checks.
+///
+/// Returns Some((slot_index, cpu)) when rsp is on an IST stack, or None
+/// otherwise.  slot_index = 1 for #DF stack, 2 for #SS stack.  cpu is
+/// the IST_STACKS index (= logical CPU for the current setup).
+#[inline]
+pub fn is_on_ist(rsp: u64) -> Option<(u8, u8)> {
+    // SAFETY: IST_STACKS / IST_STACKS_SS are static mut arrays in .bss.
+    // We only read the slice metadata (pointer + length) here — no
+    // mutation, no synchronization needed beyond Acquire-equivalent
+    // semantics of the kernel-image .bss after early init.
+    unsafe {
+        let stack_size = IST_STACK_SIZE as u64;
+        for slot in 0..MAX_IST_CPUS {
+            let base = IST_STACKS[slot].data.as_ptr() as u64;
+            if rsp >= base && rsp < base + stack_size {
+                return Some((1, slot as u8));
+            }
+            let base = IST_STACKS_SS[slot].data.as_ptr() as u64;
+            if rsp >= base && rsp < base + stack_size {
+                return Some((2, slot as u8));
+            }
+        }
+        None
+    }
+}
+
 /// Pointer to this CPU's TSS storage. BSP uses bootstrap, APs use the
 /// dynamic slice.
 #[inline]
