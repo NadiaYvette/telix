@@ -4165,6 +4165,81 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
     idle_id
 }
 
+/// #173 Phase 1: pop + CAS-claim in one critical section.
+///
+/// The legacy `percpu_pick_next` pops a thread from the rq, drops the rq
+/// lock, then stamps `on_cpu = ON_CPU_PENDING`.  The caller (try_switch /
+/// voluntary_reschedule / park_current_for_ipc) does the CAS
+/// `PENDING → this_cpu` later.  Between the stamp and the CAS, a host
+/// pause can strand the picked thread — the phantom-pending window.
+///
+/// This helper collapses both steps under the rq lock: pop, then
+/// `CAS(on_cpu, PENDING, this_cpu)`.  On CAS success, the thread is
+/// claimed and `state = Running` is set here.  On CAS failure (another
+/// path — rescue, wake_thread direct — claimed the thread first), we
+/// drop it on the floor and try the next pick.  See
+/// `docs/dispatch-protocol-refactor.md` for the full rationale.
+///
+/// Phase 1 deliverable: helper exists, builds clean, has its own
+/// metrics counters.  No call site wired yet — that's Phase 2.
+#[allow(dead_code)]
+fn percpu_pick_next_and_claim(cpu: u32, idle_id: ThreadId) -> ThreadId {
+    let mut rq = percpu_rq()[cpu as usize].lock();
+    loop {
+        let tid = match rq.class_pick_next() {
+            Some(t) => t,
+            None => break,
+        };
+        thread_ref(tid).in_queue.store(false, Ordering::Release);
+        if thread_ref(tid)
+            .on_cpu
+            .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+            trace_sched(tid, 3); // 3=pick_deq (same tag as legacy path)
+            DISPATCH_CLAIM_LOCAL.fetch_add(1, Ordering::Relaxed);
+            return tid;
+        }
+        // CAS failed — `tid` was stamped to a real CPU number by another
+        // path (rescue, wake_thread direct, ...).  Drop on the floor and
+        // try the next pick.  We've removed it from the rq; that's
+        // semantically correct since the other path owns the lifecycle.
+        DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(rq);
+    // Nothing local — try work stealing.  Same pop-then-CAS dance.
+    if let Some(tid) = try_steal(cpu) {
+        thread_ref(tid).in_queue.store(false, Ordering::Release);
+        if thread_ref(tid)
+            .on_cpu
+            .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+            trace_sched(tid, 12); // 12=steal_deq (same tag as legacy path)
+            DISPATCH_CLAIM_STEAL.fetch_add(1, Ordering::Relaxed);
+            return tid;
+        }
+        // CAS failed on a stolen tid — return idle.  Phase 1: don't retry
+        // try_steal (cost vs benefit unclear).  Phase 2+ may revisit.
+        DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+    idle_id
+}
+
+/// #173 Phase 1 metrics: count successful local claims, successful steal
+/// claims, and CAS failures inside `percpu_pick_next_and_claim`.  Used for
+/// A/B comparison against the legacy `dispatch_set_pending_count` /
+/// `dispatch_cas_ok_count` pair once Phase 2 wires the new helper at a
+/// dispatch call site.
+pub static DISPATCH_CLAIM_LOCAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DISPATCH_CLAIM_STEAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DISPATCH_CLAIM_FAIL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Pick next thread, preferring a cosched group mate on the current CPU.
 /// Coscheduling only applies to RT-class threads in the bitmap queues.
 fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (ThreadId, bool) {
