@@ -4249,6 +4249,134 @@ fn percpu_pick_next_and_claim(
 pub static DISPATCH_USE_CLAIM_HELPER: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// #173 Phase 3c: cosched-aware variant of `percpu_pick_next_and_claim`.
+///
+/// Mirrors `percpu_pick_next_cosched`'s prev-group preference and adds
+/// **self-pick detection**.  Self-pick occurs in `try_switch` when the
+/// picker dequeues `prev_id` (concurrently re-enqueued by a wake or
+/// rescue while still running on this CPU).  Legacy code handles it by
+/// checking `prev_id == next_id` at the caller; with the claim helper,
+/// the CAS `PENDING → cpu` fails on a self-pick because `on_cpu` is
+/// already `this_cpu` (not `PENDING`).
+///
+/// On CAS failure we re-load `on_cpu`: if it equals `cpu`, this is
+/// self-pick — the thread is still happily running on us.  Return
+/// `prev_id_for_self_pick` so the caller's existing `next_id == prev_id`
+/// branch fires naturally and skips the switch.  If `on_cpu` is some
+/// other CPU number, a real concurrent claim happened — drop and retry.
+///
+/// `prev_id_for_self_pick` is the currently-running tid the caller will
+/// stay on if self-pick is detected.  Pass `idle_id` if self-pick is
+/// not a concern at the caller (the value won't be returned unless the
+/// pop matches it, which is rare).
+fn percpu_pick_next_cosched_and_claim(
+    cpu: u32,
+    idle_id: ThreadId,
+    prev_group: u32,
+    prev_id_for_self_pick: ThreadId,
+    pcpu: &smp::PerCpuData,
+    set_by: u8,
+) -> ThreadId {
+    let mut rq = percpu_rq()[cpu as usize].lock();
+    // Cosched preference: pop from the same group as prev.
+    if prev_group != 0 && rq.cosched_burst < MAX_COSCHED_BURST {
+        if let Some(tid) = rq.pop_for_group(prev_group) {
+            thread_ref(tid).in_queue.store(false, Ordering::Release);
+            if thread_ref(tid)
+                .on_cpu
+                .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+                thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
+                dispatch_cas_ok(pcpu, tid);
+                unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+                pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+                rq.cosched_burst += 1;
+                COSCHED_HITS.fetch_add(1, Ordering::Relaxed);
+                trace_sched(tid, 3);
+                DISPATCH_CLAIM_LOCAL.fetch_add(1, Ordering::Relaxed);
+                return tid;
+            }
+            // Self-pick detection on the cosched pop.
+            if tid == prev_id_for_self_pick
+                && thread_ref(tid).on_cpu.load(Ordering::Acquire) == cpu
+            {
+                DISPATCH_CLAIM_SELF_PICK.fetch_add(1, Ordering::Relaxed);
+                rq.cosched_burst += 1;
+                return tid;
+            }
+            DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    rq.cosched_burst = 0;
+    // Class-aware pick + retry loop.
+    loop {
+        let tid = match rq.class_pick_next() {
+            Some(t) => t,
+            None => break,
+        };
+        thread_ref(tid).in_queue.store(false, Ordering::Release);
+        if thread_ref(tid)
+            .on_cpu
+            .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+            thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
+            dispatch_cas_ok(pcpu, tid);
+            unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+            pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+            trace_sched(tid, 3);
+            DISPATCH_CLAIM_LOCAL.fetch_add(1, Ordering::Relaxed);
+            return tid;
+        }
+        // Self-pick: prev_id was popped but still has on_cpu == this_cpu.
+        if tid == prev_id_for_self_pick
+            && thread_ref(tid).on_cpu.load(Ordering::Acquire) == cpu
+        {
+            DISPATCH_CLAIM_SELF_PICK.fetch_add(1, Ordering::Relaxed);
+            return tid;
+        }
+        DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(rq);
+    // try_steal fallback.
+    if let Some(tid) = try_steal(cpu) {
+        thread_ref(tid).in_queue.store(false, Ordering::Release);
+        if thread_ref(tid)
+            .on_cpu
+            .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+            thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
+            dispatch_cas_ok(pcpu, tid);
+            unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+            pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+            trace_sched(tid, 12);
+            DISPATCH_CLAIM_STEAL.fetch_add(1, Ordering::Relaxed);
+            return tid;
+        }
+        // try_steal'd a self thread? Extremely unlikely (steal looks at other
+        // CPUs' queues), but handle defensively.
+        if tid == prev_id_for_self_pick
+            && thread_ref(tid).on_cpu.load(Ordering::Acquire) == cpu
+        {
+            DISPATCH_CLAIM_SELF_PICK.fetch_add(1, Ordering::Relaxed);
+            return tid;
+        }
+        DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+    idle_id
+}
+
+/// #173 Phase 3c: counter for self-pick observations under the new
+/// helper.  Compared against the legacy `SELF_PICK_COUNT` (try_switch
+/// line 5913) when validating the migration.
+pub static DISPATCH_CLAIM_SELF_PICK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// #173 Phase 1 metrics: count successful local claims, successful steal
 /// claims, and CAS failures inside `percpu_pick_next_and_claim`.  Used for
 /// A/B comparison against the legacy `dispatch_set_pending_count` /
@@ -5885,30 +6013,48 @@ fn try_switch(current_sp: u64) -> u64 {
 
     // Pick next thread from per-CPU queue.
     let prev_group = thread_ref(prev_id).cosched_group.load(Ordering::Relaxed);
-    let (next_id, _cosched) = percpu_pick_next_cosched(cpu, idle_id, prev_group);
+    // #173 Phase 3c: gated cosched dispatch.  The cosched-claim helper
+    // handles self-pick INTERNALLY by returning `prev_id` when CAS-fail
+    // detects `on_cpu == cpu`, so the existing `prev_id == next_id`
+    // branch below fires naturally.  No state restore is needed for the
+    // self-pick path because the helper never stamped `pending_set_ns`
+    // or moved `on_cpu` to `PENDING` (those were the legacy artifacts).
+    let claimed_by_helper =
+        DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed);
+    let (next_id, _cosched) = if claimed_by_helper {
+        let pcpu_for_helper = smp::current();
+        let nid = percpu_pick_next_cosched_and_claim(
+            cpu, idle_id, prev_group, prev_id,
+            pcpu_for_helper, 1, /* set_by=1 (try_switch) */
+        );
+        (nid, false)
+    } else {
+        percpu_pick_next_cosched(cpu, idle_id, prev_group)
+    };
 
     if prev_id == next_id {
-        // percpu_pick_next_cosched dequeued `prev_id` from the run queue
-        // (it was re-enqueued by a concurrent wake/rescue while running).
-        // Restore on_cpu from ON_CPU_PENDING back to our CPU number — the
-        // thread is still running on this CPU and leaving on_cpu as
-        // ON_CPU_PENDING would make the thread invisible to scheduling
-        // (a future try_switch would see ON_CPU_PENDING and CAS wrongly,
-        // or the thread would appear orphaned).
+        // Self-pick: `prev_id` was popped but is still running on us.
+        // Legacy path needed to restore on_cpu=cpu and clear
+        // pending_set_ns / PENDING_LOW_LOGGED because dequeue_set_pending
+        // had stamped them.  Claim helper never stamped them in the
+        // self-pick case (CAS failed before the bookkeeping ran), so the
+        // restore is unnecessary for that branch.
         if prev_id != idle_id {
-            thread_ref(prev_id).on_cpu.store(cpu, Ordering::Release);
-            // #135 self-pick PENDING-STUCK-LOW false-positive fix:
-            // percpu_pick_next_cosched called dequeue_set_pending which
-            // stamped pending_set_ns to "now" and set on_cpu=PENDING.
-            // We just restored on_cpu but the stale stamp would survive
-            // until the next REAL preemption, then the rescue sweep would
-            // compute age_ns from this stale stamp and fire PENDING-STUCK-
-            // LOW falsely on a thread that ran continuously between.
-            // Mirror what dispatch_cas_ok does on the real dispatch path:
-            // clear pending_set_ns and reset PENDING_LOW_LOGGED.
-            thread_ref(prev_id).pending_set_ns.store(0, Ordering::Relaxed);
-            if (prev_id as usize) < PENDING_LOW_LOGGED.len() {
-                PENDING_LOW_LOGGED[prev_id as usize].store(false, Ordering::Relaxed);
+            if !claimed_by_helper {
+                thread_ref(prev_id).on_cpu.store(cpu, Ordering::Release);
+                // #135 self-pick PENDING-STUCK-LOW false-positive fix:
+                // percpu_pick_next_cosched called dequeue_set_pending which
+                // stamped pending_set_ns to "now" and set on_cpu=PENDING.
+                // We just restored on_cpu but the stale stamp would survive
+                // until the next REAL preemption, then the rescue sweep would
+                // compute age_ns from this stale stamp and fire PENDING-STUCK-
+                // LOW falsely on a thread that ran continuously between.
+                // Mirror what dispatch_cas_ok does on the real dispatch path:
+                // clear pending_set_ns and reset PENDING_LOW_LOGGED.
+                thread_ref(prev_id).pending_set_ns.store(0, Ordering::Relaxed);
+                if (prev_id as usize) < PENDING_LOW_LOGGED.len() {
+                    PENDING_LOW_LOGGED[prev_id as usize].store(false, Ordering::Relaxed);
+                }
             }
             SELF_PICK_COUNT.fetch_add(1, Ordering::Relaxed);
         }
@@ -6183,7 +6329,24 @@ fn try_switch(current_sp: u64) -> u64 {
     // that has on_cpu=cpu but is neither dispatching nor current_thread.
     if next_id != idle_id {
         pcpu.dispatching_tid.store(next_id, Ordering::Release);
-        if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
+        if claimed_by_helper {
+            // Phase 3c: helper already CAS'd PENDING→cpu under rq.lock
+            // and ran the matching bookkeeping (TRANS_CAS_OK,
+            // on_cpu_set_by=1, dispatch_cas_ok, state=Running,
+            // dispatch_count).  Still need the try_switch-specific:
+            // trace_point("cas_ok"), trace_sched(4), first-dispatch log,
+            // dispatch_streak.
+            trace_point("try_switch.cas_ok", next_id as u32);
+            trace_sched(next_id, 4); // 4=on_cpu_set
+            maybe_log_first_dispatch(cpu, next_id);
+            let prev_picked =
+                pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
+            if prev_picked == next_id as u32 {
+                pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
+            } else {
+                pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+            }
+        } else if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
             trace_point("try_switch.cas_fail", next_id as u32);
@@ -6209,26 +6372,27 @@ fn try_switch(current_sp: u64) -> u64 {
             // immediately follows this return).
             transition_release_to_pending(prev_id);
             return idle_sp;
-        }
-        trace_point("try_switch.cas_ok", next_id as u32);
-        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
-        thread_ref(next_id).on_cpu_set_by.store(1, Ordering::Relaxed); // 1=try_switch
-        // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
-        dispatch_cas_ok(pcpu, next_id);
-        // Set Running IMMEDIATELY after CAS to close the TOCTOU window:
-        // between CAS(on_cpu=cpu) and state=Running, rescue sees
-        // state=Ready + on_cpu=cpu + current_thread≠tid → false orphan.
-        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
-        trace_sched(next_id, 4); // 4=on_cpu_set
-        // #135 first-dispatch probe — log the first time each tid is picked.
-        maybe_log_first_dispatch(cpu, next_id);
-        // #120 dispatch-pattern diagnostic: count + same-tid streak.
-        pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
-        let prev_picked = pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
-        if prev_picked == next_id as u32 {
-            pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
         } else {
-            pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+            trace_point("try_switch.cas_ok", next_id as u32);
+            record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+            thread_ref(next_id).on_cpu_set_by.store(1, Ordering::Relaxed); // 1=try_switch
+            // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
+            dispatch_cas_ok(pcpu, next_id);
+            // Set Running IMMEDIATELY after CAS to close the TOCTOU window:
+            // between CAS(on_cpu=cpu) and state=Running, rescue sees
+            // state=Ready + on_cpu=cpu + current_thread≠tid → false orphan.
+            unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+            trace_sched(next_id, 4); // 4=on_cpu_set
+            // #135 first-dispatch probe — log the first time each tid is picked.
+            maybe_log_first_dispatch(cpu, next_id);
+            // #120 dispatch-pattern diagnostic: count + same-tid streak.
+            pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+            let prev_picked = pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
+            if prev_picked == next_id as u32 {
+                pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
+            } else {
+                pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+            }
         }
     } else {
         // Idle thread: no CAS needed, just set Running.
