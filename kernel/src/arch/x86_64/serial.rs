@@ -429,6 +429,22 @@ static FALLBACK_BUFS: [CpuFallbackBufs; MAX_PRINT_CPUS] = [const {
     }
 }; MAX_PRINT_CPUS];
 
+/// #229: aggregate VA range covering per-CPU print buffer statics.
+/// Returns `(min_va, max_va)` spanning every byte of `PRINT_BUFS` and
+/// `FALLBACK_BUFS`.  Used at boot to verify the print buffers do not
+/// VA-overlap the kstack region (PML4[508]) — the hypothesis behind
+/// the #229 iretq-corruption family was print buffers aliasing fresh
+/// kstacks.  Both arrays live in `.bss` (PML4[511]), so this is
+/// structurally impossible after #217 (VA isolation Phase 5b), but
+/// the runtime check guards against future refactors moving them.
+pub fn print_buf_va_range() -> (u64, u64) {
+    let p_base = &PRINT_BUFS as *const _ as u64;
+    let p_end = p_base + core::mem::size_of::<[CpuPrintBufs; MAX_PRINT_CPUS]>() as u64;
+    let f_base = &FALLBACK_BUFS as *const _ as u64;
+    let f_end = f_base + core::mem::size_of::<[CpuFallbackBufs; MAX_PRINT_CPUS]>() as u64;
+    (p_base.min(f_base), p_end.max(f_end))
+}
+
 /// Slice-based fmt::Write adapter — writes into a caller-provided
 /// mutable slice + length counter.  Used to format into the per-CPU
 /// static fmt buffer without allocating any stack frame.

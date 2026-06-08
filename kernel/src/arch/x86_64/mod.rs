@@ -83,6 +83,45 @@ pub fn kernel_end_addr() -> usize {
     boot::kernel_end_addr()
 }
 
+/// #229: log the VA layout of kernel static buffers (IST stacks, per-CPU
+/// print buffers) alongside the kstack VA region and assert no overlap.
+///
+/// The #229 corruption hypothesis was that IST stacks or print buffers
+/// could end up VA-aliasing fresh kstacks, scrambling iretq frames as a
+/// side effect of an unrelated print or IST entry.  After #217 (VA
+/// isolation Phase 5b) kstacks live in PML4[508] (`KSTACK_REGION`) while
+/// IST stacks and print buffers are statics in `.bss` (PML4[511] kernel
+/// image).  These slots can't overlap by construction.
+///
+/// We log the actual VA ranges once at boot — future investigators see
+/// the geometry in the boot log, and the panic-on-overlap guards against
+/// a refactor that moves one of these regions into a colliding slot.
+pub fn log_static_buffer_layout() {
+    let (ist_lo, ist_hi) = gdt::ist_stack_va_range();
+    let (pb_lo, pb_hi) = serial::print_buf_va_range();
+    let kstack_lo = mm::KSTACK_REGION_BASE;
+    let kstack_hi = mm::KSTACK_REGION_BASE + mm::PML4_SLOT_SIZE;
+    crate::println!(
+        "VM-LAYOUT: IST [{:#x}..{:#x}) PRINT [{:#x}..{:#x}) KSTACK [{:#x}..{:#x})",
+        ist_lo, ist_hi, pb_lo, pb_hi, kstack_lo, kstack_hi,
+    );
+    let overlap = |a_lo: u64, a_hi: u64| {
+        a_lo < kstack_hi && a_hi > kstack_lo
+    };
+    if overlap(ist_lo, ist_hi) {
+        panic!(
+            "VM-LAYOUT-BAD: IST stacks [{:#x}..{:#x}) overlap KSTACK_REGION [{:#x}..{:#x})",
+            ist_lo, ist_hi, kstack_lo, kstack_hi,
+        );
+    }
+    if overlap(pb_lo, pb_hi) {
+        panic!(
+            "VM-LAYOUT-BAD: print bufs [{:#x}..{:#x}) overlap KSTACK_REGION [{:#x}..{:#x})",
+            pb_lo, pb_hi, kstack_lo, kstack_hi,
+        );
+    }
+}
+
 /// Set up page tables and enable the MMU.
 pub fn enable_mmu() {
     let pml4 = mm::setup_tables().expect("page tables");

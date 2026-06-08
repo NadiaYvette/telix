@@ -91,6 +91,15 @@ pub fn kmain() -> ! {
     // Must happen before secondary CPU startup (they need the page table root).
     arch::platform::enable_mmu();
 
+    // #229: log the VA layout of IST stacks and per-CPU print buffers
+    // alongside the kstack region, and assert no overlap.  The original
+    // #229 hypothesis was that print buffers or IST stacks could alias
+    // fresh kstacks via a PML4[511] path; the VA isolation work moved
+    // kstacks to PML4[508], so the overlap is structurally impossible
+    // — but the runtime check guards against future refactors.
+    #[cfg(target_arch = "x86_64")]
+    arch::platform::log_static_buffer_layout();
+
     // Initialize framebuffer console (if GOP/VBE framebuffer is available).
     // After MMU enable so the framebuffer address is identity-mapped.
     drivers::fb_console::init();

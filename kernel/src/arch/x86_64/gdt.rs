@@ -283,6 +283,31 @@ pub fn is_on_ist(rsp: u64) -> Option<(u8, u8)> {
     }
 }
 
+/// #229: aggregate VA range covering all IST stack arrays.  Returns
+/// `(min_va, max_va)` spanning every byte of `IST_STACKS{,_SS,_NMI,_PF}`.
+/// Used at boot to verify the IST stacks do not VA-overlap the kstack
+/// region (PML4[508]) — the hypothesis behind the #229 iretq-corruption
+/// family was print buffers or IST stacks aliasing fresh kstacks.
+pub fn ist_stack_va_range() -> (u64, u64) {
+    unsafe {
+        let stack_size = IST_STACK_SIZE as u64;
+        let arrays = [
+            IST_STACKS[0].data.as_ptr() as u64,
+            IST_STACKS_SS[0].data.as_ptr() as u64,
+            IST_STACKS_NMI[0].data.as_ptr() as u64,
+            IST_STACKS_PF[0].data.as_ptr() as u64,
+        ];
+        let mut min_va = u64::MAX;
+        let mut max_va = 0u64;
+        for &base in &arrays {
+            if base < min_va { min_va = base; }
+            let end = base + stack_size * MAX_IST_CPUS as u64;
+            if end > max_va { max_va = end; }
+        }
+        (min_va, max_va)
+    }
+}
+
 /// Pointer to this CPU's TSS storage. BSP uses bootstrap, APs use the
 /// dynamic slice.
 #[inline]
