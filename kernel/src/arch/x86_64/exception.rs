@@ -1479,9 +1479,17 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     // kernel #UD family.  Boot 600 tid=13 had frame_sp=0x835fda0
     // while its real kstack was [0x7f70000..0x7f90000).  One log
     // line per fire, rate-limited to 100/boot.
+    //
+    // #238: skip when on IST.  An IST-routed entry from user has
+    // `frame_sp` on the IST stack, not the thread's kstack — the
+    // "outside kstack range" comparison would always false-positive.
+    // For Phase 1 (#DF, #SS on IST) this path isn't reached anyway
+    // because those vectors dispatch into exception_fault directly,
+    // but future-proofs for Phase 2/3.
     {
         let from_user = (frame.cs() & 3) == 3;
-        if from_user {
+        let on_ist = crate::arch::x86_64::gdt::is_on_ist(frame_sp).is_some();
+        if from_user && !on_ist {
             let tid = crate::sched::smp::current()
                 .current_thread
                 .load(core::sync::atomic::Ordering::Relaxed);
