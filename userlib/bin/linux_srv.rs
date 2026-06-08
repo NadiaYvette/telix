@@ -698,6 +698,17 @@ impl ProcessState {
 
 static mut PROC_TABLE: [ProcessState; MAX_PROCS] = [const { ProcessState::empty() }; MAX_PROCS];
 
+// Phase B5d (#212): per-slot atomic-publish active-bit.  Workers
+// calling `find_proc` from `syscall_worker_entry` race with main's
+// `init_proc_slot` / reclaim writes to PROC_TABLE[i].  PROC_ACTIVE[i]
+// is the publication boundary: main stores `true` with Release AFTER
+// writing all PROC_TABLE[i] fields; workers load with Acquire BEFORE
+// reading those fields.  PROC_TABLE[i].active is still maintained
+// for the existing main-only call sites — this commit only routes
+// `find_proc` through the atomic so it's safe to call from workers.
+static PROC_ACTIVE: [core::sync::atomic::AtomicBool; MAX_PROCS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_PROCS];
+
 // Phase B2 (linux_srv worker-pool, #184): parallel per-pi locks for
 // future M:N worker-pool serialization of PROC_TABLE[pi] accesses.
 //
@@ -1599,9 +1610,13 @@ static mut FUTEX_TABLE: [FutexWaiter; MAX_FUTEX_WAITERS] = [const { FutexWaiter:
 
 /// Find a process slot by caller_port.
 fn find_proc(port: u64) -> Option<usize> {
+    use core::sync::atomic::Ordering;
     unsafe {
         for i in 0..MAX_PROCS {
-            if !PROC_TABLE[i].active { continue; }
+            // Phase B5d: Acquire load pairs with the Release store in
+            // `init_proc_slot` so worker threads see the slot's `port` /
+            // `thread_ports[*]` writes only after they've been published.
+            if !PROC_ACTIVE[i].load(Ordering::Acquire) { continue; }
             if PROC_TABLE[i].port == port { return Some(i); }
             // Phase 174: a CLONE_THREAD sibling shares this process's state.
             for t in 0..PROC_TABLE[i].thread_ports.len() {
@@ -1644,12 +1659,22 @@ fn get_or_init_proc(port: u64) -> Option<usize> {
 }
 
 unsafe fn init_proc_slot(i: usize, port: u64) -> usize {
+    use core::sync::atomic::Ordering;
+    // Phase B5d: ensure the slot's atomic-publish active-bit is FALSE
+    // before we mutate the struct fields.  Workers' `find_proc` loads
+    // Acquire and skips inactive slots, so a stale `true` here would
+    // expose torn intermediate state.  Main is the sole writer of
+    // PROC_ACTIVE; the worker side is read-only.
+    PROC_ACTIVE[i].store(false, Ordering::Release);
     PROC_TABLE[i] = ProcessState::empty();
     PROC_TABLE[i].active = true;
     PROC_TABLE[i].port = port;
     PROC_TABLE[i].cwd[0] = b'/';
     PROC_TABLE[i].cwd_len = 1;
     PROC_TABLE[i].umask = 0o022;
+    // Publish: any reader that observes PROC_ACTIVE[i]=true (via
+    // Acquire) is guaranteed to see all the writes above.
+    PROC_ACTIVE[i].store(true, Ordering::Release);
     i
 }
 
