@@ -12011,6 +12011,16 @@ fn is_worker_safe_syscall(linux_nr: u64) -> bool {
         | __NR_SCHED_YIELD
         | __NR_CLOCK_GETTIME | __NR_GETTIMEOFDAY | __NR_CLOCK_GETRES
         | __NR_UNAME | __NR_GETRANDOM
+        // Phase B5d (#212): PROC_TABLE[pi]-touching syscalls.  The worker
+        // resolves `pi = find_proc(caller_port)` (via PROC_ACTIVE acquire-
+        // load, B5d.1) and acquires `proc_lock(pi)` before dispatch — the
+        // same locking discipline the main dispatch arm uses (B5a).  Each
+        // handler reads/writes PROC_TABLE[pi] (fds, umask, cwd) and may
+        // synchronously call out to FS/UDS/TCP servers (do_close), which
+        // is fine: the call returns before we drop the proc_lock guard.
+        | __NR_CLOSE | __NR_LSEEK | __NR_FCNTL
+        | __NR_DUP | __NR_DUP2 | __NR_DUP3
+        | __NR_UMASK | __NR_GETCWD
     )
 }
 
@@ -12030,6 +12040,17 @@ extern "C" fn syscall_worker_entry(_arg: u64) -> ! {
         };
         let linux_nr = msg.tag & 0xFFFF_FFFF;
         let caller_port = msg.tag >> 32;
+        // Phase B5d (#212): PROC_TABLE-touching syscalls need a pi and the
+        // per-pi lock.  Pure-stateless syscalls (clock_gettime, uname,
+        // ...) skip both.  pi resolution is race-safe via PROC_ACTIVE's
+        // Acquire load (B5d.1).
+        let needs_pi = matches!(linux_nr,
+            __NR_CLOSE | __NR_LSEEK | __NR_FCNTL
+            | __NR_DUP | __NR_DUP2 | __NR_DUP3
+            | __NR_UMASK | __NR_GETCWD
+        );
+        let pi = if needs_pi { find_proc(caller_port) } else { None };
+        let _guard = pi.map(|p| proc_lock(p));
         let result = match linux_nr {
             __NR_GETPID | __NR_GETTID | __NR_GETUID | __NR_GETEUID
             | __NR_GETGID | __NR_GETEGID => handle_getid(linux_nr, caller_port),
@@ -12040,8 +12061,20 @@ extern "C" fn syscall_worker_entry(_arg: u64) -> ! {
             __NR_CLOCK_GETRES => handle_clock_getres(caller_port, &msg.data),
             __NR_UNAME => handle_uname(caller_port, &msg.data),
             __NR_GETRANDOM => handle_getrandom(caller_port, &msg.data),
+            // Phase B5d: PROC_TABLE-touching dispatch.  pi is guaranteed
+            // Some() under the matches!() filter above; if find_proc
+            // failed (caller has no process slot), report ESRCH.
+            __NR_CLOSE => match pi { Some(pi) => handle_close(pi, &msg.data), None => linux_err(ESRCH) },
+            __NR_LSEEK => match pi { Some(pi) => handle_lseek(pi, &msg.data), None => linux_err(ESRCH) },
+            __NR_FCNTL => match pi { Some(pi) => handle_fcntl(pi, &msg.data), None => linux_err(ESRCH) },
+            __NR_DUP => match pi { Some(pi) => handle_dup(pi, &msg.data), None => linux_err(ESRCH) },
+            __NR_DUP2 => match pi { Some(pi) => handle_dup2(pi, &msg.data), None => linux_err(ESRCH) },
+            __NR_DUP3 => match pi { Some(pi) => handle_dup3(pi, &msg.data), None => linux_err(ESRCH) },
+            __NR_UMASK => match pi { Some(pi) => handle_umask(pi, &msg.data), None => linux_err(ESRCH) },
+            __NR_GETCWD => match pi { Some(pi) => handle_getcwd(pi, caller_port, &msg.data), None => linux_err(ESRCH) },
             _ => linux_err(ENOSYS), // main shouldn't forward unsafe nrs
         };
+        drop(_guard);
         let _ = syscall::personality_reply(caller_port, result);
     }
 }
