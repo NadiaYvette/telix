@@ -459,32 +459,32 @@ impl<'a> fmt::Write for SliceWriter<'a> {
 /// writer's signature (or rule the theory out).
 const PRINT_CANARY: u64 = 0x504b4e413a3a0a13; // "PNA::\n\x13" — easy to grep
 
-/// #244 ARGS-PROBE helper: scan 256 bytes of kstack centered on
-/// `args_addr` (the in-stack location of the `Arguments` value passed
-/// to `_print`) for 8-byte slots that match the partial-write signature
+/// #244 ARGS-PROBE helper: scan the kstack UPWARD from `rsp_at_probe`
+/// for 8-byte slots that match the partial-write signature
 /// `(upper4 = 0xCAFEBABE) && (lower4 != 0)`.  Update the global
-/// counters; on the first 32 hits per boot also emit a short log line
-/// so we can see which call sites are accumulating partial slots.
+/// counters; on the first 32 hits per boot also emit a short log line.
 ///
-/// All slot reads are bounded by the kstack VA range (PML4[508]
-/// `0xfffffe0000000000`..) so the probe cannot fault.
+/// rsp_at_probe is captured by inline asm at the _print call site,
+/// just before this function is called.  Scanning UPWARD covers
+/// _print's own frame plus every caller's frame up to the kstack top —
+/// the partial-write u32 stack slots we're hunting are scattered
+/// across the active call chain, not just immediately around `&args`.
+///
+/// All slot reads are bounded by the high-half VA range so the probe
+/// cannot fault on user pointers.
 #[inline(never)]
-fn args_probe_scan(args_addr: u64) {
+fn args_probe_scan(rsp_at_probe: u64) {
     use core::sync::atomic::Ordering;
-    // Guard: only scan if we're somewhere in the high-half VA window
-    // (kernel image, kstacks, PHYS_DIRECT_MAP, IST stacks all qualify).
-    // Excludes user-mode and obviously bogus pointers.
-    if (args_addr as i64) >= 0 {
+    // Guard: only scan high-half VAs.
+    if (rsp_at_probe as i64) >= 0 {
         return;
     }
-    // Scan a 4 KiB window centered on `&args`.  rsp grows DOWN, so
-    // the caller's frame (with the println! format_args temporaries)
-    // is at HIGHER addresses, while _print's own locals and the
-    // kstack frames below are at lower addresses.  Scan both sides
-    // because the compiler's exact placement of the Argument array
-    // and its referenced u32 locals depends on inlining + call ABI.
-    let lo = args_addr.saturating_sub(2048) & !0x7;
-    let hi = args_addr.saturating_add(2048) & !0x7;
+    // Scan from current rsp upward by 8 KiB (= 1024 slots).  Stack
+    // grows DOWN so higher addresses = older callers.  8 KiB is
+    // typically enough to cover _print's frame + several caller
+    // frames in the typical println! call chain.
+    let lo = rsp_at_probe & !0x7;
+    let hi = rsp_at_probe.saturating_add(8192) & !0x7;
     if hi <= lo {
         return;
     }
@@ -517,8 +517,8 @@ fn args_probe_scan(args_addr: u64) {
             // crate::println! that just called us.
             let mut buf = [0u8; 96];
             let mut k = 0;
-            put_bytes(&mut buf, &mut k, b"ARGS-PROBE-HIT: args=");
-            put_hex_u64(&mut buf, &mut k, args_addr);
+            put_bytes(&mut buf, &mut k, b"ARGS-PROBE-HIT: rsp=");
+            put_hex_u64(&mut buf, &mut k, rsp_at_probe);
             put_bytes(&mut buf, &mut k, b" partial=");
             put_dec_u64(&mut buf, &mut k, partial as u64);
             put_bytes(&mut buf, &mut k, b"/");
@@ -556,17 +556,27 @@ pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
     init_uart_fifo_once();
 
-    // #244 ARGS-PROBE: rate-limited stack scan around `args` for slots
-    // with the partial-32-bit-write signature.  Scan every 16th _print
-    // call; emit a heartbeat ARGS-PROBE-TICK line every 64 scans so
-    // we can confirm the probe is actually running even when no
-    // partial slots are present.
+    // #244 ARGS-PROBE: rate-limited kstack scan upward from CURRENT
+    // rsp.  `&args` proved to point at _print's own local slot (the
+    // hidden-pointer ABI saves rdi there at rsp+0x30), not at the
+    // caller's Arguments struct.  Scanning from current rsp upward
+    // covers _print's frame plus all of the active call chain — every
+    // caller's locals are at higher addresses, with the partial-write
+    // u32 stack slots we're hunting interleaved in their frames.
     {
         use core::sync::atomic::{AtomicU32, Ordering};
         static ARGS_PROBE_TICK: AtomicU32 = AtomicU32::new(0);
         let n = ARGS_PROBE_TICK.fetch_add(1, Ordering::Relaxed);
         if n & 0xF == 0 {
-            args_probe_scan(&args as *const _ as u64);
+            let rsp_now: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov {0}, rsp",
+                    out(reg) rsp_now,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            args_probe_scan(rsp_now);
             if (n >> 4) & 0x3F == 0 && (n >> 10) < 16 {
                 // Heartbeat: print every 64th probe run (= every 1024
                 // _print calls), capped at the first 16 heartbeats so
