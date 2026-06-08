@@ -17,10 +17,14 @@ GDB_PORT="${TELIX_GDB_PORT:-3234}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISK_IMG="$SCRIPT_DIR/../test.img"
 
+# RAM size: parity with x86 default (2 GiB) and aarch64.  256 MiB ran
+# out of phys pages during I/O-server spawn; override via `TELIX_MEM`.
+MEM="${TELIX_MEM:-2G}"
+
 QEMU_ARGS=(
     -machine virt
     -cpu rv64
-    -m 256M
+    -m "$MEM"
     -nographic
     -serial mon:stdio
     -bios default

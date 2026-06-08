@@ -17,10 +17,14 @@ GDB_PORT="${TELIX_GDB_PORT:-3234}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISK_IMG="$SCRIPT_DIR/../test.img"
 
+# RAM size: parity with x86 default (2 GiB).  256 MiB ran out of phys
+# pages during I/O-server spawn (alloc_task_entry FAILED cascades).
+MEM="${TELIX_MEM:-2G}"
+
 QEMU_ARGS=(
     -machine virt
     -cpu la464
-    -m 256M
+    -m "$MEM"
     -nographic
     -serial mon:stdio
     -kernel "$KERNEL"

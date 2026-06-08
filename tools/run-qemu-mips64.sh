@@ -17,10 +17,14 @@ GDB_PORT="${TELIX_GDB_PORT:-3234}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISK_IMG="$SCRIPT_DIR/../test.img"
 
+# RAM size: parity with x86 default (2 GiB).  Default 256 MiB ran out
+# of phys pages during I/O-server spawn cascades.
+MEM="${TELIX_MEM:-2G}"
+
 QEMU_ARGS=(
     -M malta
     -cpu MIPS64R2-generic
-    -m 256M
+    -m "$MEM"
     -nographic
     -serial mon:stdio
     -kernel "$KERNEL"

@@ -15,6 +15,12 @@ shift
 SSH_PORT="${TELIX_SSH_PORT:-3222}"
 GDB_PORT="${TELIX_GDB_PORT:-3234}"
 SMP="${TELIX_SMP:-4}"
+# RAM size: parity with x86 default (2 GiB).  256 MiB ran out of phys
+# pages during the I/O-server spawn fan-out (boot 2026-06-09: phys_free
+# hit 60 pages / 3.8 MiB before half the FS servers were up), causing
+# `alloc_task_entry FAILED` cascades and the appearance of an "IPC
+# stall".  Override via `TELIX_MEM=512M tools/run-qemu.sh ...` as needed.
+MEM="${TELIX_MEM:-2G}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISK_IMG="$SCRIPT_DIR/../test.img"
@@ -27,7 +33,7 @@ DTB_FILE="${SCRIPT_DIR}/../.qemu-virt.dtb"
 QEMU_ARGS=(
     -machine virt,gic-version=3
     -cpu cortex-a72
-    -m 256M
+    -m "$MEM"
     -nographic
     -serial mon:stdio
     -kernel "$KERNEL"
@@ -52,10 +58,14 @@ NET_ARGS=(
 QEMU_ARGS+=("${NET_ARGS[@]}")
 
 # Generate the DTB matching our exact device configuration.
-# dumpdtb causes QEMU to write the DTB and exit immediately.
+# dumpdtb causes QEMU to write the DTB and exit immediately.  The
+# /memory node in the DTB must match the actual `-m` on the run
+# below, otherwise the kernel's RAM-scan caps at the DTB-described
+# size — which previously held us at 256 MiB regardless of run-time
+# overrides.
 qemu-system-aarch64 \
     -machine virt,gic-version=3,dumpdtb="$DTB_FILE" \
-    -cpu cortex-a72 -m 256M -smp "$SMP" \
+    -cpu cortex-a72 -m "$MEM" -smp "$SMP" \
     "${DISK_ARGS[@]}" "${NET_ARGS[@]}" 2>/dev/null || true
 
 # Compact it (remove padding) and inject at 0x40000000.
