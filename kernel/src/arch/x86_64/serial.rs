@@ -174,21 +174,45 @@ impl fmt::Write for DirectUart {
 /// through core::fmt.  Used by handler probes that already formatted
 /// via a thin hex writer to keep the kstack frame small.
 ///
-/// Takes PRINT_LOCK to prevent interleaving with other CPUs' prints;
-/// IRQs are NOT disabled because callers are already in IRQ context.
+/// Bisect 2026-06-08 (boots 19amfsq3384-3395 + 11amfsq3365-3380, task
+/// #243) caught a 4-multi-only wedge introduced by commit 8e5049d when
+/// TS-IN started calling this helper from try_switch in timer-tick IRQ
+/// context.  The old version acquired PRINT_LOCK without setting
+/// PRINT_HOLDER_CPU and without disabling IRQs, so a timer tick that
+/// landed mid-push_bytes on a CPU already holding the lock self-
+/// deadlocked.  This version uses the same polite-lock + holder-CPU
+/// protocol as `_print`, with same-CPU re-entry short-circuited.
 pub fn handler_write_bytes(bytes: &[u8]) {
     init_uart_fifo_once();
-    // Acquire PRINT_LOCK by busy-waiting (we may be in an IRQ handler,
-    // so just spin until it's available).  Skip the lock-holder check
-    // because we're not at risk of self-deadlock here.
-    while PRINT_LOCK
-        .compare_exchange(0, 1, AOrdering::Acquire, AOrdering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
+    let my_cpu = crate::sched::smp::cpu_id() as i32;
+    if PRINT_HOLDER_CPU.load(AOrdering::Acquire) == my_cpu {
+        // Re-entry on the same CPU (we're an IRQ that fired while this
+        // CPU was already inside _print or handler_write_bytes).  Push
+        // directly — bytes will interleave with the outer call's output
+        // but no deadlock, no IRQ-blocking wait.
+        Serial.push_bytes(bytes);
+        return;
     }
+    let saved;
+    loop {
+        while PRINT_LOCK.load(AOrdering::Relaxed) != 0 {
+            core::hint::spin_loop();
+        }
+        let s = crate::arch::irq::disable();
+        if PRINT_LOCK
+            .compare_exchange(0, 1, AOrdering::Acquire, AOrdering::Relaxed)
+            .is_ok()
+        {
+            saved = s;
+            break;
+        }
+        crate::arch::irq::restore(s);
+    }
+    PRINT_HOLDER_CPU.store(my_cpu, AOrdering::Release);
     Serial.push_bytes(bytes);
+    PRINT_HOLDER_CPU.store(-1, AOrdering::Release);
     PRINT_LOCK.store(0, AOrdering::Release);
+    crate::arch::irq::restore(saved);
 }
 
 // #208 Pattern A escape helpers — let fault-path code emit log lines
