@@ -1171,7 +1171,47 @@ impl Drop for Dr1Guard {
 /// few events) when it fires while a handler is in progress — which
 /// could explain how the second-call ret-target keeps landing in the
 /// outer ret-slot despite the no-stack-switch mitigation.
+///
+/// #241 NMI re-entrancy state.  NMI_NEST_DEPTH[cpu] counts the number
+/// of NMI vector dispatches currently in-flight on this CPU.  Outer NMI
+/// (depth was 0 → 1) takes the normal processing path; nested NMI
+/// (depth was ≥ 1 → ≥ 2) takes the safe-abort path that skips
+/// exception_fault and returns to the iretq stub immediately, avoiding
+/// (a) deadlock on locks the interrupted handler may hold (PRINT_LOCK,
+/// scheduler locks, …) and (b) infinite recursion through panic.
+///
+/// NMI_OUTERMOST_IRETQ_FRAME[cpu] is forward-looking storage for the
+/// `paranoid_entry`-style asm trampoline that #216 Phase 2 will add
+/// when NMI moves to IST 3.  The single-shot rsp store on IST entry
+/// means a nested NMI overwrites the outer NMI's iretq frame at
+/// IST3_TOP; the trampoline copies that frame into this per-CPU slot
+/// on outer entry, then restores it on outer exit.  We populate the
+/// field today from Rust so existing diagnostics can see what the
+/// outermost iretq frame looked like, and so the asm trampoline can
+/// drop in later without changing this file.
 const MAX_NMI_CPUS: usize = 8;
+pub static NMI_NEST_DEPTH: [core::sync::atomic::AtomicU32; MAX_NMI_CPUS] = [const {
+    core::sync::atomic::AtomicU32::new(0)
+}; MAX_NMI_CPUS];
+pub static NMI_NESTED_TOTAL: [core::sync::atomic::AtomicU32; MAX_NMI_CPUS] = [const {
+    core::sync::atomic::AtomicU32::new(0)
+}; MAX_NMI_CPUS];
+
+/// Outermost iretq frame (rip, cs, rflags, rsp, ss) populated by the
+/// outer NMI handler at entry.  See #241 design note above.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NmiIretqFrame {
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+pub static mut NMI_OUTERMOST_IRETQ_FRAME: [NmiIretqFrame; MAX_NMI_CPUS] =
+    [NmiIretqFrame { rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0 }; MAX_NMI_CPUS];
+
+
 static IN_HANDLER: [core::sync::atomic::AtomicBool; MAX_NMI_CPUS] = [const {
     core::sync::atomic::AtomicBool::new(false)
 }; MAX_NMI_CPUS];
@@ -1708,42 +1748,101 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             exception_fault("Debug (#DB)", frame)
         }
         2 => {
-            // #233 (4): if NMI fires while a handler is in flight on this
-            // CPU, that's evidence for the "nested-interrupt overlap"
-            // hypothesis for the second-call ret-scribble pattern.
+            // #241 NMI re-entrancy.  Atomically bump the per-CPU nest
+            // counter; outer NMI takes the depth 0 → 1 transition and
+            // the normal exception_fault path, nested NMI takes ≥ 1 → ≥ 2
+            // and returns early without calling exception_fault.
+            //
+            // Why skip exception_fault on nested:
+            //   - exception_fault prints (handler_write_bytes is itself
+            //     re-entrant after #243, but the deeper dump path may
+            //     touch scheduler/format/etc. locks that the interrupted
+            //     handler holds).
+            //   - exception_fault calls exit_current_thread which takes
+            //     scheduler locks; running it twice on this CPU at once
+            //     would deadlock.
+            //   - Panic + halt are also non-re-entrant in practice.
+            //
+            // The depth-counter is the kstack analogue of Linux's
+            // `paranoid_entry` sentinel.  When NMI moves to IST 3
+            // (#216 Phase 2), the same depth counter combined with the
+            // NMI_OUTERMOST_IRETQ_FRAME storage will form the basis of
+            // the asm trampoline that protects the outer iretq frame
+            // from being overwritten by an inner NMI's single-shot rsp
+            // store at IST3_TOP.  Until then, NMI stays on the kstack
+            // (no IST), so the frame-overwrite case can't trigger; only
+            // the lock-recursion case can, and the depth counter blocks
+            // it.
             let cpu_for_nmi = crate::sched::smp::cpu_id() as usize;
-            if get_in_handler(cpu_for_nmi) {
-                let n = NMI_IN_HANDLER_COUNT[cpu_for_nmi]
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if n < 16 {
-                    let mut buf = [0u8; 96];
-                    let mut k = 0;
-                    fn put(buf: &mut [u8; 96], k: &mut usize, b: u8) {
-                        if *k < buf.len() { buf[*k] = b; *k += 1; }
+            if cpu_for_nmi < MAX_NMI_CPUS {
+                let prev_depth = NMI_NEST_DEPTH[cpu_for_nmi]
+                    .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+                if prev_depth == 0 {
+                    // Outer NMI: snapshot the iretq frame into the
+                    // per-CPU outermost-frame slot.  This populates the
+                    // forward-looking #216 Phase 2 hook in code today;
+                    // when the asm trampoline lands, the snapshot will
+                    // move into asm and the Rust path will only read.
+                    let snap = NmiIretqFrame {
+                        rip: frame.rip(),
+                        cs: frame.cs(),
+                        rflags: frame.rflags(),
+                        rsp: frame.rsp(),
+                        ss: frame.ss(),
+                    };
+                    // SAFETY: per-CPU slot, only touched by this CPU's
+                    // outer NMI handler (depth was 0 → 1, so no other
+                    // writer is running on this CPU).
+                    unsafe { NMI_OUTERMOST_IRETQ_FRAME[cpu_for_nmi] = snap; }
+                } else {
+                    // Nested NMI: log + safe-abort.
+                    let n = NMI_NESTED_TOTAL[cpu_for_nmi]
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n < 16 {
+                        use crate::arch::x86_64::serial::{
+                            put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                        };
+                        let mut buf = [0u8; 128];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"NMI-NESTED: cpu=");
+                        put_dec_u64(&mut buf, &mut k, cpu_for_nmi as u64);
+                        put_bytes(&mut buf, &mut k, b" depth=");
+                        put_dec_u64(&mut buf, &mut k, (prev_depth + 1) as u64);
+                        put_bytes(&mut buf, &mut k, b" n=");
+                        put_dec_u64(&mut buf, &mut k, n as u64);
+                        put_bytes(&mut buf, &mut k, b" inner_rip=");
+                        put_hex_u64(&mut buf, &mut k, frame.rip());
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(
+                            &buf[..k.min(buf.len())]
+                        );
                     }
-                    fn put_str(buf: &mut [u8; 96], k: &mut usize, s: &str) {
-                        for &b in s.as_bytes() { put(buf, k, b); }
+                    // Drop nest depth and return — outer keeps running.
+                    NMI_NEST_DEPTH[cpu_for_nmi]
+                        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+                    return validate_iretq_frame(frame_sp, frame_sp, 2);
+                }
+                // #233 (4): keep the historical NMI-IN-HANDLER probe for
+                // the case where an unrelated exception was already in
+                // flight on this CPU (NMI fired during e.g. a #PF).
+                if get_in_handler(cpu_for_nmi) {
+                    let n = NMI_IN_HANDLER_COUNT[cpu_for_nmi]
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n < 16 {
+                        use crate::arch::x86_64::serial::{
+                            put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                        };
+                        let mut buf = [0u8; 96];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"NMI-IN-HANDLER: cpu=");
+                        put_dec_u64(&mut buf, &mut k, cpu_for_nmi as u64);
+                        put_bytes(&mut buf, &mut k, b" n=");
+                        put_dec_u64(&mut buf, &mut k, n as u64);
+                        put_bytes(&mut buf, &mut k, b" rip=");
+                        put_hex_u64(&mut buf, &mut k, frame.rip());
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k]);
                     }
-                    fn put_hex(buf: &mut [u8; 96], k: &mut usize, mut v: u64) {
-                        put_str(buf, k, "0x");
-                        if v == 0 { put(buf, k, b'0'); return; }
-                        let mut digits = [0u8; 16];
-                        let mut j = 0;
-                        while v > 0 {
-                            let d = (v & 0xf) as u8;
-                            digits[j] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
-                            v >>= 4; j += 1;
-                        }
-                        for i in (0..j).rev() { put(buf, k, digits[i]); }
-                    }
-                    put_str(&mut buf, &mut k, "NMI-IN-HANDLER: cpu=0x");
-                    put_hex(&mut buf, &mut k, cpu_for_nmi as u64);
-                    put_str(&mut buf, &mut k, " n=0x");
-                    put_hex(&mut buf, &mut k, n as u64);
-                    put_str(&mut buf, &mut k, " rip=");
-                    put_hex(&mut buf, &mut k, frame.rip());
-                    put(&mut buf, &mut k, b'\n');
-                    crate::arch::x86_64::serial::handler_write_bytes(&buf[..k]);
                 }
             }
             exception_fault("NMI", frame)
