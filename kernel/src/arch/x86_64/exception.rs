@@ -2173,8 +2173,32 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             {
                 let cpu = crate::sched::smp::cpu_id();
                 let pcpu = crate::sched::smp::get(cpu);
-                pcpu.ipi_recv_count
+                let prev = pcpu
+                    .ipi_recv_count
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // #182 sanity check: realistic IPI counter caps at ~10^9
+                // (boots last seconds, IPI rates ~10^5/s).  Boot 536 caught
+                // cpu=0's counter at 0x010000000000030B (bit 56 set + 779
+                // real increments) — meaning something other than this
+                // fetch_add poked the field.  Log the first observation
+                // per-CPU with the interrupted RIP/RSP so we can attribute
+                // the corruption window.
+                if prev > (1u64 << 40) {
+                    static SEEN: [core::sync::atomic::AtomicBool;
+                        crate::sched::smp::MAX_CPUS] = [const {
+                            core::sync::atomic::AtomicBool::new(false)
+                        }; crate::sched::smp::MAX_CPUS];
+                    let cpu_idx = cpu as usize;
+                    if cpu_idx < crate::sched::smp::MAX_CPUS
+                        && !SEEN[cpu_idx]
+                            .swap(true, core::sync::atomic::Ordering::AcqRel)
+                    {
+                        crate::println!(
+                            "IPI-RECV-COUNT-CORRUPT: cpu={} prev={:#x} rip={:#x} rsp={:#x}",
+                            cpu, prev, frame.rip(), frame.rsp(),
+                        );
+                    }
+                }
                 // Layer 4 paravirt: stamp recv timestamp + Stage-1
                 // adaptive EWMA of inter-arrival mean and MAD for the
                 // per-CPU IPI-staleness threshold in
