@@ -106,6 +106,17 @@ pub fn init() {
         // can't affect us today.  #241's NMI_NEST_DEPTH short-circuits
         // the nested case before it recurses into exception_fault.
         idt[2].set_ist(3);
+        // Vector 14 (#PF) uses IST 4 → TSS.ist[3].  #216 Phase 3 per
+        // the slot-allocation policy in task #239.  See gdt.rs
+        // IST_STACKS_PF for the rationale: the corruption window from
+        // a peer #PF during an async-PF park doesn't manifest today
+        // (async_pf=0 in observed boots) and `park_faulting_from_ist`
+        // (#240) is queued for when it does start firing.  The win is
+        // that a #PF on a stack-overflow guard page — the exact
+        // cascade pattern we saw in boot 3243 before today's IST
+        // sequence — now lands cleanly on a fresh 1 MiB stack instead
+        // of recursing into the corrupted kstack and triple-faulting.
+        idt[14].set_ist(4);
 
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,

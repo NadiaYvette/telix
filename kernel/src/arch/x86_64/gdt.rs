@@ -189,6 +189,38 @@ static mut IST_STACKS_SS: [IstStack; MAX_IST_CPUS] = {
     [EMPTY; MAX_IST_CPUS]
 };
 
+/// IST slot 4 — used for #PF (vector 14).  #216 Phase 3 per the slot-
+/// allocation policy in task #239.
+///
+/// Unlike Phase 1 (#DF, #SS — both fatal) and Phase 2 (NMI — also
+/// fatal in current Telix), #PF has a legitimate non-fatal park path
+/// (`async_pf_park` for KVM_PV_REASON_PAGE_NOT_PRESENT).  If a thread
+/// parks while on IST 4 and a second #PF fires on the same CPU during
+/// the WFI loop, the second #PF's CPU-pushed iretq frame at IST4_TOP
+/// will overwrite the parked thread's continuation state on IST 4,
+/// corrupting it when the parked thread is later resumed.
+///
+/// Mitigations:
+///   - Today: async-PF reports async_pf=0 events in all observed boots
+///     (LAYER3-DIAG counter), so the park-from-IST path is exercised
+///     zero times — the corruption window doesn't manifest.
+///   - Future: `park_faulting_from_ist` (#240's pure-Rust helper)
+///     copies the 22-quad iretq+gpregs frame from IST 4 to the
+///     faulting thread's kstack, then performs a direct synthetic
+///     dispatch to the next thread, bypassing `block_current`'s
+///     WFI-on-IST loop entirely.  When async-PF starts firing in
+///     real workloads we'll wire that helper in.
+///
+/// The other #PF paths (NeedPager via `initiate_fault`, kernel-mode
+/// fatal #PF, user-mode unhandled #PF) do not synchronously block on
+/// the IST stack — `initiate_fault` just records frame_sp and returns,
+/// and the fatal paths spin-loop in place — so IST 4 reuse by a peer
+/// #PF on the same CPU doesn't affect them.
+static mut IST_STACKS_PF: [IstStack; MAX_IST_CPUS] = {
+    const EMPTY: IstStack = IstStack { data: [0; IST_STACK_SIZE] };
+    [EMPTY; MAX_IST_CPUS]
+};
+
 /// IST slot 3 — used for NMI (vector 2).  #216 Phase 2 per the slot-
 /// allocation policy in task #239.
 ///
@@ -219,14 +251,14 @@ static mut IST_STACKS_NMI: [IstStack; MAX_IST_CPUS] = {
 ///
 /// Returns Some((slot_index, cpu)) when rsp is on an IST stack, or None
 /// otherwise.  slot_index = 1 for #DF stack, 2 for #SS stack, 3 for NMI
-/// stack.  cpu is the IST_STACKS index (= logical CPU for the current
-/// setup).
+/// stack, 4 for #PF stack.  cpu is the IST_STACKS index (= logical CPU
+/// for the current setup).
 #[inline]
 pub fn is_on_ist(rsp: u64) -> Option<(u8, u8)> {
-    // SAFETY: IST_STACKS / IST_STACKS_SS / IST_STACKS_NMI are static mut
-    // arrays in .bss.  We only read the slice metadata (pointer + length)
-    // here — no mutation, no synchronization needed beyond Acquire-
-    // equivalent semantics of the kernel-image .bss after early init.
+    // SAFETY: IST_STACKS{,_SS,_NMI,_PF} are static mut arrays in .bss.
+    // We only read the slice metadata (pointer + length) here — no
+    // mutation, no synchronization needed beyond Acquire-equivalent
+    // semantics of the kernel-image .bss after early init.
     unsafe {
         let stack_size = IST_STACK_SIZE as u64;
         for slot in 0..MAX_IST_CPUS {
@@ -241,6 +273,10 @@ pub fn is_on_ist(rsp: u64) -> Option<(u8, u8)> {
             let base = IST_STACKS_NMI[slot].data.as_ptr() as u64;
             if rsp >= base && rsp < base + stack_size {
                 return Some((3, slot as u8));
+            }
+            let base = IST_STACKS_PF[slot].data.as_ptr() as u64;
+            if rsp >= base && rsp < base + stack_size {
+                return Some((4, slot as u8));
             }
         }
         None
@@ -534,6 +570,9 @@ pub fn init() {
         // IST[2] → dedicated NMI stack (#216 Phase 2).
         (*tss_for(0)).ist[2] =
             IST_STACKS_NMI[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+        // IST[3] → dedicated #PF stack (#216 Phase 3).
+        (*tss_for(0)).ist[3] =
+            IST_STACKS_PF[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
     }
 
     load_gdt_for_cpu(0);
@@ -558,6 +597,9 @@ pub fn init_ap(cpu: u32) {
             // IST[2] → dedicated NMI stack (#216 Phase 2).
             (*tss_for(cpu)).ist[2] =
                 IST_STACKS_NMI[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+            // IST[3] → dedicated #PF stack (#216 Phase 3).
+            (*tss_for(cpu)).ist[3] =
+                IST_STACKS_PF[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
         }
     }
 
