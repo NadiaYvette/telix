@@ -38,6 +38,85 @@ const USER_PAGE: u64 = PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RW_ALL |
 const MMU_PAGE_SIZE: usize = 4096;
 const PA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
+// ============================================================================
+// SLAB_THREAD_REGION (#260 step 2: per-Thread VA window with guard pages).
+//
+// Sits in L1[3] of the kernel's TTBR0 L0 sub-tree — VA 0xC000_0000 onwards,
+// the next 1 GiB after the 2 GiB RAM identity map.  Every aspace's L0
+// (kernel + every user PT created via setup_tables) installs the SAME
+// physical L2 sub-tree at L1[3], so Thread VA windows are visible from
+// every active context — matching x86_64's SLAB_THREAD_REGION semantics
+// (which on x86 are reachable from every cr3 because they live in the
+// PML4 kernel half).
+//
+// Each Thread gets a 16 KiB VA window with one 4 KiB phys page mapped
+// at the TOP and 12 KiB of unmapped guard below.  A stray write to a
+// Thread struct's address from unrelated kernel code (e.g., extent-tree
+// pointer arithmetic landing in the slab region) faults instead of
+// silently scribbling a sibling Thread.
+//
+// Step 1 (commit 09cb0d4) gave each Thread its own dedicated 4 KiB phys
+// page; this step adds the unmapped-guard layout around that page so
+// stray writes near it also fault.
+// ============================================================================
+
+/// VA base of the SLAB_THREAD_REGION (3 GiB; covered by L1[3]).
+pub const SLAB_THREAD_REGION_BASE: u64 = 0xC000_0000;
+
+/// Size of each Thread's VA window (16 KiB): 4 KiB mapped at top + 12 KiB guard.
+pub const SLAB_THREAD_WINDOW_SIZE: u64 = 16 * 1024;
+
+/// Shared L2 sub-tree PA covering SLAB_THREAD_REGION's 1 GiB L1 slot.
+/// Allocated on the first setup_tables() call; reused by subsequent calls
+/// so every aspace's L1[3] points at the same physical L2.
+static SHARED_SLAB_THREAD_L2_PA: AtomicUsize = AtomicUsize::new(0);
+
+/// Bump-pointer cursor for SLAB_THREAD_REGION VA windows.  Skip the first
+/// window so `base + offset` doesn't collide with code that treats
+/// null-ish VAs specially.
+static SLAB_THREAD_VA_NEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(SLAB_THREAD_REGION_BASE + SLAB_THREAD_WINDOW_SIZE);
+
+/// Serializes concurrent calls to `map_slab_thread_window`.  Needed
+/// because `radix_pt::walk_or_create` has a race: two CPUs both reading
+/// an L2 slot as 0, both allocating a fresh L3 table, both writing the
+/// L2 slot — one CPU's L3 is lost AND its leaf writes go to a now-
+/// orphaned table.  Surface = intermittent `Translation fault level
+/// 2/3` on Thread VAs that should be mapped.  Lock-around fixes
+/// trivially since map_single_mmupage is fast.
+static MAP_LOCK: crate::sync::spinlock::SpinLock<()> =
+    crate::sync::spinlock::SpinLock::new(());
+
+/// Reserve the next 16 KiB VA window in SLAB_THREAD_REGION.  Returns the
+/// VA base (low address).  The Thread struct lives in the TOP 4 KiB;
+/// the bottom 12 KiB stays unmapped (guard).
+#[inline]
+pub fn alloc_slab_thread_va_window() -> u64 {
+    SLAB_THREAD_VA_NEXT.fetch_add(
+        SLAB_THREAD_WINDOW_SIZE,
+        core::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// Map a single 4 KiB phys page at the TOP of a SLAB_THREAD_REGION VA
+/// window.  Returns the VA of the mapped page.  Uses the kernel's L0
+/// (which has L1[3] → SHARED_SLAB_THREAD_L2); the mapping is visible
+/// from every aspace because every aspace's L1[3] points at the same L2.
+pub fn map_slab_thread_window(va_window_base: u64, pa: usize) -> Option<u64> {
+    let kernel_l0 = KERNEL_PT_ROOT.load(Ordering::Acquire);
+    if kernel_l0 == 0 {
+        return None;
+    }
+    let va = va_window_base + SLAB_THREAD_WINDOW_SIZE - MMU_PAGE_SIZE as u64;
+    let flags = PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RW_EL1
+        | PT_ATTR_IDX_0 | PT_UXN | PT_PXN;
+    let _guard = MAP_LOCK.lock();
+    if !map_single_mmupage(kernel_l0, va as usize, pa, flags) {
+        return None;
+    }
+    Some(va)
+}
+
 /// Allocate a zero-filled 4K page for a page table from the buddy allocator.
 fn alloc_table() -> Option<usize> {
     let page = crate::mm::phys::alloc_page()?;
@@ -89,6 +168,37 @@ pub fn setup_tables() -> Option<usize> {
                 *l2_table.add(i) = phys | KERN_BLOCK;
             }
         }
+    }
+
+    // L1[3]: SLAB_THREAD_REGION shared L2 sub-tree (1 GiB at VA 0xC000_0000).
+    // Allocate the L2 on first call (BSP MMU bring-up); reuse across all
+    // subsequent setup_tables calls so every aspace's L1[3] points at the
+    // same physical L2.  This is what makes the per-Thread VA windows
+    // visible from every active TTBR0 context.
+    let shared_l2_pa = {
+        let existing = SHARED_SLAB_THREAD_L2_PA.load(Ordering::Acquire);
+        if existing != 0 {
+            existing
+        } else {
+            let new_l2 = alloc_table()?;
+            match SHARED_SLAB_THREAD_L2_PA.compare_exchange(
+                0,
+                new_l2,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => new_l2,
+                Err(winning) => {
+                    // Lost the init race; the page we allocated leaks (rare,
+                    // happens at most once per boot since CAS only fires
+                    // when racing setup_tables on different CPUs).
+                    winning
+                }
+            }
+        }
+    };
+    unsafe {
+        *l1_table.add(3) = (shared_l2_pa as u64) | PT_VALID | PT_TABLE;
     }
 
     Some(l0)

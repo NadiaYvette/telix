@@ -3318,29 +3318,44 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
         }
         Some(p)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        // #260 Phase 4 port (aarch64/riscv64/loongarch64/mips64):
-        // each Thread gets its own dedicated 4 KiB phys page via
-        // `phys::alloc_page()` instead of sharing a 2048-byte slab
-        // chunk.  Closes the cross-Thread payload scribble surface
-        // — Thread structs no longer share underlying pages with
-        // each other OR with other slab consumers like ART Node4
-        // (64 B) or Node16 (256 B).  Underlying #228 PA double-
-        // issue is still possible but the surface narrows.
+        // #260 step 2: per-Thread VA window with 12 KiB unmapped guard
+        // pages below the mapped 4 KiB Thread page.  Mirrors x86_64's
+        // SLAB_THREAD_REGION isolation.  Each Thread:
+        //   - owns its own 4 KiB phys page (no shared slab chunks)
+        //   - lives at the TOP of a 16 KiB VA window in 0xC000_0000+
+        //   - has 12 KiB of unmapped VA below — stray writes computing
+        //     a "near-Thread" pointer fault instead of scribbling
         //
-        // Memory cost: ~3 KiB slop per Thread (page_size - sizeof
-        // Thread).  With a few hundred Threads this is well under
-        // a MiB.
-        //
-        // Compared to the x86_64 path: that one ALSO allocates the
-        // VA window with 12 KiB unmapped guards.  The VA-window
-        // guard requires per-arch page-table sub-allocator support
-        // which aarch64 doesn't have yet (kernel uses TTBR0
-        // identity map, no TTBR1 yet).  Adding the VA window is a
-        // follow-up; the dedicated-PA isolation alone is what
-        // closes the immediate corruption surface boot test-alias
-        // captured.
+        // The mapping lives in a SHARED L2 sub-tree at L1[3] (installed
+        // by `setup_tables` for every aspace), so the Thread VA is
+        // reachable from every active TTBR0 context.
+        let pa = crate::mm::phys::alloc_page()?;
+        // Zero the phys page via PHYS_DIRECT_MAP before mapping it into
+        // the VA window.  Cheaper than writing through the window VA
+        // since identity map is already set up.
+        unsafe {
+            core::ptr::write_bytes(
+                crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
+                0,
+                crate::mm::page::page_size(),
+            );
+        }
+        let va_window = crate::arch::aarch64::mm::alloc_slab_thread_va_window();
+        let va = crate::arch::aarch64::mm::map_slab_thread_window(va_window, pa.as_usize())?;
+        let p = va as *mut Thread;
+        unsafe {
+            core::ptr::write(p, Thread::empty());
+        }
+        Some(p)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // riscv64/loongarch64/mips64: per-page Thread alloc (step 1
+        // of #260) only.  Adding VA-window guards on these arches is
+        // a follow-up matching the aarch64 path once each arch has
+        // its own SLAB_THREAD_REGION sub-allocator.
         let pa = crate::mm::phys::alloc_page()?;
         let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Thread;
         unsafe {
