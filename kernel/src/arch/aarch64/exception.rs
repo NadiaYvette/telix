@@ -237,6 +237,47 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 put_byte(buf, &mut k, b'\n');
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
+            // Walk UPWARD from frame_sp (toward kstack_end, higher VAs)
+            // to dump the caller-frame chain.  Upward addresses are the
+            // older frames that the current execution was using before
+            // the trap — definitely mapped.  Downward (deeper) addresses
+            // could be lazy-mapped pages we haven't faulted in yet; that
+            // direction is unsafe to read in the EL1 Sync handler and
+            // an earlier draft of this probe hung on a nested fault
+            // there (see memory/project_aarch64_tid29_linux_srv_wild_jump.md).
+            {
+                use crate::arch::aarch64::serial::{
+                    fault_buf_for_current_cpu, handler_write_bytes, put_byte, put_bytes,
+                    put_hex_u64,
+                };
+                let buf = fault_buf_for_current_cpu();
+                let mut k = 0;
+                put_bytes(buf, &mut k, b"  kstack [frame_sp .. kstack_end), upward:\n");
+                let start = (frame_sp as usize) & !7;
+                let kstack_top = kstack_base + kstack_size;
+                let max_qwords = 14usize;
+                let end = core::cmp::min(start + max_qwords * 8, kstack_top);
+                let mut va = start;
+                while va < end {
+                    let val = unsafe { core::ptr::read_volatile(va as *const u64) };
+                    put_bytes(buf, &mut k, b"    [");
+                    put_hex_u64(buf, &mut k, va as u64);
+                    if va == (frame_sp as usize) {
+                        put_bytes(buf, &mut k, b"*] ");
+                    } else {
+                        put_bytes(buf, &mut k, b" ] ");
+                    }
+                    put_hex_u64(buf, &mut k, val);
+                    if val == 0xCAFEBABE_00000000 {
+                        put_bytes(buf, &mut k, b" SENTINEL");
+                    } else if val & 0xFFFFFFFF_00000000 == 0xCAFEBABE_00000000 {
+                        put_bytes(buf, &mut k, b" SENTINEL-HI");
+                    }
+                    put_byte(buf, &mut k, b'\n');
+                    va += 8;
+                }
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
             loop {
                 core::hint::spin_loop();
             }
