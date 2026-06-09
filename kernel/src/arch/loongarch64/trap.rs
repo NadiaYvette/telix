@@ -264,6 +264,11 @@ fn read_badv() -> u64 {
 /// Returns (potentially new) SP for context switch.
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(frame_sp: u64) -> u64 {
+    // #246 Fix D drain — see riscv64/trap.rs and aarch64/exception.rs.
+    // Mirrors x86_64/exception.rs:1438 so ON_CPU_RELEASING → ON_CPU_PENDING
+    // transitions complete on every trap entry.
+    crate::sched::scheduler::finalize_release_after_stack_switch();
+    crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     let frame = unsafe { &mut *(frame_sp as *mut TrapFrame) };
     let estat = frame.estat;
     let ecode = (estat >> 16) & 0x3F;

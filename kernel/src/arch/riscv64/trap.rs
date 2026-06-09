@@ -225,6 +225,16 @@ pub fn program_oneshot(deadline_ns: u64) {
 /// For other traps, handles and returns same SP.
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(frame_sp: u64) -> u64 {
+    // #246 Fix D drain — every trap entry must drain the per-CPU release
+    // slot so threads transitioned to ON_CPU_RELEASING by try_switch are
+    // CAS'd to ON_CPU_PENDING and become dispatchable on peer CPUs.
+    // Without this, blocked threads stay stuck at on_cpu=RELEASING forever
+    // and the SMP scheduler wedges (matches the aarch64 #246 surface).
+    // Mirror of x86_64/exception.rs:1438.
+    crate::sched::scheduler::finalize_release_after_stack_switch();
+    // Mirror the aarch64 PARK_WOKEN arbitration drain so wake_parked_thread
+    // deferred-local paths can complete on the parking hart.
+    crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     let frame = unsafe { &mut *(frame_sp as *mut TrapFrame) };
     let scause = frame.scause;
 

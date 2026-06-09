@@ -53,7 +53,7 @@ fn alloc_table() -> Option<usize> {
 ///
 /// Kernel identity mapping (via 2 MiB blocks):
 ///   0x0000_0000 - 0x3FFF_FFFF: Device memory (1 GiB, UART + GIC)
-///   0x4000_0000 - 0x4FFF_FFFF: RAM (256 MiB)
+///   0x4000_0000 - 0xBFFF_FFFF: RAM (2 GiB, covers QEMU virt -m 2G)
 ///
 /// User mappings are added afterwards via `map_user_pages`.
 pub fn setup_tables() -> Option<usize> {
@@ -72,18 +72,22 @@ pub fn setup_tables() -> Option<usize> {
         *l1_table = 0x0000_0000u64 | DEV_BLOCK;
     }
 
-    // L1[1]: L2 table for 0x4000_0000 - 0x7FFF_FFFF (RAM region).
-    let l2 = alloc_table()?;
-    let l2_table = l2 as *mut u64;
-    unsafe {
-        *l1_table.add(1) = (l2 as u64) | PT_VALID | PT_TABLE;
-    }
-
-    // Map 128 × 2 MiB blocks = 256 MiB of RAM starting at 0x4000_0000.
-    for i in 0..128 {
-        let phys = 0x4000_0000u64 + (i as u64) * 0x20_0000;
+    // L1[1..3]: identity-map 2 GiB of RAM (0x4000_0000 - 0xBFFF_FFFF)
+    // via per-1 GiB L2 tables of 2 MiB blocks.  Without this, allocator
+    // returns past 0x5000_0000 fault EL1 Data Abort in memset (#246
+    // residual surfaced after Phase 4 progress).
+    for gib in 0..2 {
+        let l2 = alloc_table()?;
+        let l2_table = l2 as *mut u64;
         unsafe {
-            *l2_table.add(i) = phys | KERN_BLOCK;
+            *l1_table.add(1 + gib) = (l2 as u64) | PT_VALID | PT_TABLE;
+        }
+        let l1_base = 0x4000_0000u64 + (gib as u64) * 0x4000_0000;
+        for i in 0..512 {
+            let phys = l1_base + (i as u64) * 0x20_0000;
+            unsafe {
+                *l2_table.add(i) = phys | KERN_BLOCK;
+            }
         }
     }
 

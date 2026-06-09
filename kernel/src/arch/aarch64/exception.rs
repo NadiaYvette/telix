@@ -41,6 +41,13 @@ extern "C" fn exception_unhandled(frame: &ExceptionFrame) {
 
 #[unsafe(no_mangle)]
 extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
+    // #246 Fix D drain — match x86_64/exception.rs:1438.  Without this,
+    // threads that try_switch transitioned to ON_CPU_RELEASING are never
+    // CAS'd to ON_CPU_PENDING, so peer CPUs that observe RELEASING fail
+    // their dispatch CAS forever and the thread is permanently undispatchable.
+    // Surface: SMP=4 aarch64 wedges with tids stuck at on_cpu=4294967293
+    // (ON_CPU_RELEASING sentinel) and console_srv spawn hangs after rootfs_srv.
+    crate::sched::scheduler::finalize_release_after_stack_switch();
     let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let ec = (frame.esr >> 26) & 0x3f;
     match ec {
@@ -152,6 +159,10 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
 /// If the scheduler decides to preempt, it returns a different thread's SP.
 #[unsafe(no_mangle)]
 extern "C" fn exception_irq_el1(frame_sp: u64) -> u64 {
+    // #246 Fix D drain — see exception_sync_el1.  Must run BEFORE
+    // clear_pending_switch so peer CPUs can dispatch released threads
+    // on the same tick we observe the wake.
+    crate::sched::scheduler::finalize_release_after_stack_switch();
     // PARK_WOKEN arbitration & per-thread stack_switch_pending clear.
     // Mirrors x86_64's exception handler.  Without this, a thread that
     // parked on an IPC call has stack_switch_pending stuck at true forever,
@@ -176,6 +187,10 @@ extern "C" fn exception_serror_el1(frame: &ExceptionFrame) {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
+    // #246 Fix D drain — see exception_sync_el1.  Must run BEFORE
+    // clear_pending_switch and syscall dispatch so released threads
+    // are visible to peer CPUs immediately.
+    crate::sched::scheduler::finalize_release_after_stack_switch();
     // See exception_irq_el1 — every exception entry needs to drain any
     // pending PARK_WOKEN arbitration so wake_parked_thread's deferred-local
     // path completes.  Must run before syscall dispatch since the syscall
@@ -270,6 +285,8 @@ fn handle_abort_el0(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn exception_irq_el0(frame_sp: u64) -> u64 {
+    // #246 Fix D drain — see exception_sync_el1.
+    crate::sched::scheduler::finalize_release_after_stack_switch();
     // See exception_irq_el1 — PARK_WOKEN arbitration on every IRQ entry.
     crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     crate::arch::aarch64::irq::handle_irq();

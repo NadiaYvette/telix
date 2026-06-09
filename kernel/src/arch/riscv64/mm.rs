@@ -71,6 +71,7 @@ fn alloc_table() -> Option<usize> {
 /// Layout:
 ///   root[0] = 1 GiB gigapage at 0x0000_0000 (devices: UART, PLIC, CLINT)
 ///   root[2] = 1 GiB gigapage at 0x8000_0000 (RAM)
+///   root[3] = 1 GiB gigapage at 0xC000_0000 (RAM second GiB; QEMU `-m 2G`)
 ///
 /// User mappings are added via `map_user_pages`.
 pub fn setup_tables() -> Option<usize> {
@@ -83,6 +84,11 @@ pub fn setup_tables() -> Option<usize> {
 
         // root[2]: RAM at 0x8000_0000 (1 GiB, RWX, no user).
         *root_table.add(2) = pte_leaf(0x8000_0000, KERN_GIGA);
+
+        // root[3]: RAM at 0xC000_0000 (additional 1 GiB) — without this
+        // pages allocated past the first GiB are inaccessible from the
+        // kernel and the phys allocator hands out unreachable pages.
+        *root_table.add(3) = pte_leaf(0xC000_0000, KERN_GIGA);
     }
 
     Some(root)
