@@ -151,47 +151,55 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 put_byte(buf, &mut k, b'\n');
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
-            // Find which thread (if any) owns the page containing frame_sp.
+            // Find ALL threads whose kstack window contains frame_sp's
+            // page.  If two or more come up, that's direct evidence of a
+            // VA-window or PA-window double-issue (Signature A of
+            // memory/project_aarch64_post_migration_signatures.md).
+            // Also print the offending thread (`tid`)'s own kstack_base
+            // alongside, so the reader can compare windows at a glance.
             let frame_page = (frame_sp as usize) & !(page_size - 1);
             {
-                let mut found = false;
+                use crate::arch::aarch64::serial::{
+                    fault_buf_for_current_cpu, handler_write_bytes, put_bytes, put_dec_u64,
+                    put_hex_u64,
+                };
+                let mut owner_count: u32 = 0;
                 crate::sched::scheduler::SCHED_THREAD_ART.for_each(|key, val| {
-                    if found {
-                        return;
-                    }
                     let t = unsafe { &*(val as *const crate::sched::thread::Thread) };
-                    // Range check: a thread's kstack spans `kstack_size`
-                    // (16 pages on aarch64 64K-page builds), not one page.
                     if t.stack_base != 0
                         && frame_page >= t.stack_base
                         && frame_page < t.stack_base + kstack_size
                     {
-                        use crate::arch::aarch64::serial::{
-                            fault_buf_for_current_cpu, handler_write_bytes, put_bytes,
-                            put_dec_u64, put_hex_u64,
-                        };
                         let buf = fault_buf_for_current_cpu();
                         let mut k = 0;
                         put_bytes(buf, &mut k, b"  frame_sp page ");
                         put_hex_u64(buf, &mut k, frame_page as u64);
-                        put_bytes(buf, &mut k, b" belongs to tid=");
+                        put_bytes(buf, &mut k, b" claimed by tid=");
                         put_dec_u64(buf, &mut k, key);
                         put_bytes(buf, &mut k, b" task=");
                         put_dec_u64(buf, &mut k, t.task_id as u64);
-                        put_bytes(buf, &mut k, b"\n");
+                        put_bytes(buf, &mut k, b" kstack=[");
+                        put_hex_u64(buf, &mut k, t.stack_base as u64);
+                        put_bytes(buf, &mut k, b"..");
+                        put_hex_u64(buf, &mut k, (t.stack_base + kstack_size) as u64);
+                        put_bytes(buf, &mut k, b")\n");
                         handler_write_bytes(&buf[..k.min(buf.len())]);
-                        found = true;
+                        owner_count += 1;
                     }
                 });
-                if !found {
-                    use crate::arch::aarch64::serial::{
-                        fault_buf_for_current_cpu, handler_write_bytes, put_bytes, put_hex_u64,
-                    };
+                if owner_count == 0 {
                     let buf = fault_buf_for_current_cpu();
                     let mut k = 0;
                     put_bytes(buf, &mut k, b"  frame_sp page ");
                     put_hex_u64(buf, &mut k, frame_page as u64);
                     put_bytes(buf, &mut k, b" NOT found in any thread's kstack!\n");
+                    handler_write_bytes(&buf[..k.min(buf.len())]);
+                } else if owner_count > 1 {
+                    let buf = fault_buf_for_current_cpu();
+                    let mut k = 0;
+                    put_bytes(buf, &mut k, b"  ALIAS: ");
+                    put_dec_u64(buf, &mut k, owner_count as u64);
+                    put_bytes(buf, &mut k, b" threads claim the same kstack page!\n");
                     handler_write_bytes(&buf[..k.min(buf.len())]);
                 }
             }
