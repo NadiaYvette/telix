@@ -3320,12 +3320,31 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let pa = slab::alloc(THREAD_SLAB_SIZE)?;
-        // #235 Phase 4f: PHYS_DIRECT_MAP kva storage on non-x86 (x86_64
-        // uses SLAB_THREAD_REGION VAs in alloc_thread_entry_x86 above).
+        // #260 Phase 4 port (aarch64/riscv64/loongarch64/mips64):
+        // each Thread gets its own dedicated 4 KiB phys page via
+        // `phys::alloc_page()` instead of sharing a 2048-byte slab
+        // chunk.  Closes the cross-Thread payload scribble surface
+        // — Thread structs no longer share underlying pages with
+        // each other OR with other slab consumers like ART Node4
+        // (64 B) or Node16 (256 B).  Underlying #228 PA double-
+        // issue is still possible but the surface narrows.
+        //
+        // Memory cost: ~3 KiB slop per Thread (page_size - sizeof
+        // Thread).  With a few hundred Threads this is well under
+        // a MiB.
+        //
+        // Compared to the x86_64 path: that one ALSO allocates the
+        // VA window with 12 KiB unmapped guards.  The VA-window
+        // guard requires per-arch page-table sub-allocator support
+        // which aarch64 doesn't have yet (kernel uses TTBR0
+        // identity map, no TTBR1 yet).  Adding the VA window is a
+        // follow-up; the dedicated-PA isolation alone is what
+        // closes the immediate corruption surface boot test-alias
+        // captured.
+        let pa = crate::mm::phys::alloc_page()?;
         let p = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut Thread;
         unsafe {
-            core::ptr::write_bytes(p as *mut u8, 0, THREAD_SLAB_SIZE);
+            core::ptr::write_bytes(p as *mut u8, 0, crate::mm::page::page_size());
             core::ptr::write(p, Thread::empty());
         }
         Some(p)
@@ -3334,20 +3353,13 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
 
 #[allow(dead_code)]
 fn free_thread_entry(p: *mut Thread) {
-    // Phase 4: Thread VAs in SLAB_THREAD_REGION are never freed; the
+    // Phase 4: Thread pages are never freed on either path; the
     // SCHED_THREAD_ART lookup reuses Dead slots (see alloc_thread_id).
-    // Non-x86 still routes through slab.
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        slab::free(
-            PhysAddr::new(crate::mm::page::kva_to_phys(p as usize)),
-            THREAD_SLAB_SIZE,
-        );
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let _ = p;
-    }
+    // The phys page leak is bounded by max-tid (the alloc_thread_id
+    // pool is finite), and Thread structs survive across spawn/exit
+    // cycles via slot reuse — so freeing the page would create a
+    // use-after-free for any in-flight observer.
+    let _ = p;
 }
 
 fn alloc_task_entry() -> Option<*mut Task> {
