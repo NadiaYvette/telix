@@ -843,10 +843,16 @@ pub fn personality_mmap_anon(target_port: u64, va_hint: u64, page_count: u64, pr
 
         let mmu_start = page_idx * mmu_count;
         let mmu_end = core::cmp::min(mmu_start + mmu_count, mmu_pages);
-        for mmu_idx in mmu_start..mmu_end {
-            let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
-            let mmu_pa = pa_usize + (mmu_idx - mmu_start) * MMUPAGE_SIZE;
-            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+        let alloc_va = va + mmu_start * MMUPAGE_SIZE;
+        let alloc_len = (mmu_end - mmu_start) * MMUPAGE_SIZE;
+        if let Err(e) =
+            crate::mm::hat::map_range(pt_root, alloc_va, pa_usize, alloc_len, pte_flags)
+        {
+            crate::println!(
+                "[mmap] map_range FAIL va={:#x} pa={:#x} len={:#x} err={:?}",
+                alloc_va, pa_usize, alloc_len, e
+            );
+            return u64::MAX;
         }
     }
 
@@ -986,10 +992,16 @@ pub fn personality_mmap_fixed(target_port: u64, va: u64, page_count: u64, prot: 
 
         let mmu_start = page_idx * mmu_count;
         let mmu_end = core::cmp::min(mmu_start + mmu_count, mmu_pages);
-        for mmu_idx in mmu_start..mmu_end {
-            let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
-            let mmu_pa = pa_usize + (mmu_idx - mmu_start) * MMUPAGE_SIZE;
-            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+        let alloc_va = va + mmu_start * MMUPAGE_SIZE;
+        let alloc_len = (mmu_end - mmu_start) * MMUPAGE_SIZE;
+        if let Err(e) =
+            crate::mm::hat::map_range(pt_root, alloc_va, pa_usize, alloc_len, pte_flags)
+        {
+            crate::println!(
+                "[mmap] map_range FAIL va={:#x} pa={:#x} len={:#x} err={:?}",
+                alloc_va, pa_usize, alloc_len, e
+            );
+            return u64::MAX;
         }
     }
 

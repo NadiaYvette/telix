@@ -3859,11 +3859,15 @@ fn do_spawn_heavy_work(
         let sw_z = crate::mm::fault::sw_zeroed_bit();
         let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
 
-        for mmu_idx in 0..mmu_count {
-            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
-            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
-
-            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+        let alloc_len = mmu_count * MMUPAGE_SIZE;
+        if let Err(e) =
+            crate::mm::hat::map_range(pt_root, page_va, pa_usize, alloc_len, pte_flags)
+        {
+            crate::println!(
+                "[spawn-heavy] FAIL step=user_stack_map_range task_id={} tid={} page_va={:#x} err={:?}",
+                task_id, thread_id, page_va, e
+            );
+            return None;
         }
     }
 
@@ -4823,10 +4827,15 @@ pub fn spawn_user_with_data(
                 }
             }
 
-            for mmu_idx in 0..mmu_count {
-                let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
-                let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
-                crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            let alloc_len = mmu_count * MMUPAGE_SIZE;
+            if let Err(e) =
+                crate::mm::hat::map_range(pt_root, page_va, pa_usize, alloc_len, pte_flags)
+            {
+                crate::println!(
+                    "[spawn-data] map_range FAIL page_va={:#x} pa={:#x} len={:#x} err={:?}",
+                    page_va, pa_usize, alloc_len, e
+                );
+                return None;
             }
         }
     }

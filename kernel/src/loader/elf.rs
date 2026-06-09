@@ -381,6 +381,9 @@ fn load_segment(
 
         // Copy file data for each MMU page in this allocation page.
         let mmu_count = ps / MMUPAGE_SIZE;
+        // First pass: file-data copy + POST-COPY csum (per-MMU-page logic).
+        // PTE install happens in a single all-or-nothing map_range call after
+        // the loop so a partial mapping can't leave the segment half-loaded.
         for mmu_idx in 0..mmu_count {
             let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
             let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
@@ -438,8 +441,22 @@ fn load_segment(
                 }
             }
 
-            // Install PTE with merged permissions (union of all overlapping segments).
-            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, effective_flags);
+        }
+
+        // Install PTEs for the entire alloc page as a single all-or-nothing
+        // map_range.  On partial failure (intermediate PT alloc OOM), the
+        // helper unmaps everything it installed in this call and returns
+        // MapError — we propagate as ElfError::MapFailed so the spawn aborts
+        // cleanly instead of leaving the binary half-mapped.
+        let alloc_len = mmu_count * MMUPAGE_SIZE;
+        if let Err(e) =
+            crate::mm::hat::map_range(pt_root, page_va, pa_usize, alloc_len, effective_flags)
+        {
+            crate::println!(
+                "[elf-load] map_range FAIL aspace={} page_va={:#x} pa={:#x} len={:#x} err={:?}",
+                aspace_id, page_va, pa_usize, alloc_len, e
+            );
+            return Err(ElfError::MapFailed);
         }
 
         // PTE installation with SW_ZEROED is the authority — no bitmap update needed.

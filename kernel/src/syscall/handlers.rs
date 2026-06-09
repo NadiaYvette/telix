@@ -1853,8 +1853,6 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     };
 
     for page_idx in 0..alloc_pages {
-        let page_va = va + page_idx * ps;
-
         let pa = match crate::mm::object::try_with_object(obj_id, |obj| {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
         }) {
@@ -1870,14 +1868,19 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
             core::ptr::write_bytes(crate::mm::page::phys_to_kva(pa_usize) as *mut u8, 0, ps);
         }
 
-        // Map each MMU page within this alloc page, but only up to mmu_pages total.
+        // Map this alloc page's MMU pages as one all-or-nothing range.
         let mmu_start = page_idx * mmu_count;
         let mmu_end = core::cmp::min(mmu_start + mmu_count, mmu_pages);
-        for mmu_idx in mmu_start..mmu_end {
-            let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
-            let mmu_pa = pa_usize + (mmu_idx - mmu_start) * MMUPAGE_SIZE;
-
-            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+        let alloc_va = va + mmu_start * MMUPAGE_SIZE;
+        let alloc_len = (mmu_end - mmu_start) * MMUPAGE_SIZE;
+        if let Err(e) =
+            crate::mm::hat::map_range(pt_root, alloc_va, pa_usize, alloc_len, pte_flags)
+        {
+            crate::println!(
+                "[mmap] map_range FAIL va={:#x} pa={:#x} len={:#x} err={:?}",
+                alloc_va, pa_usize, alloc_len, e
+            );
+            return u64::MAX;
         }
 
         // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
@@ -2855,12 +2858,9 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         let sw_z = crate::mm::fault::sw_zeroed_bit();
         let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
 
-        for mmu_idx in 0..mmu_count {
-            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
-            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
-
-            crate::mm::hat::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
-        }
+        let alloc_len = mmu_count * MMUPAGE_SIZE;
+        crate::mm::hat::map_range(new_pt_root, page_va, pa_usize, alloc_len, pte_flags)
+            .expect("execve: stack map_range");
 
         // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
     }
@@ -3338,12 +3338,21 @@ pub(crate) fn exec_for_task(
                             None => continue,
                         }
                     };
-                    for mi in 0..mmu_per_alloc {
-                        let mmu_idx = ap * mmu_per_alloc + mi;
-                        if mmu_idx >= TLS_PLACEHOLDER_PAGES { break; }
-                        let va = TLS_PLACEHOLDER_BASE + mmu_idx * MMUPAGE_SIZE;
-                        let mmu_pa = alloc_pa + mi * MMUPAGE_SIZE;
-                        crate::mm::hat::map_single_mmupage(new_pt_root, va, mmu_pa, pte_flags);
+                    let mmu_start = ap * mmu_per_alloc;
+                    let mmu_end = (mmu_start + mmu_per_alloc).min(TLS_PLACEHOLDER_PAGES);
+                    let alloc_va = TLS_PLACEHOLDER_BASE + mmu_start * MMUPAGE_SIZE;
+                    let alloc_len = (mmu_end - mmu_start) * MMUPAGE_SIZE;
+                    if let Err(e) = crate::mm::hat::map_range(
+                        new_pt_root, alloc_va, alloc_pa, alloc_len, pte_flags,
+                    ) {
+                        crate::println!(
+                            "[tls-placeholder] map_range FAIL va={:#x} pa={:#x} len={:#x} err={:?}",
+                            alloc_va, alloc_pa, alloc_len, e
+                        );
+                        // Best-effort path; leave partial setup and continue
+                        // (matches the pre-existing tolerance of the placeholder
+                        // build loop, which used `continue` on alloc failure).
+                        continue;
                     }
                 }
                 let tls_va = TLS_PLACEHOLDER_BASE + TLS_PLACEHOLDER_OFFSET;
@@ -3436,11 +3445,9 @@ pub(crate) fn exec_for_task(
         let sw_z = crate::mm::fault::sw_zeroed_bit();
         let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
 
-        for mmu_idx in 0..mmu_count {
-            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
-            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
-            crate::mm::hat::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
-        }
+        let alloc_len = mmu_count * MMUPAGE_SIZE;
+        crate::mm::hat::map_range(new_pt_root, page_va, pa_usize, alloc_len, pte_flags)
+            .expect("exec_for_task: stack map_range");
     }
 
     // Stack layout (growing downward from USER_STACK_TOP):
