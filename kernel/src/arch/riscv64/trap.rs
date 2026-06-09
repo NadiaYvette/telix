@@ -315,11 +315,28 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     frame_sp
                 }
                 crate::mm::fault::FaultResult::Failed => {
+                    // Re-read the live CSRs at failure time so we can tell:
+                    //   * frame.sepc == live sepc → straight user-mode fault
+                    //   * frame.sepc != live sepc → kernel-side syscall fault
+                    //     (nested trap; frame.sepc preserved from user entry,
+                    //     live sepc is the kernel handler's RIP at fault).
+                    // SPP bit (sstatus[8]): 0=fault came from U-mode, 1=S-mode.
+                    // See memory/project_riscv64_init_pf_residual.md for the
+                    // anomaly this probes.
+                    let live_sepc = read_sepc();
+                    let live_sstatus = read_sstatus();
+                    let frame_spp = (frame.sstatus >> 8) & 1;
+                    let live_spp = (live_sstatus >> 8) & 1;
                     crate::println!(
-                        "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x} — killing thread",
+                        "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x} \
+                         frame_spp={} live_sepc={:#x} live_spp={} \
+                         — killing thread",
                         scause,
                         frame.sepc,
-                        stval
+                        stval,
+                        frame_spp,
+                        live_sepc,
+                        live_spp,
                     );
                     crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
                 }
@@ -354,5 +371,22 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
 fn read_stval() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("csrr {}, stval", out(reg) val) };
+    val
+}
+
+/// Read the sepc CSR.  Used by failure-path probes to detect a
+/// mismatch between `frame.sepc` (saved at trap entry) and the
+/// live CSR value at the time the failure logs — distinguishes
+/// nested-trap state from a corrupted/stale frame.
+fn read_sepc() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("csrr {}, sepc", out(reg) val) };
+    val
+}
+
+/// Read the sstatus CSR (for live SPP at fault-handler entry).
+fn read_sstatus() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) val) };
     val
 }
