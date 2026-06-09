@@ -316,24 +316,51 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 let ra = frame.regs[0]; // x1
                 let sp = frame.regs[1]; // x2
                 let fp = frame.regs[7]; // x8 / s0
-                crate::println!(
-                    "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x} cpu={} tid={} spp={} sstatus={:#x} sp(frame)={:#x} \
-                     [#251 probe: entry_scause={:#x} frame.scause={:#x} live_scause={:#x} ra={:#x} sp={:#x} fp={:#x}]",
-                    scause,
-                    frame.sepc,
-                    stval,
-                    cpu,
-                    tid,
-                    spp,
-                    frame.sstatus,
-                    frame.regs[1],
-                    scause,
-                    frame_scause_reread,
-                    live_scause,
-                    ra,
-                    sp,
-                    fp,
-                );
+                // #253 anti-interleave: format the whole record into a
+                // stack buffer and emit atomically.  Multiple harts
+                // hitting the corruption family (#251 ⊂ #228) at the
+                // same instant would otherwise mash bytes through the
+                // shared 16550 + run core::fmt over a corrupted kstack
+                // (Surface B second-fault inside pad_integral).  See
+                // memory/project_riscv64_251_is_228_family.md.
+                {
+                    use crate::arch::riscv64::serial::{
+                        handler_write_bytes, put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                    };
+                    let mut buf = [0u8; 384];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"Kernel page fault: cause=");
+                    put_hex_u64(&mut buf, &mut k, scause);
+                    put_bytes(&mut buf, &mut k, b" sepc=");
+                    put_hex_u64(&mut buf, &mut k, frame.sepc);
+                    put_bytes(&mut buf, &mut k, b" stval=");
+                    put_hex_u64(&mut buf, &mut k, stval as u64);
+                    put_bytes(&mut buf, &mut k, b" cpu=");
+                    put_dec_u64(&mut buf, &mut k, cpu as u64);
+                    put_bytes(&mut buf, &mut k, b" tid=");
+                    put_dec_u64(&mut buf, &mut k, tid as u64);
+                    put_bytes(&mut buf, &mut k, b" spp=");
+                    put_dec_u64(&mut buf, &mut k, spp);
+                    put_bytes(&mut buf, &mut k, b" sstatus=");
+                    put_hex_u64(&mut buf, &mut k, frame.sstatus);
+                    put_bytes(&mut buf, &mut k, b" sp(frame)=");
+                    put_hex_u64(&mut buf, &mut k, frame.regs[1]);
+                    put_bytes(&mut buf, &mut k, b" [#251 probe: entry_scause=");
+                    put_hex_u64(&mut buf, &mut k, scause);
+                    put_bytes(&mut buf, &mut k, b" frame.scause=");
+                    put_hex_u64(&mut buf, &mut k, frame_scause_reread);
+                    put_bytes(&mut buf, &mut k, b" live_scause=");
+                    put_hex_u64(&mut buf, &mut k, live_scause);
+                    put_bytes(&mut buf, &mut k, b" ra=");
+                    put_hex_u64(&mut buf, &mut k, ra);
+                    put_bytes(&mut buf, &mut k, b" sp=");
+                    put_hex_u64(&mut buf, &mut k, sp);
+                    put_bytes(&mut buf, &mut k, b" fp=");
+                    put_hex_u64(&mut buf, &mut k, fp);
+                    put_byte(&mut buf, &mut k, b']');
+                    put_byte(&mut buf, &mut k, b'\n');
+                    handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
                 loop {
                     core::hint::spin_loop();
                 }
@@ -362,17 +389,28 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     let live_sstatus = read_sstatus();
                     let frame_spp = (frame.sstatus >> 8) & 1;
                     let live_spp = (live_sstatus >> 8) & 1;
-                    crate::println!(
-                        "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x} \
-                         frame_spp={} live_sepc={:#x} live_spp={} \
-                         — killing thread",
-                        scause,
-                        frame.sepc,
-                        stval,
-                        frame_spp,
-                        live_sepc,
-                        live_spp,
-                    );
+                    // #253 anti-interleave.
+                    {
+                        use crate::arch::riscv64::serial::{
+                            handler_write_bytes, put_bytes, put_dec_u64, put_hex_u64,
+                        };
+                        let mut buf = [0u8; 256];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"Unhandled page fault: cause=");
+                        put_hex_u64(&mut buf, &mut k, scause);
+                        put_bytes(&mut buf, &mut k, b" sepc=");
+                        put_hex_u64(&mut buf, &mut k, frame.sepc);
+                        put_bytes(&mut buf, &mut k, b" stval=");
+                        put_hex_u64(&mut buf, &mut k, stval as u64);
+                        put_bytes(&mut buf, &mut k, b" frame_spp=");
+                        put_dec_u64(&mut buf, &mut k, frame_spp);
+                        put_bytes(&mut buf, &mut k, b" live_sepc=");
+                        put_hex_u64(&mut buf, &mut k, live_sepc);
+                        put_bytes(&mut buf, &mut k, b" live_spp=");
+                        put_dec_u64(&mut buf, &mut k, live_spp);
+                        put_bytes(&mut buf, &mut k, b" \xe2\x80\x94 killing thread\n");
+                        handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
                     crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
                 }
                 _ => frame_sp,
@@ -380,19 +418,28 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
         }
 
         _ => {
+            // #253 anti-interleave: stack-buffer + handler_write_bytes.
+            use crate::arch::riscv64::serial::{
+                handler_write_bytes, put_bytes, put_hex_u64,
+            };
+            let mut buf = [0u8; 192];
+            let mut k = 0;
             if scause & SCAUSE_INTERRUPT_BIT != 0 {
-                crate::println!(
-                    "Unhandled S-mode interrupt: cause={:#x} sepc={:#x}",
-                    scause & !SCAUSE_INTERRUPT_BIT,
-                    frame.sepc
-                );
+                put_bytes(&mut buf, &mut k, b"Unhandled S-mode interrupt: cause=");
+                put_hex_u64(&mut buf, &mut k, scause & !SCAUSE_INTERRUPT_BIT);
+                put_bytes(&mut buf, &mut k, b" sepc=");
+                put_hex_u64(&mut buf, &mut k, frame.sepc);
+                put_bytes(&mut buf, &mut k, b"\n");
+                handler_write_bytes(&buf[..k.min(buf.len())]);
             } else {
-                crate::println!(
-                    "Unhandled S-mode exception: cause={:#x} sepc={:#x} stval={:#x}",
-                    scause,
-                    frame.sepc,
-                    read_stval()
-                );
+                put_bytes(&mut buf, &mut k, b"Unhandled S-mode exception: cause=");
+                put_hex_u64(&mut buf, &mut k, scause);
+                put_bytes(&mut buf, &mut k, b" sepc=");
+                put_hex_u64(&mut buf, &mut k, frame.sepc);
+                put_bytes(&mut buf, &mut k, b" stval=");
+                put_hex_u64(&mut buf, &mut k, read_stval() as u64);
+                put_bytes(&mut buf, &mut k, b"\n");
+                handler_write_bytes(&buf[..k.min(buf.len())]);
                 loop {
                     core::hint::spin_loop();
                 }
