@@ -6272,6 +6272,39 @@ fn try_switch(current_sp: u64) -> u64 {
             write_saved_sp(prev_t, current_sp);
             record_saved_sp_write(prev_id, current_sp, 4); // try_switch
             prev_t.saved_sp_source = 1; // try_switch
+        } else if prev_id != idle_id_for_load {
+            // #250 cross-CPU active-while-deferred-free probe.  When the
+            // validator bails on prev_id (stack_base=0, recycled slot,
+            // sp out of range), check whether any PEER CPU still has
+            // current_thread == prev_id.  If so, that peer was about to
+            // dispatch a thread we already think is dead — proves the
+            // deferred-free + concurrent dispatch race that
+            // memory/project_riscv64_stack_base_writer_audit.md hypothesizes.
+            // Rate-limited; cheap (NCPUS atomic loads).  See
+            // memory/project_riscv64_corruption_family_observed.md.
+            static PEER_HIT_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n_cpus = smp::MAX_CPUS as u32;
+            let mut peer_with_prev: i32 = -1;
+            for c in 0..n_cpus {
+                if c == cpu {
+                    continue;
+                }
+                let peer_cur = smp::get(c).current_thread.load(Ordering::Relaxed);
+                if peer_cur as usize == prev_id as usize {
+                    peer_with_prev = c as i32;
+                    break;
+                }
+            }
+            if peer_with_prev >= 0 {
+                let nn = PEER_HIT_LOG.fetch_add(1, Ordering::Relaxed);
+                if nn < 32 {
+                    crate::println!(
+                        "TS-SAVE-PEER-ACTIVE: cpu={} prev={} peer_cpu={} sp={:#x} n={}",
+                        cpu, prev_id, peer_with_prev, current_sp, nn
+                    );
+                }
+            }
         }
         let mut prev_prio = prev_t.effective_priority;
         prev_task = prev_t.task_id;
