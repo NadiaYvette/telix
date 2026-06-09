@@ -496,9 +496,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     let max_sectors = disk_capacity / SECTOR_SIZE as u64;
 
-    syscall::debug_puts(b"  [cache_srv] connected to blk_srv, capacity=");
-    print_num(disk_capacity);
-    syscall::debug_puts(b" bytes\n");
+    if blk_port != u64::MAX {
+        syscall::debug_puts(b"  [cache_srv] connected to blk_srv, capacity=");
+        print_num(disk_capacity);
+        syscall::debug_puts(b" bytes\n");
+    }
 
     // Allocate scratch page for blk_srv grants.
     let scratch_va = match syscall::mmap_anon(0, 1, 1) {
@@ -523,7 +525,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // every IO_READ/IO_WRITE can skip the per-request grant_pages/revoke pair
     // (two extra syscalls and TLB shootdowns per disk sector).  See
     // ext_srv's matching change (commit 5e37e0c).
-    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, BLK_GRANT_VA, 1, false) {
+    //
+    // Skip when blk_aspace is 0 — that's the sentinel for "no backing"
+    // (blk_srv lookup timed out or IO_CONNECT failed).  grant_pages with
+    // aspace=0 is guaranteed to fail and the spin-wedge on the FAILED log
+    // path used to silently kill cache_srv even when it was supposed to
+    // serve from the in-memory cache only.  See
+    // memory/project_aarch64_pci_srv_silent_skip.md "Cascade" section for
+    // how this fired on aarch64.
+    if blk.blk_aspace != 0
+        && !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, BLK_GRANT_VA, 1, false)
+    {
         syscall::debug_puts(b"  [cache_srv] permanent grant FAILED\n");
         loop {
             core::hint::spin_loop();
