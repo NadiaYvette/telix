@@ -83,33 +83,49 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
         _ => {
             let tid = crate::sched::current_thread_id();
             let kstack_base = crate::sched::scheduler::thread_ref(tid).stack_base;
-            crate::println!(
-                "EL1 Sync: EC={:#x} ESR={:#x} ELR={:#x} SP_EL0={:#x}",
-                ec,
-                frame.esr,
-                frame.elr,
-                frame.sp
-            );
-            crate::println!(
-                "  x30(LR)={:#x} x29(FP)={:#x} x0={:#x}",
-                frame.regs[30],
-                frame.regs[29],
-                frame.regs[0]
-            );
-            crate::println!(
-                "  tid={} kstack_base={:#x} frame_sp={:#x} kstack_end={:#x}",
-                tid,
-                kstack_base,
-                frame_sp,
-                kstack_base + crate::mm::page::page_size()
-            );
-            // Check if frame_sp is within the thread's kstack.
+            // #252 anti-interleave: format the whole header into a stack
+            // buffer and emit atomically.  Multiple harts hitting the
+            // wild-RIP family (#228) at the same instant would otherwise
+            // mash their bytes character-by-character through the shared
+            // PL011, masking the actual ESR/ELR/SP/LR (see boot
+            // aa64-post-riscv-work.log + memory/project_aarch64_post_phase5_wild_rip.md).
             let page_size = crate::mm::page::page_size();
-            if kstack_base != 0 {
-                let kstack_end = kstack_base + page_size;
-                if (frame_sp as usize) < kstack_base || (frame_sp as usize) >= kstack_end {
-                    crate::println!("  BUG: frame_sp OUTSIDE kstack bounds!");
+            {
+                use crate::arch::aarch64::serial::{
+                    handler_write_bytes, put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                };
+                let mut buf = [0u8; 384];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"EL1 Sync: EC=");
+                put_hex_u64(&mut buf, &mut k, ec);
+                put_bytes(&mut buf, &mut k, b" ESR=");
+                put_hex_u64(&mut buf, &mut k, frame.esr);
+                put_bytes(&mut buf, &mut k, b" ELR=");
+                put_hex_u64(&mut buf, &mut k, frame.elr);
+                put_bytes(&mut buf, &mut k, b" SP_EL0=");
+                put_hex_u64(&mut buf, &mut k, frame.sp);
+                put_bytes(&mut buf, &mut k, b"\n  x30(LR)=");
+                put_hex_u64(&mut buf, &mut k, frame.regs[30]);
+                put_bytes(&mut buf, &mut k, b" x29(FP)=");
+                put_hex_u64(&mut buf, &mut k, frame.regs[29]);
+                put_bytes(&mut buf, &mut k, b" x0=");
+                put_hex_u64(&mut buf, &mut k, frame.regs[0]);
+                put_bytes(&mut buf, &mut k, b"\n  tid=");
+                put_dec_u64(&mut buf, &mut k, tid as u64);
+                put_bytes(&mut buf, &mut k, b" kstack_base=");
+                put_hex_u64(&mut buf, &mut k, kstack_base as u64);
+                put_bytes(&mut buf, &mut k, b" frame_sp=");
+                put_hex_u64(&mut buf, &mut k, frame_sp);
+                put_bytes(&mut buf, &mut k, b" kstack_end=");
+                put_hex_u64(&mut buf, &mut k, (kstack_base + page_size) as u64);
+                if kstack_base != 0 {
+                    let kstack_end = kstack_base + page_size;
+                    if (frame_sp as usize) < kstack_base || (frame_sp as usize) >= kstack_end {
+                        put_bytes(&mut buf, &mut k, b"\n  BUG: frame_sp OUTSIDE kstack bounds!");
+                    }
                 }
+                put_byte(&mut buf, &mut k, b'\n');
+                handler_write_bytes(&buf[..k.min(buf.len())]);
             }
             // Find which thread (if any) owns the page containing frame_sp.
             let frame_page = (frame_sp as usize) & !(page_size - 1);
