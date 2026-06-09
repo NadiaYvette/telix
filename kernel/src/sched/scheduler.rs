@@ -5552,6 +5552,19 @@ pub fn tick(current_sp: u64) -> u64 {
                             b0, b1, b2, b3, b4, b5, b6,
                             tick_max_gap_us, stale_retarget,
                             steal_us, crate::arch::hypervisor::kind());
+                        // #173 Phase 5: gate-split rescue fires + claim-helper
+                        // counters.  Tracked across stress boots to decide
+                        // whether the new dispatch helper is closing real
+                        // bug-class fires.  GATE_ON ≪ GATE_OFF under matched
+                        // stress → helper does measurable work.
+                        crate::println!(
+                            "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={}",
+                            if DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed) { "ON" } else { "OFF" },
+                            RESCUE_STUCK_PENDING_FIRES_GATE_ON.load(Ordering::Relaxed),
+                            RESCUE_STUCK_PENDING_FIRES_GATE_OFF.load(Ordering::Relaxed),
+                            DISPATCH_CLAIM_FAIL.load(Ordering::Relaxed),
+                            DISPATCH_CLAIM_SELF_PICK.load(Ordering::Relaxed),
+                        );
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
                         for c in 0..ncpus {
@@ -5810,6 +5823,19 @@ pub fn tick(current_sp: u64) -> u64 {
                         frt, cfb, sar, isr, apf, hpd, hps,
                     );
                 }
+                // #173 Phase 5: gate-split rescue + claim-helper counters.
+                // Emit unconditionally so A/B comparison runs (gate OFF vs ON)
+                // both produce a baseline trail for the same time interval.
+                let gate_on = DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed);
+                let stuck_on = RESCUE_STUCK_PENDING_FIRES_GATE_ON.load(Ordering::Relaxed);
+                let stuck_off = RESCUE_STUCK_PENDING_FIRES_GATE_OFF.load(Ordering::Relaxed);
+                let claim_fail = DISPATCH_CLAIM_FAIL.load(Ordering::Relaxed);
+                let claim_self_pick = DISPATCH_CLAIM_SELF_PICK.load(Ordering::Relaxed);
+                crate::println!(
+                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={}",
+                    if gate_on { "ON" } else { "OFF" },
+                    stuck_on, stuck_off, claim_fail, claim_self_pick,
+                );
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
             }
         }
@@ -10549,9 +10575,23 @@ fn call_reply_timeout_sweep() {
                 let rescue_pending = RESCUE_PENDING.load(Ordering::Relaxed);
                 let pending_low_fires = PENDING_LOW_FIRES.load(Ordering::Relaxed);
                 let self_pick_count = SELF_PICK_COUNT.load(Ordering::Relaxed);
+                // #173 Phase 5: gate-split rescue fires + claim-helper counters.
+                // GATE_ON ≪ GATE_OFF under matched stress → helper does real work.
+                // GATE_ON ≈ GATE_OFF → Type A was a minor contributor; helper still
+                // closes the structural bug but isn't a measurable perf win.
+                let gate_state = DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed);
+                let stuck_gate_on = RESCUE_STUCK_PENDING_FIRES_GATE_ON.load(Ordering::Relaxed);
+                let stuck_gate_off = RESCUE_STUCK_PENDING_FIRES_GATE_OFF.load(Ordering::Relaxed);
+                let claim_fail = DISPATCH_CLAIM_FAIL.load(Ordering::Relaxed);
+                let claim_self_pick = DISPATCH_CLAIM_SELF_PICK.load(Ordering::Relaxed);
                 crate::println!(
                     "  CPU-DIAG: rescue_stuck_pending_fires={} rescue_pending_obs={} pending_low_fires={} self_pick={}",
                     stuck_pending_fires, rescue_pending, pending_low_fires, self_pick_count
+                );
+                crate::println!(
+                    "  DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={}",
+                    if gate_state { "ON" } else { "OFF" },
+                    stuck_gate_on, stuck_gate_off, claim_fail, claim_self_pick
                 );
                 for c in 0..ncpus {
                     let pcpu = crate::sched::smp::get(c as u32);
