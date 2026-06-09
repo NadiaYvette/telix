@@ -47,6 +47,35 @@ _start:
 // authoritative core identity — QEMU may not preserve the original a0
 // across the lock branch on every release.
 .secondary_spin:
+    // #257 (partial): configure DMW0/DMW1 so post-wake APs can access
+    // high-half VAs coherently with the BSP.  Currently DEAD CODE on
+    // QEMU virt because APs never reach here — see big comment below.
+    //
+    // KNOWN BUG: QEMU's loongarch64 virt machine does NOT start APs at
+    // _start.  APs are halted at reset and require the LoongArch
+    // mailbox+IPI wake protocol to bring online:
+    //   1. BSP writes (entry_pc, sp, ...) to remote AP's MBUF
+    //      via IOCSR_MBUF*_WR_OTHER (target_cpu encoded in payload).
+    //   2. BSP sends IPI to remote AP via IOCSR_IPI_SEND.
+    //   3. AP, in halt state, wakes and a QEMU-provided stub reads its
+    //      MBUF then jumps to the entry_pc.
+    //
+    // start_secondary_cpus() in smp.rs currently writes
+    // _ap_entry_slot and sends IPI, but the APs aren't polling
+    // _ap_entry_slot — they're waiting on MBUF.  Result: SMP startup
+    // timeout, only BSP runs.  Confirmed empirically by an 'S' marker
+    // at the top of _start showing only 1 core enters.
+    //
+    // The DMW config below is correct preparation; when the mailbox
+    // wake-protocol is implemented in smp.rs, APs will be released
+    // into a fresh entry point that should jump into something like
+    // this stub.  Until then, this code is never reached.
+    li.d      $t0, 0x9000000000000011  // VSEG=0x9, MAT=cached, PLV0
+    csrwr     $t0, 0x180          // CSR.DMW0
+    li.d      $t0, 0x8000000000000001  // VSEG=0x8, MAT=uncached, PLV0
+    csrwr     $t0, 0x181          // CSR.DMW1
+    dbar      0
+
     csrrd     $t0, 0x20           // CSR.CPUID
     la.pcrel  $t1, _ap_entry_slot
     slli.d    $t2, $t0, 4         // core_id * 16 (slot stride)
