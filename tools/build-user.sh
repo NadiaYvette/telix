@@ -1,12 +1,19 @@
 #!/bin/bash
 # Build userspace ELF binaries for Telix and pack them into initramfs.
-# Usage: tools/build-user.sh [aarch64|riscv64|x86_64]
+# Usage: tools/build-user.sh [aarch64|riscv64|x86_64|loongarch64|mips64]
+#
+# #259: per-arch initramfs trees.  Each arch has its own
+# `initramfs-$ARCH/` directory so switching arches does not contaminate
+# the others (previously a shared `initramfs/` left x86_64 host glibc
+# .so files behind that broke aarch64 boots with BadMachine — see
+# memory/feedback_initramfs_arch_contamination.md).
 set -e
 
 ARCH="${1:-aarch64}"
 ROOTDIR="$(cd "$(dirname "$0")/.." && pwd)"
 USERLIB="$ROOTDIR/userlib"
-INITRAMFS_DIR="$ROOTDIR/initramfs"
+INITRAMFS_DIR="$ROOTDIR/initramfs-$ARCH"
+mkdir -p "$INITRAMFS_DIR"
 RUSTC="${RUSTC:-/home/nyc/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc}"
 CARGO="${CARGO:-/home/nyc/.cargo/bin/cargo}"
 
@@ -130,7 +137,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     if gcc -pie -fPIE -O2 -fno-stack-protector -s \
             -o "$BINDIR/glibc_dyn_hello" "$ROOTDIR/tools/glibc_dyn_hello.c" 2>&1; then
         echo "  glibc_dyn_hello: $(wc -c < "$BINDIR/glibc_dyn_hello") bytes"
-        cp "$BINDIR/glibc_dyn_hello" "$ROOTDIR/initramfs/glibc_dyn_hello"
+        cp "$BINDIR/glibc_dyn_hello" "$INITRAMFS_DIR/glibc_dyn_hello"
     else
         echo "  WARNING: glibc_dyn_hello build failed"
     fi
@@ -143,7 +150,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
             -o "$BINDIR/glibc_pthread_hello" "$ROOTDIR/tools/glibc_pthread_hello.c" \
             -pthread 2>&1; then
         echo "  glibc_pthread_hello: $(wc -c < "$BINDIR/glibc_pthread_hello") bytes"
-        cp "$BINDIR/glibc_pthread_hello" "$ROOTDIR/initramfs/glibc_pthread_hello"
+        cp "$BINDIR/glibc_pthread_hello" "$INITRAMFS_DIR/glibc_pthread_hello"
     else
         echo "  WARNING: glibc_pthread_hello build failed"
     fi
@@ -154,7 +161,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     if gcc -static-pie -fPIE -O2 -fno-stack-protector -s \
             -o "$BINDIR/clone3_test" "$ROOTDIR/tools/clone3_test.c" 2>&1; then
         echo "  clone3_test: $(wc -c < "$BINDIR/clone3_test") bytes"
-        cp "$BINDIR/clone3_test" "$ROOTDIR/initramfs/clone3_test"
+        cp "$BINDIR/clone3_test" "$INITRAMFS_DIR/clone3_test"
     else
         echo "  WARNING: clone3_test build failed"
     fi
@@ -165,7 +172,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     if gcc -static-pie -fPIE -O2 -fno-stack-protector -s \
             -o "$BINDIR/scm_rights_test" "$ROOTDIR/tools/scm_rights_test.c" 2>&1; then
         echo "  scm_rights_test: $(wc -c < "$BINDIR/scm_rights_test") bytes"
-        cp "$BINDIR/scm_rights_test" "$ROOTDIR/initramfs/scm_rights_test"
+        cp "$BINDIR/scm_rights_test" "$INITRAMFS_DIR/scm_rights_test"
     else
         echo "  WARNING: scm_rights_test build failed"
     fi
@@ -184,7 +191,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     # libxcvt.so.0 (Fedora's copy, dropped into initramfs/lib64/).  Headers
     # are vendored in tools/xport/include/ since libxcvt-devel isn't
     # necessarily installed on the build host.
-    if [ -f "$ROOTDIR/initramfs/lib64/libxcvt.so.0" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libxcvt.so.0" ]; then
         echo "Building libxcvt_dyn_test (Tier-0 Xwayland)..."
         # Pass -lc explicitly BEFORE -l:libxcvt.so.0 so the resulting
         # binary's DT_NEEDED list has libc.so.6 first.  glibc's ld.so
@@ -198,7 +205,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
                 -I"$ROOTDIR/tools/xport/include" \
                 -o "$BINDIR/libxcvt_dyn_test" \
                 "$ROOTDIR/tools/libxcvt_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libxcvt.so.0 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -210,12 +217,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     # Tier-0 round-out: libdrm + libxshmfence dyn-link smoke tests, same
     # pattern as libxcvt_dyn_test.  Inlined struct decls in the test
     # sources avoid a libdrm-devel / libxshmfence-devel build-host dep.
-    if [ -f "$ROOTDIR/initramfs/lib64/libdrm.so.2" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libdrm.so.2" ]; then
         echo "Building libdrm_dyn_test (Tier-0 Xwayland)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libdrm_dyn_test" \
                 "$ROOTDIR/tools/libdrm_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libdrm.so.2 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -224,12 +231,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
             echo "  WARNING: libdrm_dyn_test build failed"
         fi
     fi
-    if [ -f "$ROOTDIR/initramfs/lib64/libxshmfence.so.1" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libxshmfence.so.1" ]; then
         echo "Building libxshmfence_dyn_test (Tier-0 Xwayland)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libxshmfence_dyn_test" \
                 "$ROOTDIR/tools/libxshmfence_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libxshmfence.so.1 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -240,12 +247,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     fi
     # Tier-1 Xwayland porting: libXau dyn-link smoke (cookie-auth lib,
     # 19 KiB on Fedora 43).
-    if [ -f "$ROOTDIR/initramfs/lib64/libXau.so.6" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libXau.so.6" ]; then
         echo "Building libXau_dyn_test (Tier-1 Xwayland)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libXau_dyn_test" \
                 "$ROOTDIR/tools/libXau_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libXau.so.6 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -254,12 +261,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
             echo "  WARNING: libXau_dyn_test build failed"
         fi
     fi
-    if [ -f "$ROOTDIR/initramfs/lib64/libXdmcp.so.6" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libXdmcp.so.6" ]; then
         echo "Building libXdmcp_dyn_test (Tier-1 Xwayland)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libXdmcp_dyn_test" \
                 "$ROOTDIR/tools/libXdmcp_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libXdmcp.so.6 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -268,12 +275,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
             echo "  WARNING: libXdmcp_dyn_test build failed"
         fi
     fi
-    if [ -f "$ROOTDIR/initramfs/lib64/libpixman-1.so.0" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libpixman-1.so.0" ]; then
         echo "Building libpixman_dyn_test (Tier-1 Xwayland)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libpixman_dyn_test" \
                 "$ROOTDIR/tools/libpixman_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libpixman-1.so.0 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -285,12 +292,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     # Tier-2 Xwayland porting: libwayland-client dyn-link smoke.  Pulls
     # in libffi.so.8 (DT_NEEDED) so ld.so exercises a 3-level dep tree:
     # binary → libwayland-client → libffi → libc.
-    if [ -f "$ROOTDIR/initramfs/lib64/libwayland-client.so.0" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libwayland-client.so.0" ]; then
         echo "Building libwayland_dyn_test (Tier-2 Xwayland)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libwayland_dyn_test" \
                 "$ROOTDIR/tools/libwayland_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libwayland-client.so.0 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -302,12 +309,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     # Tier-3 Xwayland porting: libX11 dyn-link smoke.  Pulls libxcb.so.1
     # (DT_NEEDED) which itself pulls libXau — 4-level dep tree:
     # binary → libX11 → libxcb → libXau → libc.
-    if [ -f "$ROOTDIR/initramfs/lib64/libX11.so.6" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libX11.so.6" ]; then
         echo "Building libX11_dyn_test (Tier-3 Xwayland)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libX11_dyn_test" \
                 "$ROOTDIR/tools/libX11_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc -Wl,--as-needed \
                 -l:libX11.so.6 \
                 -Wl,-rpath,/lib64 2>&1; then
@@ -319,12 +326,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     # Tier-5 batch smoke: libepoxy + openssl libs + libtirpc.  These
     # are listed as "try --disable first" in the porting plan; we
     # smoke them so the option is on the table.
-    if [ -f "$ROOTDIR/initramfs/lib64/libepoxy.so.0" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libepoxy.so.0" ]; then
         echo "Building libssl_dyn_test (Tier-5 batch)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libssl_dyn_test" \
                 "$ROOTDIR/tools/libssl_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc \
                 -l:libepoxy.so.0 \
                 -l:libssl.so.3 \
@@ -338,12 +345,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
         fi
     fi
     # Tier-4 batch smoke: combined test linking the 3 font libs.
-    if [ -f "$ROOTDIR/initramfs/lib64/libfreetype.so.6" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libfreetype.so.6" ]; then
         echo "Building libfont_dyn_test (Tier-4 batch)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libfont_dyn_test" \
                 "$ROOTDIR/tools/libfont_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc \
                 -l:libfreetype.so.6 \
                 -l:libfontenc.so.1 \
@@ -357,12 +364,12 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     fi
     # Tier-3 batch smoke: combined test linking all 10 X11 extension
     # libs in one binary.  Cheaper than 10 separate Step Hx phases.
-    if [ -f "$ROOTDIR/initramfs/lib64/libXext.so.6" ]; then
+    if [ -f "$INITRAMFS_DIR/lib64/libXext.so.6" ]; then
         echo "Building libX11ext_dyn_test (Tier-3 batch)..."
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -o "$BINDIR/libX11ext_dyn_test" \
                 "$ROOTDIR/tools/libX11ext_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" \
+                -L"$INITRAMFS_DIR/lib64" \
                 -Wl,--no-as-needed -lc \
                 -l:libXext.so.6 \
                 -l:libXfixes.so.3 \
@@ -425,6 +432,6 @@ echo "Writing GPT partition table..."
 
 # Rebuild the CPIO archive.
 echo "Packing initramfs..."
-"$ROOTDIR/tools/make-initramfs.sh"
+"$ROOTDIR/tools/make-initramfs.sh" "$ARCH"
 
 echo "Done! User binaries packed into initramfs."
