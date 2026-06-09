@@ -236,7 +236,13 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
     // deferred-local paths can complete on the parking hart.
     crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     let frame = unsafe { &mut *(frame_sp as *mut TrapFrame) };
-    let scause = frame.scause;
+    // #251 scause-spill probe: capture scause once at entry; we re-read
+    // it at the "Kernel page fault" print site and compare the three
+    // values (entry-local, frame.scause, live sscause CSR).  If any of
+    // them disagree we've localised which storage got clobbered.
+    // `black_box` discourages the optimiser from spilling+reloading the
+    // local around inner calls, so the entry value sticks.
+    let scause = core::hint::black_box(frame.scause);
 
     match scause {
         SCAUSE_S_TIMER_IRQ => {
@@ -288,8 +294,18 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 let cpu = crate::sched::smp::cpu_id();
                 let tid = crate::sched::current_thread_id();
                 let spp = (frame.sstatus >> 8) & 1;
+                // #251 scause-spill probe: log the entry-captured `scause`
+                // alongside `frame.scause` (re-read from kstack) and live
+                // sscause CSR.  In the bug we're chasing, the path that
+                // reaches this log requires scause ∈ {12,13,15}, but the
+                // printed value has been observed as 0 — implying either
+                // the spilled local, the frame slot, or the CSR was
+                // clobbered between the match arm and this print.
+                let live_scause = read_scause();
+                let frame_scause_reread = frame.scause;
                 crate::println!(
-                    "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x} cpu={} tid={} spp={} sstatus={:#x} sp(frame)={:#x}",
+                    "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x} cpu={} tid={} spp={} sstatus={:#x} sp(frame)={:#x} \
+                     [#251 probe: entry_scause={:#x} frame.scause={:#x} live_scause={:#x}]",
                     scause,
                     frame.sepc,
                     stval,
@@ -297,7 +313,10 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     tid,
                     spp,
                     frame.sstatus,
-                    frame.regs[1]
+                    frame.regs[1],
+                    scause,
+                    frame_scause_reread,
+                    live_scause,
                 );
                 loop {
                     core::hint::spin_loop();
@@ -388,5 +407,13 @@ fn read_sepc() -> u64 {
 fn read_sstatus() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) val) };
+    val
+}
+
+/// Read the scause CSR — used by #251 to compare against frame.scause +
+/// the locally captured `scause` variable at the println site.
+fn read_scause() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("csrr {}, scause", out(reg) val) };
     val
 }
