@@ -72,10 +72,21 @@ pub fn kmain() -> ! {
     // Physical memory allocator.
     // Start managed RAM at kernel_end so the allocator never touches
     // firmware (OpenSBI) or kernel image pages — its bitmap metadata
-    // is written into pages within the managed range, which must be free.
-    let (_ram_start, ram_end) = arch::platform::ram_range();
+    // is written into pages within the managed range, which must be
+    // free.  When the kernel image lives OUTSIDE the chosen ram_range
+    // (e.g., loongarch64 picks the larger high-memory region; the
+    // kernel sits in a separate low-memory region), start at the
+    // region base and don't bother reserving kernel pages — they're
+    // not in the managed window.
+    let (ram_start, ram_end) = arch::platform::ram_range();
     let kernel_end = arch::platform::kernel_end_addr();
-    mm::phys::init(kernel_end, ram_end, kernel_end, kernel_end);
+    let (init_start, kstart, kend) =
+        if kernel_end >= ram_start && kernel_end < ram_end {
+            (kernel_end, kernel_end, kernel_end)
+        } else {
+            (ram_start, 0, 0)
+        };
+    mm::phys::init(init_start, ram_end, kstart, kend);
 
     // Allocate dynamic per-CPU storage now that phys is live. Currently a
     // no-op; subsequent commits in the runtime-nr_cpus series migrate

@@ -22,8 +22,26 @@ pub fn parse_firmware() {
 }
 
 /// RAM range for the physical allocator.
+///
+/// QEMU loongarch64 virt splits RAM into a low 256-MiB window at PA 0
+/// and a high window starting at PA 0x8000_0000 sized to fill `-m`.
+/// `phys::init` only manages a single contiguous range, so we pick the
+/// LARGEST region.  When `-m 2G` is set, the high region is ~1.75 GiB
+/// — much larger than the 256-MiB low region — and `main.rs` is
+/// responsible for not trying to reserve the kernel image inside the
+/// high region (the kernel sits in the low region).
 pub fn ram_range() -> (usize, usize) {
-    // QEMU virt: 256 MiB starting at 0x0
+    let regions = crate::firmware::mem_regions();
+    if !regions.is_empty() {
+        let mut best = &regions[0];
+        for r in &regions[1..] {
+            if r.size > best.size {
+                best = r;
+            }
+        }
+        return (best.base as usize, (best.base + best.size) as usize);
+    }
+    // Fallback: QEMU virt default 256 MiB at PA 0.
     let start = 0x0;
     let end = start + 256 * 1024 * 1024;
     (start, end)

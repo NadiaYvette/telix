@@ -813,6 +813,46 @@ pub fn parse_riscv64(dtb_addr: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Arch-specific extraction: LoongArch64
+// ---------------------------------------------------------------------------
+
+/// Parse a DTB blob for LoongArch64.  Unlike aarch64/riscv64 (which take
+/// a physical address), this takes a slice because the loongarch64
+/// firmware delivers the DTB via FW_CFG into kernel-side memory.
+/// Extracts memory regions and CPU descriptors so the phys allocator
+/// + smp init see the real RAM size + CPU count.
+#[cfg(target_arch = "loongarch64")]
+pub fn parse_loongarch64(data: &[u8]) {
+    let fdt = match Fdt::new(data) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    // Memory: /memory@* nodes.
+    for node in fdt.root_children() {
+        if !node_name_starts_with(node.name, b"memory") {
+            continue;
+        }
+        if let Some(reg) = node.property(b"reg") {
+            for (base, size) in reg.reg_iter(2, 2) {
+                super::push_mem_region(super::MemRegion { base, size });
+            }
+        }
+    }
+    // CPUs: /cpus/cpu@N.
+    if let Some(cpus_node) = fdt.find_node(b"/cpus") {
+        for child in cpus_node.children() {
+            if !node_name_starts_with(child.name, b"cpu@") {
+                continue;
+            }
+            if let Some(reg) = child.property(b"reg") {
+                let id = reg.as_u32().unwrap_or(0);
+                super::push_cpu(super::CpuDesc { id, flags: 1 });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
