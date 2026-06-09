@@ -303,9 +303,22 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 // clobbered between the match arm and this print.
                 let live_scause = read_scause();
                 let frame_scause_reread = frame.scause;
+                // #251 ra+fp probe: log saved registers so we can tell
+                // ret-with-ra=0 (corrupted return address) vs jalr-to-NULL
+                // (indirect call through a clobbered function pointer):
+                //   * sepc=0 + ra=0  → returned via `ret` after stack
+                //                       corruption zeroed the saved ra.
+                //   * sepc=0 + ra!=0 → indirect call to a NULL pointer;
+                //                       ra holds the next PC after the
+                //                       calling site, useful for addr2line.
+                // Also log s0/fp (frame.regs[7] = x8) and a2..a5 to seed
+                // backtrace work without a full unwinder.
+                let ra = frame.regs[0]; // x1
+                let sp = frame.regs[1]; // x2
+                let fp = frame.regs[7]; // x8 / s0
                 crate::println!(
                     "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x} cpu={} tid={} spp={} sstatus={:#x} sp(frame)={:#x} \
-                     [#251 probe: entry_scause={:#x} frame.scause={:#x} live_scause={:#x}]",
+                     [#251 probe: entry_scause={:#x} frame.scause={:#x} live_scause={:#x} ra={:#x} sp={:#x} fp={:#x}]",
                     scause,
                     frame.sepc,
                     stval,
@@ -317,6 +330,9 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     scause,
                     frame_scause_reread,
                     live_scause,
+                    ra,
+                    sp,
+                    fp,
                 );
                 loop {
                     core::hint::spin_loop();
