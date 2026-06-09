@@ -103,6 +103,12 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             // PL011, masking the actual ESR/ELR/SP/LR (see boot
             // aa64-post-riscv-work.log + memory/project_aarch64_post_phase5_wild_rip.md).
             let page_size = crate::mm::page::page_size();
+            // Fix: kstack is `kstack_size()` bytes (1 MiB on aarch64 64K
+            // pages — `KSTACK_ORDER=4`), NOT one page.  Previous emits
+            // claimed `BUG: OUTSIDE kstack bounds` whenever frame_sp was
+            // beyond the first page; that was always a false positive
+            // for any thread with non-trivial kernel work.
+            let kstack_size = crate::sched::scheduler::kstack_size();
             {
                 use crate::arch::aarch64::serial::{
                     fault_buf_for_current_cpu, handler_write_bytes, put_byte, put_bytes,
@@ -135,9 +141,9 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 put_bytes(buf, &mut k, b" frame_sp=");
                 put_hex_u64(buf, &mut k, frame_sp);
                 put_bytes(buf, &mut k, b" kstack_end=");
-                put_hex_u64(buf, &mut k, (kstack_base + page_size) as u64);
+                put_hex_u64(buf, &mut k, (kstack_base + kstack_size) as u64);
                 if kstack_base != 0 {
-                    let kstack_end = kstack_base + page_size;
+                    let kstack_end = kstack_base + kstack_size;
                     if (frame_sp as usize) < kstack_base || (frame_sp as usize) >= kstack_end {
                         put_bytes(buf, &mut k, b"\n  BUG: frame_sp OUTSIDE kstack bounds!");
                     }
@@ -154,7 +160,12 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                         return;
                     }
                     let t = unsafe { &*(val as *const crate::sched::thread::Thread) };
-                    if t.stack_base == frame_page {
+                    // Range check: a thread's kstack spans `kstack_size`
+                    // (16 pages on aarch64 64K-page builds), not one page.
+                    if t.stack_base != 0
+                        && frame_page >= t.stack_base
+                        && frame_page < t.stack_base + kstack_size
+                    {
                         crate::println!(
                             "  frame_sp page {:#x} belongs to tid={} state={:?} task={}",
                             frame_page,
@@ -172,15 +183,39 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                     );
                 }
             }
-            // Dump saved_sp of crashing thread.
+            // Dump saved_sp + alternate sp fields + corruption canary.
+            // #228 root-cause attribution: saved_sp_source tells which
+            // writer last touched saved_sp (1=try_switch, 2=voluntary,
+            // 3=pre_save_frame, 4=init; anything else = scribble).
+            // canary_around_source != THREAD_CANARY_MAGIC means the
+            // Thread struct mid-region was clobbered (slab/heap overlap).
             {
+                use crate::arch::aarch64::serial::{
+                    fault_buf_for_current_cpu, handler_write_bytes, put_byte, put_bytes,
+                    put_dec_u64, put_hex_u64,
+                };
                 let t = crate::sched::scheduler::thread_ref(tid);
-                crate::println!(
-                    "  thread[{}].saved_sp={:#x} state={:?}",
-                    tid,
-                    t.saved_sp,
-                    t.state
-                );
+                let buf = fault_buf_for_current_cpu();
+                let mut k = 0;
+                put_bytes(buf, &mut k, b"  thread[");
+                put_dec_u64(buf, &mut k, tid as u64);
+                put_bytes(buf, &mut k, b"].saved_sp=");
+                put_hex_u64(buf, &mut k, t.saved_sp);
+                put_bytes(buf, &mut k, b" src=");
+                put_dec_u64(buf, &mut k, t.saved_sp_source as u64);
+                put_bytes(buf, &mut k, b" canary=");
+                put_hex_u64(buf, &mut k, t.canary_around_source);
+                if t.canary_around_source != crate::sched::thread::THREAD_CANARY_MAGIC {
+                    put_bytes(buf, &mut k, b" CORRUPT");
+                }
+                put_bytes(buf, &mut k, b"\n  ipc_frame_sp=");
+                put_hex_u64(buf, &mut k, t.ipc_frame_sp);
+                put_bytes(buf, &mut k, b" syscall_frame_sp=");
+                put_hex_u64(buf, &mut k, t.syscall_frame_sp);
+                put_bytes(buf, &mut k, b" personality_frame_sp=");
+                put_hex_u64(buf, &mut k, t.personality_frame_sp);
+                put_byte(buf, &mut k, b'\n');
+                handler_write_bytes(&buf[..k.min(buf.len())]);
             }
             loop {
                 core::hint::spin_loop();
