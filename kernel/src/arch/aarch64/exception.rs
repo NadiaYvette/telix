@@ -214,6 +214,26 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 put_hex_u64(buf, &mut k, t.syscall_frame_sp);
                 put_bytes(buf, &mut k, b" personality_frame_sp=");
                 put_hex_u64(buf, &mut k, t.personality_frame_sp);
+                // SPSR_EL1 from trap frame.  PSTATE.M (bits 3:0) at
+                // vec_sync_el1 entry is hardware-guaranteed non-zero —
+                // EL0 traps route through vec_sync_el0 instead.  So
+                // PSTATE.M=0 here means the saved spsr slot was never
+                // written (sentinel low-bits) rather than that we
+                // actually came from EL0.  Useful diagnostic to flag
+                // sentinel-filled frames.
+                put_bytes(buf, &mut k, b"\n  spsr=");
+                put_hex_u64(buf, &mut k, frame.spsr);
+                put_bytes(buf, &mut k, b" PSTATE.M=");
+                put_hex_u64(buf, &mut k, frame.spsr & 0xF);
+                if (frame.spsr & 0xF) == 0 {
+                    // Impossible from a real vec_sync_el1 entry; the slot
+                    // holds sentinel low-bits (e.g. CAFEBABE_00000000).
+                    put_bytes(buf, &mut k, b" SENTINEL-LOW");
+                } else if (frame.spsr & 0xF) == 4 {
+                    put_bytes(buf, &mut k, b" EL1t");
+                } else if (frame.spsr & 0xF) == 5 {
+                    put_bytes(buf, &mut k, b" EL1h");
+                }
                 put_byte(buf, &mut k, b'\n');
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
