@@ -3713,15 +3713,40 @@ fn do_spawn_heavy_work(
     arg0_is_port: bool,
     mmio_cap_region: Option<u32>,
 ) -> Option<(u64, usize, u64, usize, usize, u64, u64)> {
-    // Create kernel-held ports for this task and its initial thread.
-    let task_port = crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize)?;
-    let thread_port =
-        crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
+    // #248 per-step probes — log which step returns None so we can
+    // pinpoint where do_spawn_heavy_work fails (currently failing on
+    // riscv64 SMP=4 for every server past tid=7).
+    let task_port = match crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize) {
+        Some(p) => p,
+        None => {
+            crate::println!("[spawn-heavy] FAIL step=task_port task_id={} tid={}", task_id, thread_id);
+            return None;
+        }
+    };
+    let thread_port = match crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize) {
+        Some(p) => p,
+        None => {
+            crate::println!("[spawn-heavy] FAIL step=thread_port task_id={} tid={}", task_id, thread_id);
+            return None;
+        }
+    };
     // Create a page table with kernel identity mapping.
-    let pt_root = crate::mm::hat::create_user_page_table()?;
+    let pt_root = match crate::mm::hat::create_user_page_table() {
+        Some(r) => r,
+        None => {
+            crate::println!("[spawn-heavy] FAIL step=pt_root task_id={} tid={}", task_id, thread_id);
+            return None;
+        }
+    };
 
     // Create address space.
-    let aspace_id = crate::mm::aspace::create(pt_root)?;
+    let aspace_id = match crate::mm::aspace::create(pt_root) {
+        Some(a) => a,
+        None => {
+            crate::println!("[spawn-heavy] FAIL step=aspace_create task_id={} tid={} pt_root={:#x}", task_id, thread_id, pt_root);
+            return None;
+        }
+    };
 
     // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
     // and full cap for arg0 if it's a valid active port (port passing on spawn).
@@ -3764,7 +3789,13 @@ fn do_spawn_heavy_work(
         Some(region_id) => {
             use crate::cap::capability::Rights;
             let rw = Rights::READ.union(Rights::WRITE);
-            let slot = crate::cap::grant_mmio_cap(task_id, region_id, rw)?;
+            let slot = match crate::cap::grant_mmio_cap(task_id, region_id, rw) {
+                Some(s) => s,
+                None => {
+                    crate::println!("[spawn-heavy] FAIL step=mmio_cap task_id={} tid={} region={}", task_id, thread_id, region_id);
+                    return None;
+                }
+            };
             debug_assert!(slot < 0x10000, "mmio cap slot doesn't fit in 16 bits");
             (arg0 & !0xFFFFu64) | (slot as u64 & 0xFFFF)
         }
@@ -3774,7 +3805,10 @@ fn do_spawn_heavy_work(
     // Load ELF segments into the address space.
     let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
         Ok(e) => e,
-        Err(_) => return None,
+        Err(e) => {
+            crate::println!("[spawn-heavy] FAIL step=load_elf task_id={} tid={} err={:?}", task_id, thread_id, e);
+            return None;
+        }
     };
     let entry = elf_info.entry;
 
@@ -3789,22 +3823,33 @@ fn do_spawn_heavy_work(
     let stack_mmu_pages = stack_alloc_pages * page::page_mmucount();
     let stack_va = USER_STACK_TOP - stack_alloc_pages * ps;
 
-    let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+    let obj_id = match crate::mm::aspace::with_aspace(aspace_id, |aspace| {
         let vma = aspace
             .map_anon(stack_va, stack_mmu_pages, crate::mm::vma::VmaProt::ReadWrite)
             .ok_or(())?;
         Ok::<_, ()>(vma.object_id)
-    })
-    .ok()?;
+    }) {
+        Ok(id) => id,
+        Err(_) => {
+            crate::println!("[spawn-heavy] FAIL step=stack_map_anon task_id={} tid={} aspace={}", task_id, thread_id, aspace_id);
+            return None;
+        }
+    };
 
     // Eagerly allocate and map stack pages.
     let mmu_count = page::page_mmucount();
     for page_idx in 0..stack_alloc_pages {
         let page_va = stack_va + page_idx * ps;
 
-        let pa = crate::mm::object::with_object(obj_id, |obj| {
+        let pa = match crate::mm::object::with_object(obj_id, |obj| {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
-        })?;
+        }) {
+            Some(p) => p,
+            None => {
+                crate::println!("[spawn-heavy] FAIL step=stack_ensure_page task_id={} tid={} obj_id={} page_idx={}", task_id, thread_id, obj_id, page_idx);
+                return None;
+            }
+        };
         let pa_usize = pa.as_usize();
 
         unsafe {
@@ -3823,7 +3868,13 @@ fn do_spawn_heavy_work(
     }
 
     // Allocate kernel stack for this thread.
-    let kstack_page = alloc_kstack_zeroed()?;
+    let kstack_page = match alloc_kstack_zeroed() {
+        Some(p) => p,
+        None => {
+            crate::println!("[spawn-heavy] FAIL step=kstack_alloc task_id={} tid={}", task_id, thread_id);
+            return None;
+        }
+    };
     let kstack_base = kstack_page.as_usize();
     let kstack_phys_base = kstack_page.pa_base.as_usize();
     init_stack_canary(kstack_base);
