@@ -166,21 +166,33 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                         && frame_page >= t.stack_base
                         && frame_page < t.stack_base + kstack_size
                     {
-                        crate::println!(
-                            "  frame_sp page {:#x} belongs to tid={} state={:?} task={}",
-                            frame_page,
-                            key,
-                            t.state,
-                            t.task_id
-                        );
+                        use crate::arch::aarch64::serial::{
+                            fault_buf_for_current_cpu, handler_write_bytes, put_bytes,
+                            put_dec_u64, put_hex_u64,
+                        };
+                        let buf = fault_buf_for_current_cpu();
+                        let mut k = 0;
+                        put_bytes(buf, &mut k, b"  frame_sp page ");
+                        put_hex_u64(buf, &mut k, frame_page as u64);
+                        put_bytes(buf, &mut k, b" belongs to tid=");
+                        put_dec_u64(buf, &mut k, key);
+                        put_bytes(buf, &mut k, b" task=");
+                        put_dec_u64(buf, &mut k, t.task_id as u64);
+                        put_bytes(buf, &mut k, b"\n");
+                        handler_write_bytes(&buf[..k.min(buf.len())]);
                         found = true;
                     }
                 });
                 if !found {
-                    crate::println!(
-                        "  frame_sp page {:#x} NOT found in any thread's kstack!",
-                        frame_page
-                    );
+                    use crate::arch::aarch64::serial::{
+                        fault_buf_for_current_cpu, handler_write_bytes, put_bytes, put_hex_u64,
+                    };
+                    let buf = fault_buf_for_current_cpu();
+                    let mut k = 0;
+                    put_bytes(buf, &mut k, b"  frame_sp page ");
+                    put_hex_u64(buf, &mut k, frame_page as u64);
+                    put_bytes(buf, &mut k, b" NOT found in any thread's kstack!\n");
+                    handler_write_bytes(&buf[..k.min(buf.len())]);
                 }
             }
             // Dump saved_sp + alternate sp fields + corruption canary.
