@@ -102,13 +102,55 @@ pub fn handler_write_bytes(bytes: &[u8]) {
     crate::arch::irq::restore(saved);
 }
 
+/// #255 per-CPU fault buffer.  Lives in BSS at a known-good VA so a
+/// fault handler whose kstack is corrupt (the very bug we're
+/// diagnosing) can still format an emit into a sane location.  Stack-
+/// local bufs were the bug source on boot loop-aa64-2: when the EL1
+/// Sync handler fires on a thread with `frame_sp` outside kstack
+/// bounds, the stack-local `[u8; N]` lands in arbitrary memory and
+/// produces NUL-prefix + clean-tail emissions (see
+/// memory/project_aarch64_handler_buf_kstack.md).
+///
+/// Sized to hold the largest formatted record (the EL1 Sync header is
+/// the worst case at ~250 bytes; 512 leaves headroom).  At 256 CPUs ×
+/// 512 B = 128 KiB BSS — acceptable for the diagnostic improvement.
+///
+/// Nested-fault caveat: if a fault re-enters the same handler on the
+/// same CPU while the outer call is still building its record, the
+/// nested handler will scribble the buf.  The same-CPU re-entry bypass
+/// in `handler_write_bytes` emits whatever is in the buf at that point,
+/// which is acceptable — we still get one of the two records out
+/// cleanly, whereas with the stack-local approach we got neither.
+const FAULT_BUF_SIZE: usize = 512;
+#[repr(align(16))]
+struct PerCpuFaultBuf([u8; FAULT_BUF_SIZE]);
+static mut FAULT_BUFS: [PerCpuFaultBuf; crate::sched::smp::MAX_CPUS] =
+    [const { PerCpuFaultBuf([0; FAULT_BUF_SIZE]) }; crate::sched::smp::MAX_CPUS];
+
+/// Borrow this CPU's fault buffer as a mutable slice.
+///
+/// SAFETY: caller must hold the formatting-side discipline that no two
+/// emits proceed concurrently on the same CPU.  Currently enforced
+/// because the only callers are fault handlers (which run with IRQs
+/// disabled) and `handler_write_bytes` serializes across CPUs.
+pub fn fault_buf_for_current_cpu() -> &'static mut [u8] {
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    unsafe {
+        let base = (&raw mut FAULT_BUFS) as *mut PerCpuFaultBuf;
+        let slot = base.add(cpu);
+        let bytes = (*slot).0.as_mut_ptr();
+        core::slice::from_raw_parts_mut(bytes, FAULT_BUF_SIZE)
+    }
+}
+
 // #252 escape helpers — let fault-path code emit log lines that share
 // NO state with format_args!() / Argument arrays.  Callers build the
-// whole line into a stack `[u8; N]`, then pass it to
-// `handler_write_bytes` for an atomic PRINT_LOCK-guarded emit.  Avoids
-// the optimizer-overlap where format Argument storage shadows a
-// caller's locals during a fault dump (the bug #224 fixed on x86_64
-// and that this mirror brings to aarch64).
+// whole line into a `&mut [u8]` (now per-CPU static via
+// `fault_buf_for_current_cpu`), then pass it to `handler_write_bytes`
+// for an atomic PRINT_LOCK-guarded emit.  Avoids the optimizer-overlap
+// where format Argument storage shadows a caller's locals during a
+// fault dump (the bug #224 fixed on x86_64 and that this mirror brings
+// to aarch64).
 //
 // All take `(buf, &mut n, ...)` and append to buf, capping writes at
 // buf.len() so the caller's `n.min(buf.len())` slice is always sound.

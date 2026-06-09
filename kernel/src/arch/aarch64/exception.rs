@@ -70,12 +70,25 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             unsafe {
                 core::arch::asm!("mrs {}, far_el1", out(reg) far);
             }
-            crate::println!(
-                "EL1 Data Abort: FAR={:#x} ESR={:#x} ELR={:#x}",
-                far,
-                frame.esr,
-                frame.elr
-            );
+            // #255 anti-interleave: per-CPU FAULT_BUF + handler_write_bytes.
+            // Catches the data-side surface of #228 cleanly (see
+            // memory/project_aarch64_data_abort_phys_alloc.md).
+            {
+                use crate::arch::aarch64::serial::{
+                    fault_buf_for_current_cpu, handler_write_bytes, put_byte, put_bytes,
+                    put_hex_u64,
+                };
+                let buf = fault_buf_for_current_cpu();
+                let mut k = 0;
+                put_bytes(buf, &mut k, b"EL1 Data Abort: FAR=");
+                put_hex_u64(buf, &mut k, far);
+                put_bytes(buf, &mut k, b" ESR=");
+                put_hex_u64(buf, &mut k, frame.esr);
+                put_bytes(buf, &mut k, b" ELR=");
+                put_hex_u64(buf, &mut k, frame.elr);
+                put_byte(buf, &mut k, b'\n');
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
             loop {
                 core::hint::spin_loop();
             }
@@ -92,39 +105,44 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             let page_size = crate::mm::page::page_size();
             {
                 use crate::arch::aarch64::serial::{
-                    handler_write_bytes, put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                    fault_buf_for_current_cpu, handler_write_bytes, put_byte, put_bytes,
+                    put_dec_u64, put_hex_u64,
                 };
-                let mut buf = [0u8; 384];
+                // #255: per-CPU FAULT_BUF (BSS) instead of stack-local — the
+                // stack-local approach failed on boot loop-aa64-2 when the
+                // very fault we're dumping has a corrupted kstack (see
+                // memory/project_aarch64_handler_buf_kstack.md).
+                let buf = fault_buf_for_current_cpu();
                 let mut k = 0;
-                put_bytes(&mut buf, &mut k, b"EL1 Sync: EC=");
-                put_hex_u64(&mut buf, &mut k, ec);
-                put_bytes(&mut buf, &mut k, b" ESR=");
-                put_hex_u64(&mut buf, &mut k, frame.esr);
-                put_bytes(&mut buf, &mut k, b" ELR=");
-                put_hex_u64(&mut buf, &mut k, frame.elr);
-                put_bytes(&mut buf, &mut k, b" SP_EL0=");
-                put_hex_u64(&mut buf, &mut k, frame.sp);
-                put_bytes(&mut buf, &mut k, b"\n  x30(LR)=");
-                put_hex_u64(&mut buf, &mut k, frame.regs[30]);
-                put_bytes(&mut buf, &mut k, b" x29(FP)=");
-                put_hex_u64(&mut buf, &mut k, frame.regs[29]);
-                put_bytes(&mut buf, &mut k, b" x0=");
-                put_hex_u64(&mut buf, &mut k, frame.regs[0]);
-                put_bytes(&mut buf, &mut k, b"\n  tid=");
-                put_dec_u64(&mut buf, &mut k, tid as u64);
-                put_bytes(&mut buf, &mut k, b" kstack_base=");
-                put_hex_u64(&mut buf, &mut k, kstack_base as u64);
-                put_bytes(&mut buf, &mut k, b" frame_sp=");
-                put_hex_u64(&mut buf, &mut k, frame_sp);
-                put_bytes(&mut buf, &mut k, b" kstack_end=");
-                put_hex_u64(&mut buf, &mut k, (kstack_base + page_size) as u64);
+                put_bytes(buf, &mut k, b"EL1 Sync: EC=");
+                put_hex_u64(buf, &mut k, ec);
+                put_bytes(buf, &mut k, b" ESR=");
+                put_hex_u64(buf, &mut k, frame.esr);
+                put_bytes(buf, &mut k, b" ELR=");
+                put_hex_u64(buf, &mut k, frame.elr);
+                put_bytes(buf, &mut k, b" SP_EL0=");
+                put_hex_u64(buf, &mut k, frame.sp);
+                put_bytes(buf, &mut k, b"\n  x30(LR)=");
+                put_hex_u64(buf, &mut k, frame.regs[30]);
+                put_bytes(buf, &mut k, b" x29(FP)=");
+                put_hex_u64(buf, &mut k, frame.regs[29]);
+                put_bytes(buf, &mut k, b" x0=");
+                put_hex_u64(buf, &mut k, frame.regs[0]);
+                put_bytes(buf, &mut k, b"\n  tid=");
+                put_dec_u64(buf, &mut k, tid as u64);
+                put_bytes(buf, &mut k, b" kstack_base=");
+                put_hex_u64(buf, &mut k, kstack_base as u64);
+                put_bytes(buf, &mut k, b" frame_sp=");
+                put_hex_u64(buf, &mut k, frame_sp);
+                put_bytes(buf, &mut k, b" kstack_end=");
+                put_hex_u64(buf, &mut k, (kstack_base + page_size) as u64);
                 if kstack_base != 0 {
                     let kstack_end = kstack_base + page_size;
                     if (frame_sp as usize) < kstack_base || (frame_sp as usize) >= kstack_end {
-                        put_bytes(&mut buf, &mut k, b"\n  BUG: frame_sp OUTSIDE kstack bounds!");
+                        put_bytes(buf, &mut k, b"\n  BUG: frame_sp OUTSIDE kstack bounds!");
                     }
                 }
-                put_byte(&mut buf, &mut k, b'\n');
+                put_byte(buf, &mut k, b'\n');
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
             // Find which thread (if any) owns the page containing frame_sp.
