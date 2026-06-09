@@ -2235,10 +2235,22 @@ fn sys_mmio_map_cap(slot: u64) -> u64 {
     let pt_root = crate::sched::scheduler::current_page_table_root();
     let pte_flags = trapframe::device_pte_flags();
 
-    for i in 0..pages {
-        let page_va = va + i * page;
-        let page_pa = region.phys_base + i * page;
-        crate::mm::hat::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
+    // #249 — `map_range` rolls back on partial failure so we don't hand
+    // the caller a half-mapped region whose later pages will fault.
+    // The old loop ignored `map_single_mmupage`'s bool return and could
+    // leave a partial mapping silently in place (caught on riscv64 with
+    // a 256-MiB ECAM map; see `project_249_pci_srv_riscv64_ecam.md`).
+    let _ = pages;
+    if let Err(e) = crate::mm::hat::map_range(pt_root, va, region.phys_base, region.size, pte_flags)
+    {
+        crate::println!(
+            "[mmio_map_cap] map_range FAIL va={:#x} pa={:#x} size={:#x} err={:?}",
+            va,
+            region.phys_base,
+            region.size,
+            e
+        );
+        return u64::MAX;
     }
 
     // Return VA + sub-page offset so the caller sees the exact device

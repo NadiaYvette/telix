@@ -244,6 +244,59 @@ pub fn map_user_pages(
     arch_mm::map_user_pages(root, virt, phys, size, flags)
 }
 
+/// Reason a `map_range` call could not install the full mapping.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MapError {
+    /// Intermediate page-table allocation failed (or radix walker failure).
+    /// Carries the VA of the page where allocation failed and how many
+    /// pages were installed before the failure.
+    OutOfMemory { va: usize, installed: usize },
+    /// One of the arguments isn't a multiple of `MMUPAGE_SIZE`.
+    BadAlignment,
+}
+
+/// Map a contiguous range of `len` bytes of VA → PA with full rollback
+/// on partial failure.  `len`, `va`, and `pa` must all be MMU-page-aligned.
+///
+/// On `OutOfMemory`, every page successfully installed during this call
+/// is unmapped before returning — callers see all-or-nothing semantics.
+/// (Intermediate page-table pages themselves are not freed; the empty
+/// branches stay attached to the root.  That's a small leak compared to
+/// the bug it fixes: callers used to silently keep a partial mapping.)
+///
+/// Used by `sys_mmio_map_cap` so a partial ECAM map can't go undetected
+/// (see `memory/project_249_pci_srv_riscv64_ecam.md` — the failure mode
+/// that motivated this helper).
+pub fn map_range(
+    root: usize,
+    va: usize,
+    pa: usize,
+    len: usize,
+    flags: u64,
+) -> Result<(), MapError> {
+    let page = super::page::MMUPAGE_SIZE;
+    if (va | pa | len) & (page - 1) != 0 {
+        return Err(MapError::BadAlignment);
+    }
+    let n = len / page;
+    for i in 0..n {
+        let page_va = va + i * page;
+        let page_pa = pa + i * page;
+        if !map_single_mmupage(root, page_va, page_pa, flags) {
+            // Rollback every leaf we just installed so the caller sees
+            // a clean slate (no half-mapped range).
+            for j in 0..i {
+                clear_pte(root, va + j * page);
+            }
+            return Err(MapError::OutOfMemory {
+                va: page_va,
+                installed: i,
+            });
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // PTE query helpers
 // ---------------------------------------------------------------------------
