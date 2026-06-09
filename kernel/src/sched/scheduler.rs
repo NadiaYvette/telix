@@ -1509,6 +1509,28 @@ pub fn check_iretq_shadow_at_dispatch(tid: ThreadId, sp: u64) {
 
 #[inline]
 fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
+    // The shadow capture (capture_iretq_shadow) reads x86_64 iretq frame
+    // offsets (sp+17*8 = RIP, +18*8 = CS, etc.) and the FRAME-BYTE-DELTA
+    // path interprets slot[0..21] against that layout.  On aarch64 the
+    // trap frame stores x0..x30 contiguously starting at sp, so slot[0]
+    // is just `x0` — which for IPC-parked threads holds the port arg
+    // captured at park then gets overwritten with the syscall return
+    // value at wake, producing deterministic shadow≠live "deltas" that
+    // are just normal IPC return-value writes (see
+    // memory/project_frame_byte_delta_aarch64_noise.md).  Until we add
+    // arch-specific shadow capture, no-op on non-x86 so the noise stops
+    // muddying corruption-family forensics.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (tid, sp, require_blocked);
+    }
+    #[cfg(target_arch = "x86_64")]
+    check_iretq_shadow_inner_x86(tid, sp, require_blocked);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn check_iretq_shadow_inner_x86(tid: ThreadId, sp: u64, require_blocked: bool) {
     let t = thread_ref(tid);
     if t.iretq_shadow_sp == 0 || t.iretq_shadow_sp != sp {
         return;
