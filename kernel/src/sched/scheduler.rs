@@ -4558,6 +4558,17 @@ pub fn init() {
     sched_init();
     let idle_id = 0; // Thread 0 = BSP idle
 
+    // #173 Phase 5: honor `dispatch_claim_helper=` from kernel cmdline.
+    // 0 = leave compile-time default; 1 = force ON; 2 = force OFF.
+    let knob = crate::boot::cmdline::BOOT_CONFIG
+        .dispatch_claim_helper
+        .load(Ordering::Relaxed);
+    match knob {
+        1 => DISPATCH_USE_CLAIM_HELPER.store(true, Ordering::Relaxed),
+        2 => DISPATCH_USE_CLAIM_HELPER.store(false, Ordering::Relaxed),
+        _ => {}
+    }
+
     smp::init_bsp(idle_id);
     super::hotplug::mark_online(0);
     crate::println!("  Scheduler initialized (BSP = CPU 0)");

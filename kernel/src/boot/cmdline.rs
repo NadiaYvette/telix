@@ -42,6 +42,12 @@ pub struct BootConfig {
     /// detected count). Mirrors Linux `nr_cpus=N`.
     pub nr_cpus: AtomicU32,
 
+    /// #173 Phase 5 A/B knob.  0 = leave the legacy default
+    /// (`DISPATCH_USE_CLAIM_HELPER` keeps its compile-time value);
+    /// 1 = force ON; 2 = force OFF.  Lets the multi-boot harness compare
+    /// matched gate states without rebuilding the kernel.
+    pub dispatch_claim_helper: AtomicU8,
+
     /// Whether command line was successfully parsed.
     pub parsed: AtomicU8,
 }
@@ -51,6 +57,7 @@ pub static BOOT_CONFIG: BootConfig = BootConfig {
     console: AtomicU8::new(0),
     loglevel: AtomicU8::new(5),
     nr_cpus: AtomicU32::new(0),
+    dispatch_claim_helper: AtomicU8::new(0),
     parsed: AtomicU8::new(0),
 };
 
@@ -135,6 +142,14 @@ fn handle_param(key: &[u8], val: &[u8]) {
         b"console" => {
             // Future: map console name to index.
             let _ = val;
+        }
+        b"dispatch_claim_helper" => {
+            // #173 Phase 5 A/B knob.  Accepts 0|1|2 (see BootConfig docs).
+            if let Some(n) = parse_u64(val) {
+                if n <= 2 {
+                    BOOT_CONFIG.dispatch_claim_helper.store(n as u8, Ordering::Relaxed);
+                }
+            }
         }
         _ => {
             // Store as extra param for personality layers.
