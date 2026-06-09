@@ -323,15 +323,28 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 let cpu = crate::sched::smp::cpu_id();
                 let tid = crate::sched::current_thread_id();
                 let pplv = frame.prmd & 0x3;
-                crate::println!(
-                    "Kernel page fault: ecode={:#x} era={:#x} badv={:#x} cpu={} tid={} pplv={}",
-                    ecode,
-                    frame.era,
-                    badv,
-                    cpu,
-                    tid,
-                    pplv,
-                );
+                // #254 anti-interleave: stack-buffer + handler_write_bytes.
+                {
+                    use crate::arch::loongarch64::serial::{
+                        handler_write_bytes, put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                    };
+                    let mut buf = [0u8; 256];
+                    let mut k = 0;
+                    put_bytes(&mut buf, &mut k, b"Kernel page fault: ecode=");
+                    put_hex_u64(&mut buf, &mut k, ecode);
+                    put_bytes(&mut buf, &mut k, b" era=");
+                    put_hex_u64(&mut buf, &mut k, frame.era);
+                    put_bytes(&mut buf, &mut k, b" badv=");
+                    put_hex_u64(&mut buf, &mut k, badv as u64);
+                    put_bytes(&mut buf, &mut k, b" cpu=");
+                    put_dec_u64(&mut buf, &mut k, cpu as u64);
+                    put_bytes(&mut buf, &mut k, b" tid=");
+                    put_dec_u64(&mut buf, &mut k, tid as u64);
+                    put_bytes(&mut buf, &mut k, b" pplv=");
+                    put_dec_u64(&mut buf, &mut k, pplv);
+                    put_byte(&mut buf, &mut k, b'\n');
+                    handler_write_bytes(&buf[..k.min(buf.len())]);
+                }
                 loop {
                     core::hint::spin_loop();
                 }
@@ -348,12 +361,22 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     frame_sp
                 }
                 crate::mm::fault::FaultResult::Failed => {
-                    crate::println!(
-                        "Unhandled page fault: ecode={:#x} era={:#x} badv={:#x} — killing thread",
-                        ecode,
-                        frame.era,
-                        badv
-                    );
+                    // #254 anti-interleave.
+                    {
+                        use crate::arch::loongarch64::serial::{
+                            handler_write_bytes, put_bytes, put_hex_u64,
+                        };
+                        let mut buf = [0u8; 192];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"Unhandled page fault: ecode=");
+                        put_hex_u64(&mut buf, &mut k, ecode);
+                        put_bytes(&mut buf, &mut k, b" era=");
+                        put_hex_u64(&mut buf, &mut k, frame.era);
+                        put_bytes(&mut buf, &mut k, b" badv=");
+                        put_hex_u64(&mut buf, &mut k, badv as u64);
+                        put_bytes(&mut buf, &mut k, b" \xe2\x80\x94 killing thread\n");
+                        handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
                     crate::sched::scheduler::exit_current_thread(-11) // SIGSEGV
                 }
                 _ => frame_sp,
@@ -361,21 +384,45 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
         }
 
         ECODE_INE => {
-            crate::println!(
-                "INE: era={:#x} badv={:#x} prmd={:#x} tid={}",
-                frame.era, read_badv(), frame.prmd,
-                crate::sched::current_thread_id()
-            );
+            // #254 anti-interleave.
+            {
+                use crate::arch::loongarch64::serial::{
+                    handler_write_bytes, put_bytes, put_dec_u64, put_hex_u64,
+                };
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"INE: era=");
+                put_hex_u64(&mut buf, &mut k, frame.era);
+                put_bytes(&mut buf, &mut k, b" badv=");
+                put_hex_u64(&mut buf, &mut k, read_badv());
+                put_bytes(&mut buf, &mut k, b" prmd=");
+                put_hex_u64(&mut buf, &mut k, frame.prmd);
+                put_bytes(&mut buf, &mut k, b" tid=");
+                put_dec_u64(&mut buf, &mut k, crate::sched::current_thread_id() as u64);
+                put_bytes(&mut buf, &mut k, b"\n");
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
             crate::sched::scheduler::exit_current_thread(-4) // SIGILL
         }
         _ => {
-            crate::println!(
-                "Unhandled exception: ecode={:#x} estat={:#x} era={:#x} badv={:#x}",
-                ecode,
-                estat,
-                frame.era,
-                read_badv()
-            );
+            // #254 anti-interleave.
+            {
+                use crate::arch::loongarch64::serial::{
+                    handler_write_bytes, put_bytes, put_hex_u64,
+                };
+                let mut buf = [0u8; 192];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"Unhandled exception: ecode=");
+                put_hex_u64(&mut buf, &mut k, ecode);
+                put_bytes(&mut buf, &mut k, b" estat=");
+                put_hex_u64(&mut buf, &mut k, estat);
+                put_bytes(&mut buf, &mut k, b" era=");
+                put_hex_u64(&mut buf, &mut k, frame.era);
+                put_bytes(&mut buf, &mut k, b" badv=");
+                put_hex_u64(&mut buf, &mut k, read_badv());
+                put_bytes(&mut buf, &mut k, b"\n");
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
             loop {
                 core::hint::spin_loop();
             }
