@@ -159,9 +159,11 @@ extern "C" fn secondary_hart_rust_entry(cpu_id: u64) {
     // Enable MMU using BSP's kernel page table (must happen before user VA handling).
     super::mm::enable_mmu_secondary();
 
-    // Set tp = cpu_id for smp::cpu_id().
+    // #250: set gp = cpu_id for smp::cpu_id().  Was `tp` before, but
+    // `tp` is needed for the user TLS base — see cpu.rs:cpu_id and
+    // memory/project_riscv64_set_tls_tp_clobber.md.
     unsafe {
-        core::arch::asm!("mv tp, {}", in(reg) cpu_id);
+        core::arch::asm!("mv gp, {}", in(reg) cpu_id, options(nomem, nostack, preserves_flags));
     }
 
     // Install trap vector and ensure sscratch = 0 (S-mode convention).

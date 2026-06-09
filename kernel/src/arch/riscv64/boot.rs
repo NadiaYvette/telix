@@ -27,9 +27,12 @@ pub fn kernel_end_addr() -> usize {
 /// Rust entry point called from assembly.
 #[unsafe(no_mangle)]
 pub extern "C" fn _rust_entry(dtb_ptr: usize, hart_id: usize) -> ! {
-    // Set tp = 0 for BSP (CPU 0) — used by smp::cpu_id().
+    // #250: cpu_id lives in `gp` on riscv64 (was `tp`).  Set gp = 0 for
+    // BSP (CPU 0).  See cpu.rs:cpu_id and
+    // memory/project_riscv64_set_tls_tp_clobber.md for why tp can't host
+    // cpu_id (set_tls clobbers it).
     unsafe {
-        core::arch::asm!("mv tp, zero");
+        core::arch::asm!("mv gp, zero", options(nomem, nostack, preserves_flags));
     }
 
     DTB_ADDR.store(dtb_ptr, Ordering::Relaxed);

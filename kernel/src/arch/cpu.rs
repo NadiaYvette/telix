@@ -17,9 +17,18 @@ pub fn cpu_id() -> u32 {
     }
     #[cfg(target_arch = "riscv64")]
     {
+        // #250: read cpu_id from `gp`, not `tp`.  `tp` is needed by user
+        // code as the TLS base, and set_tls() writes user_tls into the live
+        // `tp` register from S-mode (scheduler.rs:6447) — keeping cpu_id
+        // there would clobber it on every dispatch.  See
+        // memory/project_riscv64_set_tls_tp_clobber.md for the SP-swap
+        // and missed-cpu_id chain this avoids.  Trap entry/exit (vectors.S)
+        // now swaps `gp` with `sscratch`; `tp` gets the normal save/restore.
+        // Compiler doesn't use `gp` for relaxation as long as the kernel is
+        // linked with the default rustc behaviour (no -mrelax on output).
         let id: u64;
         unsafe {
-            core::arch::asm!("mv {}, tp", out(reg) id);
+            core::arch::asm!("mv {}, gp", out(reg) id, options(nomem, nostack, preserves_flags));
         }
         id as u32
     }
@@ -93,7 +102,9 @@ pub fn init_bsp_cpu_id() {
     }
     #[cfg(target_arch = "riscv64")]
     unsafe {
-        core::arch::asm!("mv tp, zero");
+        // #250: cpu_id lives in `gp` on riscv64, not `tp`.  See cpu_id()
+        // comment and memory/project_riscv64_set_tls_tp_clobber.md.
+        core::arch::asm!("mv gp, zero", options(nomem, nostack, preserves_flags));
     }
     // x86_64: LAPIC ID 0 is BSP on QEMU — no setup needed.
     // loongarch64: CSR.CPUID is read-only, returns 0 for BSP.
