@@ -237,6 +237,43 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 put_byte(buf, &mut k, b'\n');
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
+            // Targeted probe: read the EXACT kstack offsets where save_regs
+            // is supposed to have stored x30/sp_el0/elr/spsr/esr.  Cross-
+            // check against what `frame.X` returned via the Rust struct
+            // to detect "save_regs late portion didn't run" vs
+            // "post-handler scribble overwrote the slots".
+            {
+                use crate::arch::aarch64::serial::{
+                    fault_buf_for_current_cpu, handler_write_bytes, put_bytes, put_hex_u64,
+                };
+                let buf = fault_buf_for_current_cpu();
+                let mut k = 0;
+                put_bytes(buf, &mut k, b"  trap-frame system-reg slots:\n");
+                let base = frame_sp as usize;
+                let kstack_top = kstack_base + kstack_size;
+                let slots: [(usize, &[u8]); 5] = [
+                    (240, b"    [+240 x30] "),
+                    (248, b"    [+248 sp ] "),
+                    (256, b"    [+256 elr] "),
+                    (264, b"    [+264 spsr] "),
+                    (272, b"    [+272 esr] "),
+                ];
+                for (off, label) in slots {
+                    let va = base + off;
+                    if va + 8 <= kstack_top {
+                        let val = unsafe { core::ptr::read_volatile(va as *const u64) };
+                        put_bytes(buf, &mut k, label);
+                        put_hex_u64(buf, &mut k, val);
+                        if val == 0xCAFEBABE_00000000 {
+                            put_bytes(buf, &mut k, b" SENTINEL");
+                        } else if val == 0 {
+                            put_bytes(buf, &mut k, b" ZERO");
+                        }
+                        put_bytes(buf, &mut k, b"\n");
+                    }
+                }
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
             // Walk UPWARD from frame_sp (toward kstack_end, higher VAs)
             // to dump the caller-frame chain.  Upward addresses are the
             // older frames that the current execution was using before
