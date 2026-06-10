@@ -21,6 +21,10 @@ rustflags = ["-C", "link-arg=-Tkernel/src/arch/loongarch64/linker.ld"]
 runner = "tools/run-qemu-mips64.sh"
 rustflags = ["-C", "link-arg=-Tkernel/src/arch/mips64/linker.ld"]
 
+[target.mips64-telix-none]
+runner = "tools/run-qemu-mips64-be.sh"
+rustflags = ["-C", "link-arg=-Tkernel/src/arch/mips64/linker.ld"]
+
 [unstable]
 build-std = ["core"]
 build-std-features = ["compiler-builtins-mem"]
