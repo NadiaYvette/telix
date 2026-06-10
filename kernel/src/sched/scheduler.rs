@@ -101,7 +101,11 @@ impl KStackHandle {
 /// VA scribble the L1 page contents (which is exactly the
 /// THREAD_TABLE[4] corruption signature: DR0 on the identity VA can't
 /// see the write because the writer goes through the kstack VA).
-const KSTACK_PA_OWNER_CAP: usize = 32768; // 2 GiB / 64 KiB
+// 4 GiB / 64 KiB. Must cover rv64 RAM base 0x80000000..0x100000000
+// (slot index = pa>>16 ranges 0x8000..0x10000) — earlier cap of 32768
+// silently no-op'd the audit on rv64 because every kstack's slot index
+// was exactly at cap.  See #228.
+const KSTACK_PA_OWNER_CAP: usize = 65536;
 static KSTACK_PA_OWNER: [core::sync::atomic::AtomicU32; KSTACK_PA_OWNER_CAP] = {
     const Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     [Z; KSTACK_PA_OWNER_CAP]
@@ -306,6 +310,20 @@ fn kstack_pa_register(pa: u64) {
             if n < buf.len() { buf[n] = b'\n'; n += 1; }
             #[cfg(target_arch = "x86_64")]
             crate::arch::x86_64::serial::handler_write_bytes(&buf[..n]);
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::arch::aarch64::serial::{
+                    fault_buf_for_current_cpu, handler_write_bytes,
+                };
+                let fbuf = fault_buf_for_current_cpu();
+                let nn = n.min(fbuf.len());
+                fbuf[..nn].copy_from_slice(&buf[..nn]);
+                handler_write_bytes(&fbuf[..nn]);
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                crate::arch::riscv64::serial::handler_write_bytes(&buf[..n]);
+            }
             break;
         }
     }
