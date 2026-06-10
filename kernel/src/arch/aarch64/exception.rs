@@ -64,6 +64,59 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             }
             frame_sp
         }
+        // #228 Watchpoint exception, same EL.  The hardware watchpoint
+        // armed via watchpoint::arm() fired on a store/load to the
+        // tracked address.  Log offender via direct UART (avoid
+        // core::fmt to keep the handler stack-clean), disarm, and
+        // return so the boot continues.
+        0x35 => {
+            let far: u64;
+            let elr = frame.elr;
+            unsafe {
+                core::arch::asm!("mrs {}, far_el1", out(reg) far);
+            }
+            let lr = frame.regs[30]; // x30
+            let sp_caller = frame.sp;
+            let x0 = frame.regs[0];
+            let x1 = frame.regs[1];
+            let x2 = frame.regs[2];
+            let x3 = frame.regs[3];
+            {
+                use crate::arch::aarch64::serial::{
+                    fault_buf_for_current_cpu, handler_write_bytes, put_byte, put_bytes,
+                    put_hex_u64,
+                };
+                let buf = fault_buf_for_current_cpu();
+                let mut k = 0;
+                put_bytes(buf, &mut k, b"WP-HIT: ELR=");
+                put_hex_u64(buf, &mut k, elr);
+                put_bytes(buf, &mut k, b" FAR=");
+                put_hex_u64(buf, &mut k, far);
+                put_bytes(buf, &mut k, b" ESR=");
+                put_hex_u64(buf, &mut k, frame.esr);
+                put_bytes(buf, &mut k, b" LR=");
+                put_hex_u64(buf, &mut k, lr);
+                put_bytes(buf, &mut k, b" SP=");
+                put_hex_u64(buf, &mut k, sp_caller);
+                put_bytes(buf, &mut k, b" x0=");
+                put_hex_u64(buf, &mut k, x0);
+                put_bytes(buf, &mut k, b" x1=");
+                put_hex_u64(buf, &mut k, x1);
+                put_bytes(buf, &mut k, b" x2=");
+                put_hex_u64(buf, &mut k, x2);
+                put_bytes(buf, &mut k, b" x3=");
+                put_hex_u64(buf, &mut k, x3);
+                put_byte(buf, &mut k, b'\n');
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+            crate::arch::aarch64::watchpoint::disarm();
+            // Advance ELR past the trapped instruction (always 4 bytes
+            // on AArch64; no Thumb in EL1).  Per ARM ARM, ELR points
+            // to the trapped insn for watchpoint exceptions.
+            frame.elr = frame.elr.wrapping_add(4);
+            frame_sp
+        }
+
         // Data Abort from EL1 (e.g., kernel accessing unmapped address).
         0x25 => {
             let far: u64;

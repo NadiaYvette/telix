@@ -1048,14 +1048,16 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
     // println! here — this runs under scheduler critical sections
     // that hold serial-incompatible locks; the trap handler prints
     // when the watchpoint fires.
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
         static WP_ARMED: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
         // Gated by `wp_savedsp=1` on the kernel cmdline.  Default off
-        // because the trigger CSRs (tselect/tdata1/tdata2) raise
-        // Illegal Instruction on QEMU's default rv64 cpu — only
-        // works with `-cpu max` or Sdtrig-aware hardware.
+        // — on rv64 the trigger CSRs need Sdtrig-capable QEMU
+        // (`-cpu max` or hardware); on aarch64 QEMU virt supports
+        // DBGWVR/DBGWCR natively but we still gate behind the same
+        // flag so default boots aren't affected by an unexpected
+        // EC=0x35 trap during early init.
         let enabled = crate::boot::cmdline::BOOT_CONFIG
             .wp_savedsp
             .load(Ordering::Relaxed) != 0;
@@ -1066,7 +1068,10 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
                 .is_ok()
         {
             let addr = &thread.saved_sp as *const u64 as u64;
+            #[cfg(target_arch = "riscv64")]
             crate::arch::riscv64::watchpoint::arm(addr);
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::watchpoint::arm(addr);
         }
     }
     thread.saved_sp = new_value;
