@@ -202,6 +202,20 @@ pub fn kmain() -> ! {
     // Background page pre-zeroing daemon.
     sched::spawn(mm::zeropool::zero_daemon, 1, 5).expect("spawn zero_daemon");
 
+    // #228 watchpoint smoke test — wp_savedsp=2 fires the WP on a
+    // known address, validating that EC=0x35 routing reaches the
+    // handler.  Otherwise we can't tell a missed fire from a missing
+    // hit.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let wp_mode = crate::boot::cmdline::BOOT_CONFIG
+            .wp_savedsp
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if wp_mode == 2 {
+            crate::arch::aarch64::watchpoint::smoke_test();
+        }
+    }
+
     // #228 alloc/free hammer kthreads if requested via cmdline knob.
     let hammer_n = crate::boot::cmdline::BOOT_CONFIG
         .alloc_hammer

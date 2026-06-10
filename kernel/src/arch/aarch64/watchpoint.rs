@@ -28,11 +28,13 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const DBGWCR_E:   u64 = 1 << 0;
-const DBGWCR_PAC_EL1: u64 = 0b01 << 1;
+const DBGWCR_PAC_EL1: u64 = 0b01 << 1;     // PAC=01 → privileged (EL1+)
 const DBGWCR_LSC_STORE: u64 = 0b10 << 3;
 const DBGWCR_BAS_8BYTE: u64 = 0xFF << 5;
-const DBGWCR_HMC: u64 = 1 << 13;
-// SSC=00, LBN=0, WT=0, MASK=0 — defaults to all-zero.
+// HMC=0, SSC=00, PAC=01 → match in NS EL1 (Linux kernel watchpoint
+// convention, per ARM ARM Table D7-5).  Earlier HMC=1 setting was
+// for EL2-also matches and didn't fire EL1 stores in our smoke test.
+const DBGWCR_SSC_BOTH: u64 = 0b11 << 14;   // SSC=11 → secure + non-secure
 
 const MDSCR_MDE: u64 = 1 << 15;
 
@@ -51,8 +53,15 @@ pub fn arm(addr: u64) {
         | DBGWCR_PAC_EL1
         | DBGWCR_LSC_STORE
         | DBGWCR_BAS_8BYTE
-        | DBGWCR_HMC;
+        | DBGWCR_SSC_BOTH;
     unsafe {
+        // OSLAR_EL1 = 0 (release OS Lock).  Default state varies and
+        // a set OS Lock blocks watchpoint events from firing.
+        core::arch::asm!(
+            "msr oslar_el1, {}",
+            in(reg) 0u64,
+            options(nostack, preserves_flags),
+        );
         // DBGWVR0_EL1 = addr
         core::arch::asm!(
             "msr dbgwvr0_el1, {}",
@@ -100,4 +109,23 @@ pub fn disarm() {
 #[allow(dead_code)]
 pub fn armed_addr() -> u64 {
     ARMED_ADDR.load(Ordering::Acquire)
+}
+
+/// Deliberately fire the watchpoint to verify the EC=0x35 path is
+/// wired correctly.  Arms on a local u64, writes through volatile,
+/// expects a WP-HIT log line.  Used once at boot from main.rs when
+/// `wp_savedsp=2` is set, to validate the infrastructure before
+/// believing or disbelieving real-world hits.
+#[allow(dead_code)]
+pub fn smoke_test() {
+    static SMOKE_TARGET: AtomicU64 = AtomicU64::new(0);
+    let addr = &SMOKE_TARGET as *const _ as u64;
+    crate::println!("[#228 WP smoke-test] arming on {:#x}", addr);
+    arm(addr);
+    // Write to trigger.  If the watchpoint fires, the handler logs
+    // WP-HIT and advances ELR past this store.  After the store, the
+    // watchpoint is disarmed by the handler, so this write completes.
+    SMOKE_TARGET.store(0xDEADBEEF_CAFEBABE, Ordering::SeqCst);
+    crate::println!("[#228 WP smoke-test] post-store: {:#x}",
+        SMOKE_TARGET.load(Ordering::SeqCst));
 }
