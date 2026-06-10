@@ -23,7 +23,11 @@
 //!   [23:20] MASK - address mask (0 = exact match)
 //!
 //! MDSCR_EL1.MDE (bit 15) must be 1 for watchpoints to fire in
-//! Monitor Debug-mode; we set it on arm() and leave it set.
+//! Monitor Debug-mode; KDE (bit 13) must also be 1 for same-EL
+//! events (EL1→EL1) per ARM ARM AArch64.GenerateDebugExceptionsFrom
+//! and QEMU debug_helper.c aa64_generate_debug_exceptions (cur_el ==
+//! debug_el branch).  PSTATE.D in DAIF must also be clear.  We set
+//! MDE+KDE on arm() and leave them set; D is left to the caller.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -37,6 +41,10 @@ const DBGWCR_BAS_8BYTE: u64 = 0xFF << 5;
 const DBGWCR_SSC_BOTH: u64 = 0b11 << 14;   // SSC=11 → secure + non-secure
 
 const MDSCR_MDE: u64 = 1 << 15;
+// KDE = Kernel Debug Enable.  Required for same-EL (EL1→EL1) debug
+// exceptions to fire when cur_el == debug_el (see ARM ARM section
+// D2.4 "Routing debug exceptions" + QEMU aa64_generate_debug_exceptions).
+const MDSCR_KDE: u64 = 1 << 13;
 
 /// Last-armed address; 0 = disarmed.  Read by the trap handler.
 static ARMED_ADDR: AtomicU64 = AtomicU64::new(0);
@@ -82,7 +90,7 @@ pub fn arm(addr: u64) {
             out(reg) mdscr,
             options(nomem, nostack, preserves_flags),
         );
-        mdscr |= MDSCR_MDE;
+        mdscr |= MDSCR_MDE | MDSCR_KDE;
         core::arch::asm!(
             "msr mdscr_el1, {}",
             in(reg) mdscr,

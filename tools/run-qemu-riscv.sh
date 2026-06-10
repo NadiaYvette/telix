@@ -15,7 +15,7 @@ SSH_PORT="${TELIX_SSH_PORT:-3222}"
 GDB_PORT="${TELIX_GDB_PORT:-3234}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DISK_IMG="$SCRIPT_DIR/../test.img"
+DISK_IMG="${TELIX_DISK_IMG:-$SCRIPT_DIR/../test.img}"
 
 # RAM size: parity with x86 default (2 GiB) and aarch64.  256 MiB ran
 # out of phys pages during I/O-server spawn; override via `TELIX_MEM`.
@@ -57,4 +57,5 @@ if [ "${1:-}" = "--debug" ]; then
     echo "Waiting for GDB on localhost:${GDB_PORT} ..." >&2
 fi
 
-exec qemu-system-riscv64 "${QEMU_ARGS[@]}"
+QEMU_BIN="${TELIX_QEMU:-qemu-system-riscv64}"
+exec "$QEMU_BIN" "${QEMU_ARGS[@]}"

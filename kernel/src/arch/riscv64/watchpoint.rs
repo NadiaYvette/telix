@@ -91,3 +91,19 @@ pub fn disarm() {
 pub fn armed_addr() -> u64 {
     ARMED_ADDR.load(Ordering::Acquire)
 }
+
+/// Deliberately fire the watchpoint to verify Sdtrig and scause=3
+/// routing are wired correctly.  Arms on a local static, writes
+/// through volatile, expects a WP-HIT log line.  Used once at boot
+/// from arch::riscv64::boot when `wp_savedsp=2`, to validate the
+/// infrastructure before believing or disbelieving real-world hits.
+#[allow(dead_code)]
+pub fn smoke_test() {
+    static SMOKE_TARGET: AtomicU64 = AtomicU64::new(0);
+    let addr = &SMOKE_TARGET as *const _ as u64;
+    crate::println!("[#228 WP smoke-test] arming on {:#x}", addr);
+    arm(addr);
+    SMOKE_TARGET.store(0xDEADBEEF_CAFEBABE, Ordering::SeqCst);
+    crate::println!("[#228 WP smoke-test] post-store: {:#x}",
+        SMOKE_TARGET.load(Ordering::SeqCst));
+}

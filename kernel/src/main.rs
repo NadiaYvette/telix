@@ -215,6 +215,15 @@ pub fn kmain() -> ! {
             crate::arch::aarch64::watchpoint::smoke_test();
         }
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let wp_mode = crate::boot::cmdline::BOOT_CONFIG
+            .wp_savedsp
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if wp_mode == 2 {
+            crate::arch::riscv64::watchpoint::smoke_test();
+        }
+    }
 
     // #228 alloc/free hammer kthreads if requested via cmdline knob.
     let hammer_n = crate::boot::cmdline::BOOT_CONFIG
