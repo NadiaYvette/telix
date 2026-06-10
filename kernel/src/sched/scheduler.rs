@@ -982,6 +982,14 @@ fn log_saved_sp_out_of_range(tid: u32, new_value: u64, kbase: u64, ksize: u64) {
 #[track_caller]
 pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
     let _thread_addr = thread as *const _ as u64;
+    // #228 kstack stamp probe: place a magic value on the LOCAL stack
+    // frame at entry and check it at function exit.  If a scribble
+    // surface clobbers the caller's spilled `thread*` slot, it likely
+    // also hits a nearby kstack slot — this canary detects that
+    // class of corruption window.  The volatile read at exit
+    // prevents the compiler from optimizing the local away.
+    let canary: u64 = 0xDEAD_C0DE_DEAD_C0DE;
+    let canary_ptr: *const u64 = &canary;
     #[cfg(target_arch = "x86_64")]
     {
         let thread_addr = _thread_addr;
@@ -1003,6 +1011,45 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
                     caller.file(),
                     caller.line(),
                     n,
+                );
+            }
+        }
+    }
+    // rv64: slab + identity-mapped RAM at 0x8000_0000..0x1_0000_0000.
+    // aarch64: slab identity 0x4000_0000..0xC000_0000 OR
+    // SLAB_THREAD_REGION 0xC000_0000..0xFFFF_FFFF (per-Thread VA).
+    #[cfg(target_arch = "riscv64")]
+    {
+        let in_ram = _thread_addr >= 0x8000_0000
+            && _thread_addr < 0x1_0000_0000;
+        if !in_ram {
+            let caller = core::panic::Location::caller();
+            static BAD_THREAD_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = BAD_THREAD_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                crate::println!(
+                    "SAVED-SP-WRITE-BAD-THREAD: thread={:#x} new_sp={:#x} caller={}:{} n={}",
+                    _thread_addr, new_value, caller.file(), caller.line(), n,
+                );
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let in_identity = _thread_addr >= 0x4000_0000
+            && _thread_addr < 0xC000_0000;
+        let in_slab_region = _thread_addr >= 0xC000_0000
+            && _thread_addr < 0x1_0000_0000;
+        if !in_identity && !in_slab_region {
+            let caller = core::panic::Location::caller();
+            static BAD_THREAD_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = BAD_THREAD_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                crate::println!(
+                    "SAVED-SP-WRITE-BAD-THREAD: thread={:#x} new_sp={:#x} caller={}:{} n={}",
+                    _thread_addr, new_value, caller.file(), caller.line(), n,
                 );
             }
         }
@@ -1169,6 +1216,32 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
         }
     }
     thread.saved_sp = new_value;
+    // #228 stamp probe: verify the entry-time stack canary survived
+    // the function body.  A mismatch means some external write hit
+    // our local stack frame between entry and store — strong signal
+    // that the corruption surface is intra-function kstack scribble.
+    // Volatile read prevents the compiler from constant-folding the
+    // check away.
+    let canary_check = unsafe { canary_ptr.read_volatile() };
+    if canary_check != 0xDEAD_C0DE_DEAD_C0DE {
+        let caller = core::panic::Location::caller();
+        static CANARY_BREAK_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = CANARY_BREAK_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            crate::println!(
+                "KSTACK-STAMP-BROKEN: canary={:#x} thread={:#x} tid={} new_sp={:#x} canary_va={:p} caller={}:{} n={}",
+                canary_check,
+                _thread_addr,
+                thread.id,
+                new_value,
+                canary_ptr,
+                caller.file(),
+                caller.line(),
+                n,
+            );
+        }
+    }
 }
 
 #[inline]
