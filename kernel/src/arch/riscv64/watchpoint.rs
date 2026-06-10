@@ -181,6 +181,13 @@ pub fn armed_addr() -> u64 {
     ARMED_ADDR.load(Ordering::Acquire)
 }
 
+/// Address last passed to arm() (sticky — not cleared by disarm()).
+/// Used by the scheduler to bootstrap arming on APs once the BSP
+/// has registered the target slot.
+pub fn watched_addr() -> u64 {
+    WATCHED_ADDR.load(Ordering::Acquire)
+}
+
 /// Deliberately fire the watchpoint to verify Sdtrig and scause=3
 /// routing are wired correctly.  Arms on a local static, writes
 /// through volatile, expects a WP-HIT log line.  Used once at boot

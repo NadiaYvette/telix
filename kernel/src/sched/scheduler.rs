@@ -1079,18 +1079,34 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
         let enabled = crate::boot::cmdline::BOOT_CONFIG
             .wp_savedsp
             .load(Ordering::Relaxed) != 0;
-        if enabled && thread.id == 4 {
+        if enabled {
             let cpu = smp::cpu_id() as usize;
-            if cpu < MAX_CPUS
-                && WP_ARMED_PER_CPU[cpu]
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let addr = &thread.saved_sp as *const u64 as u64;
+            // First CPU to touch tid=4 publishes the address in
+            // watchpoint::WATCHED_ADDR via arm().  Subsequent CPUs
+            // bootstrap from that on their first call here regardless
+            // of which tid they're switching — they don't need to
+            // wait for tid=4 to be scheduled on them, which may never
+            // happen during boot if zero_daemon stays on CPU 0.
+            let candidate_addr: Option<u64> = if thread.id == 4 {
+                Some(&thread.saved_sp as *const u64 as u64)
+            } else {
                 #[cfg(target_arch = "riscv64")]
-                crate::arch::riscv64::watchpoint::arm(addr);
+                let v = crate::arch::riscv64::watchpoint::watched_addr();
                 #[cfg(target_arch = "aarch64")]
-                crate::arch::aarch64::watchpoint::arm(addr);
+                let v = crate::arch::aarch64::watchpoint::watched_addr();
+                if v != 0 { Some(v) } else { None }
+            };
+            if let Some(addr) = candidate_addr {
+                if cpu < MAX_CPUS
+                    && WP_ARMED_PER_CPU[cpu]
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    #[cfg(target_arch = "riscv64")]
+                    crate::arch::riscv64::watchpoint::arm(addr);
+                    #[cfg(target_arch = "aarch64")]
+                    crate::arch::aarch64::watchpoint::arm(addr);
+                }
             }
         }
     }

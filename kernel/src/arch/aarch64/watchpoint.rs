@@ -119,6 +119,15 @@ pub fn armed_addr() -> u64 {
     ARMED_ADDR.load(Ordering::Acquire)
 }
 
+/// Sticky address — last value passed to arm(), even after disarm().
+/// The aarch64 trap path doesn't have its full re-arm/learn flow yet
+/// so this is currently just a mirror of `armed_addr()`; the scheduler
+/// uses it via a per-arch fn so we can extend the rv64 variant
+/// separately.
+pub fn watched_addr() -> u64 {
+    ARMED_ADDR.load(Ordering::Acquire)
+}
+
 /// Deliberately fire the watchpoint to verify the EC=0x35 path is
 /// wired correctly.  Arms on a local u64, writes through volatile,
 /// expects a WP-HIT log line.  Used once at boot from main.rs when
