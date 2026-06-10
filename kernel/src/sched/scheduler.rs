@@ -1019,6 +1019,56 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
             log_saved_sp_out_of_range(thread.id, new_value, kbase, ksize);
         }
     }
+    // #228 watchpoint: log every write of 0 to saved_sp.  KEPOCH-BAIL
+    // fires deterministically 5×/boot for tid=4 (zero_daemon) reading
+    // sp=0.  Either a legitimate writer is passing 0 (caller bug) or
+    // some non-write_saved_sp path is scribbling the slot.  If this
+    // log fires before/at the same count as KEPOCH-BAIL, it's the
+    // former; if it never fires while KEPOCH-BAIL still triggers, it
+    // confirms a non-write_saved_sp writer and we need a real hardware
+    // watchpoint to catch it.
+    if new_value == 0 {
+        let caller = core::panic::Location::caller();
+        static ZERO_WRITE_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = ZERO_WRITE_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            crate::println!(
+                "SAVED-SP-WRITE-ZERO: tid={} cur={:#x} caller={}:{} n={}",
+                thread.id, thread.saved_sp,
+                caller.file(), caller.line(), n,
+            );
+        }
+    }
+    // #228 rv64 hardware watchpoint: arm a S-mode store trigger on
+    // tid=4 (zero_daemon)'s saved_sp slot the FIRST time we touch it,
+    // so any subsequent non-write_saved_sp store traps Breakpoint and
+    // we get the offending PC.  The trap handler disarms after the
+    // first hit so we don't loop.  Only arm once per boot.  No
+    // println! here — this runs under scheduler critical sections
+    // that hold serial-incompatible locks; the trap handler prints
+    // when the watchpoint fires.
+    #[cfg(target_arch = "riscv64")]
+    {
+        static WP_ARMED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        // Gated by `wp_savedsp=1` on the kernel cmdline.  Default off
+        // because the trigger CSRs (tselect/tdata1/tdata2) raise
+        // Illegal Instruction on QEMU's default rv64 cpu — only
+        // works with `-cpu max` or Sdtrig-aware hardware.
+        let enabled = crate::boot::cmdline::BOOT_CONFIG
+            .wp_savedsp
+            .load(Ordering::Relaxed) != 0;
+        if enabled
+            && thread.id == 4
+            && WP_ARMED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            let addr = &thread.saved_sp as *const u64 as u64;
+            crate::arch::riscv64::watchpoint::arm(addr);
+        }
+    }
     thread.saved_sp = new_value;
 }
 

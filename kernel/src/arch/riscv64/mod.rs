@@ -6,6 +6,7 @@ pub mod serial;
 pub mod smp;
 pub mod trap;
 pub mod usertest;
+pub mod watchpoint;
 
 use core::arch::global_asm;
 

@@ -59,6 +59,15 @@ pub struct BootConfig {
     /// Mimics kstack lifecycle to surface path-specific corruption.
     pub alloc_hammer_persist: AtomicU8,
 
+    /// #228 rv64 hardware watchpoint on tid=4 saved_sp.  1 = enable.
+    /// Requires QEMU with `Sdtrig` extension (default `-cpu rv64` does
+    /// NOT support it — `csrrw tselect` raises Illegal Instruction).
+    /// On real hardware or `-cpu max` setups, arms a S-mode store
+    /// watchpoint on tid=4's Thread.saved_sp slot the first time
+    /// `write_saved_sp` touches it; the next non-write_saved_sp store
+    /// to that slot traps Breakpoint and logs the offending PC.
+    pub wp_savedsp: AtomicU8,
+
     /// Whether command line was successfully parsed.
     pub parsed: AtomicU8,
 }
@@ -71,6 +80,7 @@ pub static BOOT_CONFIG: BootConfig = BootConfig {
     dispatch_claim_helper: AtomicU8::new(0),
     alloc_hammer: AtomicU8::new(0),
     alloc_hammer_persist: AtomicU8::new(0),
+    wp_savedsp: AtomicU8::new(0),
     parsed: AtomicU8::new(0),
 };
 
@@ -174,6 +184,13 @@ fn handle_param(key: &[u8], val: &[u8]) {
             // #228 persistent-allocation hammer thread count.  Caps at 255.
             if let Some(n) = parse_u64(val) {
                 BOOT_CONFIG.alloc_hammer_persist.store(n.min(255) as u8, Ordering::Relaxed);
+            }
+        }
+        b"wp_savedsp" => {
+            // #228 rv64 hardware watchpoint enable.  Requires QEMU
+            // with Sdtrig extension; default rv64 cpu does not.
+            if let Some(n) = parse_u64(val) {
+                BOOT_CONFIG.wp_savedsp.store(n.min(255) as u8, Ordering::Relaxed);
             }
         }
         _ => {

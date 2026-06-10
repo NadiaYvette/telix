@@ -28,6 +28,7 @@ const SCAUSE_S_TIMER_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 5;
 const SCAUSE_S_EXTERNAL_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 9;
 const SCAUSE_ECALL_FROM_UMODE: u64 = 8;
 const SCAUSE_ECALL_FROM_SMODE: u64 = 9;
+const SCAUSE_BREAKPOINT: u64 = 3;
 const SCAUSE_INST_PAGE_FAULT: u64 = 12;
 const SCAUSE_LOAD_PAGE_FAULT: u64 = 13;
 const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
@@ -260,6 +261,70 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             }
             SGI_RECV_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             crate::sched::tick(frame_sp)
+        }
+
+        SCAUSE_BREAKPOINT => {
+            // #228 hardware watchpoint hit.  tselect/tdata2 was armed
+            // via watchpoint::arm() on a specific Thread.saved_sp slot;
+            // this fires whenever S-mode (or M-mode) writes there.
+            //
+            // Log sepc (offending PC), x1..x7 (key call-args), then
+            // advance sepc past the trapped instruction so we can
+            // continue.  Disarm so we only catch the first hit.
+            let stval = read_stval();
+            let live_scause = read_scause();
+            let cpu = crate::sched::smp::cpu_id();
+            let tid = crate::sched::current_thread_id();
+            let ra = frame.regs[0];
+            let sp = frame.regs[1];
+            let a0 = frame.regs[9];
+            let a1 = frame.regs[10];
+            let a2 = frame.regs[11];
+            let a3 = frame.regs[12];
+            // Direct UART emit to skip core::fmt (which would touch
+            // the kstack again; if that kstack is the corrupt one we
+            // loop forever).
+            {
+                use crate::arch::riscv64::serial::{
+                    handler_write_bytes, put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                };
+                let mut buf = [0u8; 512];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"WP-HIT: cpu=");
+                put_dec_u64(&mut buf, &mut k, cpu as u64);
+                put_bytes(&mut buf, &mut k, b" tid=");
+                put_dec_u64(&mut buf, &mut k, tid as u64);
+                put_bytes(&mut buf, &mut k, b" sepc=");
+                put_hex_u64(&mut buf, &mut k, frame.sepc);
+                put_bytes(&mut buf, &mut k, b" stval=");
+                put_hex_u64(&mut buf, &mut k, stval as u64);
+                put_bytes(&mut buf, &mut k, b" scause=");
+                put_hex_u64(&mut buf, &mut k, live_scause);
+                put_bytes(&mut buf, &mut k, b" ra=");
+                put_hex_u64(&mut buf, &mut k, ra);
+                put_bytes(&mut buf, &mut k, b" sp=");
+                put_hex_u64(&mut buf, &mut k, sp);
+                put_bytes(&mut buf, &mut k, b" a0=");
+                put_hex_u64(&mut buf, &mut k, a0);
+                put_bytes(&mut buf, &mut k, b" a1=");
+                put_hex_u64(&mut buf, &mut k, a1);
+                put_bytes(&mut buf, &mut k, b" a2=");
+                put_hex_u64(&mut buf, &mut k, a2);
+                put_bytes(&mut buf, &mut k, b" a3=");
+                put_hex_u64(&mut buf, &mut k, a3);
+                put_byte(&mut buf, &mut k, b'\n');
+                handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+            // Disarm so we don't loop on repeated stores from the
+            // same offending instruction.
+            super::watchpoint::disarm();
+            // Advance sepc past the trapped instruction (4 bytes for
+            // a standard 32-bit insn; 2 for a compressed one — peek
+            // the low bits to tell which).
+            let insn_first = unsafe { (frame.sepc as *const u16).read_volatile() };
+            let insn_len = if (insn_first & 0x3) == 0x3 { 4 } else { 2 };
+            frame.sepc = frame.sepc.wrapping_add(insn_len);
+            frame_sp
         }
 
         SCAUSE_S_EXTERNAL_IRQ => {
