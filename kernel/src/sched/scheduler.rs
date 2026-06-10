@@ -1033,6 +1033,81 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
     };
     #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
     let entry_sp: u64 = 0;
+    // #228 fp-chain walk: with `-C force-frame-pointers=yes` rv64
+    // builds emit `addi s0, sp, FRAMESIZE` in every prologue, so s0
+    // points at the saved-ra slot's high address.  Walk the chain:
+    //   fp - 8  = saved ra of THIS frame
+    //   fp - 16 = saved fp = caller's fp
+    // ...repeat.  Each saved-ra should be a kernel code address; a
+    // 0 or wildly out-of-range value means that frame's ra slot
+    // was scribbled, which is the cause=0xc sepc=0x0 return-to-NULL
+    // pattern.  Log up to one violation per call to avoid serial
+    // floods.
+    #[cfg(target_arch = "riscv64")]
+    {
+        let mut fp: u64;
+        unsafe {
+            core::arch::asm!(
+                "mv {}, s0",
+                out(reg) fp,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let mut logged_this_call = false;
+        for depth in 0..16u32 {
+            // Stop walk if fp leaves the kernel RAM range or is
+            // misaligned (frame pointers are 16-byte aligned).
+            if fp < 0x8000_0000 || fp >= 0x1_0000_0000 || (fp & 0xF) != 0 {
+                break;
+            }
+            let saved_ra = unsafe { ((fp - 8) as *const u64).read_volatile() };
+            let saved_fp = unsafe { ((fp - 16) as *const u64).read_volatile() };
+            // Natural kstack-bottom terminator: both saved-ra and
+            // saved-fp are zero (the page was just zero-filled at
+            // thread spawn and we walked off the top of the chain).
+            // Stop the walk here; don't flag as corruption.
+            if saved_ra == 0 && saved_fp == 0 {
+                break;
+            }
+            // Kernel code lives roughly in 0x8020_0000..0x80a0_0000.
+            // Anything outside that range (and especially 0) is bogus
+            // ONLY if there's still a chain above (saved_fp suggests
+            // more frames).
+            let ra_is_bogus = saved_ra == 0
+                || saved_ra < 0x8020_0000
+                || saved_ra > 0x80a0_0000;
+            if ra_is_bogus && !logged_this_call {
+                logged_this_call = true;
+                let caller = core::panic::Location::caller();
+                static FP_CHAIN_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = FP_CHAIN_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    crate::println!(
+                        "KSTACK-FP-CHAIN-BAD-RA: depth={} fp={:#x} saved_ra={:#x} saved_fp={:#x} tid={} thread={:#x} new_sp={:#x} entry_sp={:#x} caller={}:{} n={}",
+                        depth,
+                        fp,
+                        saved_ra,
+                        saved_fp,
+                        thread.id,
+                        _thread_addr,
+                        new_value,
+                        entry_sp,
+                        caller.file(),
+                        caller.line(),
+                        n,
+                    );
+                }
+            }
+            // Caller's fp must be strictly above (higher addr) ours;
+            // stack grows down so each frame's fp is at a higher
+            // address than the callee's.  Break on regression.
+            if saved_fp <= fp {
+                break;
+            }
+            fp = saved_fp;
+        }
+    }
     // #228 kstack saved-ra mirror: cause=0xc sepc=0x0 in stress runs
     // = ret loaded ra=0 because some frame's saved-ra slot got
     // scribbled.  Snapshot uses a per-CPU static buffer (rather than
