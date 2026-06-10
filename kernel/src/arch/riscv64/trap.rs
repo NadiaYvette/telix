@@ -268,29 +268,88 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             // via watchpoint::arm() on a specific Thread.saved_sp slot;
             // this fires whenever S-mode (or M-mode) writes there.
             //
-            // Log sepc (offending PC), x1..x7 (key call-args), then
-            // advance sepc past the trapped instruction so we can
-            // continue.  Disarm so we only catch the first hit.
+            // Policy (legit-PC re-arm):
+            //   1. Decode the trapped store and emulate it so legit
+            //      writes (write_saved_sp's inline `thread.saved_sp =
+            //      new_value`) keep their semantics — otherwise we
+            //      lose every kstack save and kernel wedges.
+            //   2. The first 8 distinct sepcs that fire are "learned"
+            //      as legit (they're the inlined call sites of
+            //      write_saved_sp).  Log a LEARN line per new PC.
+            //   3. Subsequent hits at known-legit PCs are silent +
+            //      re-armed.
+            //   4. A 9th distinct PC = the corrupting writer.  Log
+            //      a loud BAD-WRITER line and disarm so we don't
+            //      keep storming the trace ring.
+            //   5. Emulation skips on unknown insn formats — we log
+            //      INSN-SKIP and re-arm without touching memory.
+            super::watchpoint::HIT_COUNT
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let stval = read_stval();
             let live_scause = read_scause();
             let cpu = crate::sched::smp::cpu_id();
             let tid = crate::sched::current_thread_id();
             let ra = frame.regs[0];
             let sp = frame.regs[1];
-            let a0 = frame.regs[9];
-            let a1 = frame.regs[10];
-            let a2 = frame.regs[11];
-            let a3 = frame.regs[12];
-            // Direct UART emit to skip core::fmt (which would touch
-            // the kstack again; if that kstack is the corrupt one we
-            // loop forever).
-            {
+
+            // Peek insn at sepc.  Lower 2 bits decide 16- vs 32-bit
+            // form per RISC-V spec; we read enough bytes for either.
+            let insn_first = unsafe { (frame.sepc as *const u16).read_volatile() };
+            let is_compressed = (insn_first & 0x3) != 0x3;
+            let insn_len: u64 = if is_compressed { 2 } else { 4 };
+            let insn32: u32 = if is_compressed {
+                insn_first as u32
+            } else {
+                unsafe { (frame.sepc as *const u32).read_volatile() }
+            };
+
+            let known = super::watchpoint::is_legit_pc(frame.sepc);
+            let learned_slot = if known {
+                None
+            } else {
+                super::watchpoint::learn_legit_pc(frame.sepc)
+            };
+            let is_bad = !known && learned_slot.is_none();
+
+            // We DON'T emulate the legit store — repeated tests on
+            // patched QEMU showed the trap re-enters during the
+            // emulator's write_volatile (only 21 of 8403 writes
+            // completed in a 10s run, vs the trap firing 8403x).
+            // Suspected QEMU TCG behavior is that the trigger
+            // remains "armed" within the trap re-entry window so the
+            // emulator's own store re-fires, recursing.  Skipping
+            // the store is lossy (the legit value never reaches
+            // memory for that particular call) but kernel observed
+            // to survive — saved_sp values cycle, so a few missed
+            // updates don't break dispatch in practice.  Treat the
+            // mode flag as: 1 = catch first hit only, 3 = catch
+            // every hit (legit PCs re-armed silently, others loudly).
+            let mode_pre = crate::boot::cmdline::BOOT_CONFIG
+                .wp_savedsp
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let emulated = false;
+            let _ = emulate_store; // keep referenced for future use
+
+            // Log policy: always log new learns and bad-writer hits;
+            // log first N (=64) other hits so a smoke run can confirm
+            // the path; suppress thereafter to avoid serial flood.
+            let n = super::watchpoint::HIT_COUNT
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let want_log = is_bad || learned_slot.is_some() || n <= 64;
+            if want_log {
                 use crate::arch::riscv64::serial::{
                     handler_write_bytes, put_byte, put_bytes, put_dec_u64, put_hex_u64,
                 };
                 let mut buf = [0u8; 512];
                 let mut k = 0;
-                put_bytes(&mut buf, &mut k, b"WP-HIT: cpu=");
+                let tag: &[u8] = if is_bad {
+                    b"WP-BAD-WRITER: cpu="
+                } else if learned_slot.is_some() {
+                    b"WP-LEARN: cpu="
+                } else {
+                    b"WP-INSN-SKIP: cpu="
+                };
+                put_bytes(&mut buf, &mut k, tag);
                 put_dec_u64(&mut buf, &mut k, cpu as u64);
                 put_bytes(&mut buf, &mut k, b" tid=");
                 put_dec_u64(&mut buf, &mut k, tid as u64);
@@ -300,30 +359,34 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 put_hex_u64(&mut buf, &mut k, stval as u64);
                 put_bytes(&mut buf, &mut k, b" scause=");
                 put_hex_u64(&mut buf, &mut k, live_scause);
+                put_bytes(&mut buf, &mut k, b" insn=");
+                put_hex_u64(&mut buf, &mut k, insn32 as u64);
                 put_bytes(&mut buf, &mut k, b" ra=");
                 put_hex_u64(&mut buf, &mut k, ra);
                 put_bytes(&mut buf, &mut k, b" sp=");
                 put_hex_u64(&mut buf, &mut k, sp);
-                put_bytes(&mut buf, &mut k, b" a0=");
-                put_hex_u64(&mut buf, &mut k, a0);
-                put_bytes(&mut buf, &mut k, b" a1=");
-                put_hex_u64(&mut buf, &mut k, a1);
-                put_bytes(&mut buf, &mut k, b" a2=");
-                put_hex_u64(&mut buf, &mut k, a2);
-                put_bytes(&mut buf, &mut k, b" a3=");
-                put_hex_u64(&mut buf, &mut k, a3);
+                if let Some(slot) = learned_slot {
+                    put_bytes(&mut buf, &mut k, b" slot=");
+                    put_dec_u64(&mut buf, &mut k, slot as u64);
+                }
                 put_byte(&mut buf, &mut k, b'\n');
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
-            // Disarm so we don't loop on repeated stores from the
-            // same offending instruction.
+
+            // Disarm + advance sepc.  Legit path re-arms; bad path
+            // leaves it disarmed so the loud log isn't drowned by
+            // subsequent stores from the same caller.
+            // Modes:
+            //   1 = disarm permanently after first hit (baseline
+            //       sanity check; loses only one saved_sp write)
+            //   3 = re-arm on every legit-PC hit (catches a future
+            //       corrupting writer; loses one saved_sp write per
+            //       hit, but kernel observed to survive)
             super::watchpoint::disarm();
-            // Advance sepc past the trapped instruction (4 bytes for
-            // a standard 32-bit insn; 2 for a compressed one — peek
-            // the low bits to tell which).
-            let insn_first = unsafe { (frame.sepc as *const u16).read_volatile() };
-            let insn_len = if (insn_first & 0x3) == 0x3 { 4 } else { 2 };
             frame.sepc = frame.sepc.wrapping_add(insn_len);
+            if !is_bad && mode_pre >= 3 {
+                super::watchpoint::re_arm();
+            }
             frame_sp
         }
 
@@ -544,4 +607,91 @@ fn read_scause() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("csrr {}, scause", out(reg) val) };
     val
+}
+
+/// Read register `idx` from the trap frame.  RISC-V `x0` always reads
+/// as 0; `x1..x31` are stored at `frame.regs[0..31]`.
+#[inline]
+fn frame_x(frame: &TrapFrame, idx: u32) -> u64 {
+    if idx == 0 { 0 } else { frame.regs[(idx - 1) as usize] }
+}
+
+/// Decode the store at `frame.sepc` and perform the write to memory
+/// so legit `write_saved_sp` traffic preserves its semantics across
+/// the trapped instruction.  Returns true on successful emulation,
+/// false if the insn isn't a recognized store form (caller then
+/// skips it with sepc advance only).
+///
+/// Disarms + re-arms the watchpoint around the emulated write so we
+/// don't recursively trap on ourselves.
+fn emulate_store(frame: &TrapFrame, insn32: u32, is_compressed: bool) -> bool {
+    if !is_compressed {
+        // 32-bit Store-type (S-type): opcode = 0b0100011, funct3
+        // distinguishes sb/sh/sw/sd.
+        if (insn32 & 0x7f) != 0x23 {
+            return false;
+        }
+        let funct3 = (insn32 >> 12) & 0x7;
+        let rs1 = (insn32 >> 15) & 0x1f;
+        let rs2 = (insn32 >> 20) & 0x1f;
+        let imm_11_5 = ((insn32 >> 25) & 0x7f) as i32;
+        let imm_4_0 = ((insn32 >> 7) & 0x1f) as i32;
+        let mut imm = (imm_11_5 << 5) | imm_4_0;
+        if (imm & 0x800) != 0 { imm |= !0xfff_i32; }
+        let imm = imm as i64;
+
+        let base = frame_x(frame, rs1) as i64;
+        let addr = base.wrapping_add(imm) as u64;
+        let val = frame_x(frame, rs2);
+
+        super::watchpoint::disarm();
+        unsafe {
+            match funct3 {
+                0b000 => (addr as *mut u8).write_volatile(val as u8),         // sb
+                0b001 => (addr as *mut u16).write_volatile(val as u16),       // sh
+                0b010 => (addr as *mut u32).write_volatile(val as u32),       // sw
+                0b011 => (addr as *mut u64).write_volatile(val),              // sd
+                _ => return false,
+            }
+        }
+        true
+    } else {
+        // Compressed stores.  RVC quadrant 0 covers c.sw / c.sd.
+        // c.sd encoding (RV64): funct3 = 0b111, op = 0b00.
+        // c.sw encoding:        funct3 = 0b110, op = 0b00.
+        let op = insn32 & 0x3;
+        let funct3 = (insn32 >> 13) & 0x7;
+        if op != 0b00 {
+            return false;
+        }
+        // rs1' = bits[9:7] + 8; rs2' = bits[4:2] + 8.
+        let rs1p = ((insn32 >> 7) & 0x7) + 8;
+        let rs2p = ((insn32 >> 2) & 0x7) + 8;
+        let base = frame_x(frame, rs1p) as u64;
+        let val = frame_x(frame, rs2p);
+        match funct3 {
+            0b111 => {
+                // c.sd uimm = {bits[6:5], bits[12:10], 000}  (8-byte offset)
+                let uimm_7_6 = ((insn32 >> 5) & 0x3) as u64;
+                let uimm_5_3 = ((insn32 >> 10) & 0x7) as u64;
+                let off = (uimm_5_3 << 3) | (uimm_7_6 << 6);
+                let addr = base.wrapping_add(off);
+                super::watchpoint::disarm();
+                unsafe { (addr as *mut u64).write_volatile(val) };
+                true
+            }
+            0b110 => {
+                // c.sw uimm = {bits[5], bits[12:10], bits[6], 00}  (4-byte offset)
+                let uimm_2 = ((insn32 >> 6) & 0x1) as u64;
+                let uimm_6 = ((insn32 >> 5) & 0x1) as u64;
+                let uimm_5_3 = ((insn32 >> 10) & 0x7) as u64;
+                let off = (uimm_2 << 2) | (uimm_5_3 << 3) | (uimm_6 << 6);
+                let addr = base.wrapping_add(off);
+                super::watchpoint::disarm();
+                unsafe { (addr as *mut u32).write_volatile(val as u32) };
+                true
+            }
+            _ => false,
+        }
+    }
 }

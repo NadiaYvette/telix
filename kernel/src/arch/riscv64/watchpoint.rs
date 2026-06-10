@@ -44,7 +44,9 @@ static EVER_ARMED: AtomicBool = AtomicBool::new(false);
 /// expected to be S-mode kernel code.
 pub fn arm(addr: u64) {
     EVER_ARMED.store(true, Ordering::Relaxed);
+    ARM_COUNT.fetch_add(1, Ordering::Relaxed);
     ARMED_ADDR.store(addr, Ordering::Release);
+    WATCHED_ADDR.store(addr, Ordering::Release);
     unsafe {
         // Select trigger 0.
         core::arch::asm!(
@@ -84,6 +86,93 @@ pub fn disarm() {
             options(nomem, nostack),
         );
     }
+}
+
+/// Re-arm the trigger on the most recently `arm()`-ed address.
+/// Used by the Breakpoint trap handler to keep catching writers
+/// after the first (legit) hit so later corrupting writers don't go
+/// unobserved.  No-op if `arm()` was never called.
+pub fn re_arm() {
+    let addr = WATCHED_ADDR.load(Ordering::Acquire);
+    if addr == 0 {
+        return;
+    }
+    ARMED_ADDR.store(addr, Ordering::Release);
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x7a0, {}",
+            in(reg) 0u64,
+            options(nomem, nostack),
+        );
+        core::arch::asm!(
+            "csrw 0x7a2, {}",
+            in(reg) addr,
+            options(nomem, nostack),
+        );
+        let tdata1 = TDATA1_TYPE_MCONTROL | TDATA1_M | TDATA1_S | TDATA1_STORE;
+        core::arch::asm!(
+            "csrw 0x7a1, {}",
+            in(reg) tdata1,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Persistent record of the last address passed to `arm()`.  Distinct
+/// from `ARMED_ADDR` (which is cleared by `disarm()`) so `re_arm()`
+/// can find the target without the caller threading it through.
+static WATCHED_ADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Counter incremented on every trap-handler hit.  Useful for a
+/// post-boot sanity check ("did the WP fire at all?") via the
+/// existing scheduler tick log path.
+pub static HIT_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Counter incremented every time arm() is called.  Boot-time only
+/// (we want to know whether the saved_sp arm site ever runs).
+pub static ARM_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Per-process learned set of "legit" store PCs that fired the
+/// watchpoint.  After the first N distinct PCs are observed (the
+/// inlined `thread.saved_sp = new_value` sites from write_saved_sp),
+/// subsequent hits at any of those PCs are quiet and re-armed.
+/// A new PC after the learn slots are full is the corruption writer.
+const LEGIT_PC_SLOTS: usize = 8;
+static LEGIT_PCS: [AtomicU64; LEGIT_PC_SLOTS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+/// Returns true if `pc` is in the learned legit set.
+pub fn is_legit_pc(pc: u64) -> bool {
+    for slot in LEGIT_PCS.iter() {
+        let v = slot.load(Ordering::Acquire);
+        if v == pc { return true; }
+        if v == 0 { return false; }
+    }
+    false
+}
+
+/// Add `pc` to the legit set if there is room.  Returns
+/// `Some(slot_index)` on first insertion, `None` if full or already
+/// present.  Caller uses this to log a single "LEARN" line per new PC.
+pub fn learn_legit_pc(pc: u64) -> Option<usize> {
+    for (i, slot) in LEGIT_PCS.iter().enumerate() {
+        let v = slot.load(Ordering::Acquire);
+        if v == pc { return None; }
+        if v == 0 {
+            // Race-safe-enough for boot single-shot: if CAS loses,
+            // the other thread is also learning the same PC, so the
+            // legit set still contains it.
+            if slot.compare_exchange(0, pc, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return Some(i);
+            } else {
+                continue;
+            }
+        }
+    }
+    None
 }
 
 /// Current armed address, or 0 if not armed.
