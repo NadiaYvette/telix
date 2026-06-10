@@ -992,6 +992,31 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
     // together cover both sides of our return-address slot).
     let canary: u64 = 0xDEAD_C0DE_DEAD_C0DE;
     let canary_ptr: *const u64 = &canary;
+    // #228 slab-canary check: verify the magic stamped at
+    // alloc_thread_entry-time hasn't been scribbled by an unrelated
+    // subsystem.  Cheap volatile read of one u64 at page+0x800.
+    // Catches "another path wrote into the Thread's 4 KiB phys page"
+    // class of bug — exactly what the WP and stack probes missed.
+    if let Some(observed) = check_thread_slab_canary(_thread_addr) {
+        let caller = core::panic::Location::caller();
+        static SLAB_CANARY_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = SLAB_CANARY_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            crate::println!(
+                "THREAD-SLAB-CANARY-BROKEN: thread={:#x} canary_va={:#x} observed={:#x} expected={:#x} tid={} new_sp={:#x} caller={}:{} n={}",
+                _thread_addr,
+                (_thread_addr & !0xFFF) + THREAD_SLAB_CANARY_OFFSET,
+                observed,
+                THREAD_SLAB_CANARY_MAGIC,
+                thread.id,
+                new_value,
+                caller.file(),
+                caller.line(),
+                n,
+            );
+        }
+    }
     // Caller-frame snapshot.  Capture entry-time SP, then read 16
     // u64s starting at sp + CALLER_FRAME_OFFSET (just above our
     // prologue allocation).  Re-read at exit, log first mismatch.
@@ -3571,6 +3596,40 @@ fn thread_port_handler(
 const THREAD_SLAB_SIZE: usize = 1024;
 const _: () = assert!(core::mem::size_of::<Thread>() <= THREAD_SLAB_SIZE);
 
+/// #228 slab-canary probe: each Thread gets its own 4 KiB phys page;
+/// only the first ~1 KiB holds the Thread struct, the rest is unused
+/// padding.  We stamp a magic value at offset 0x800 of every Thread
+/// page on allocation and verify it at write_saved_sp entry.  An
+/// unrelated subsystem scribbling into the Thread page (slab alias
+/// from phys-allocator double-issue family, or stray pointer write)
+/// breaks the magic, so the verify log identifies *that* path even
+/// though direct WP on saved_sp didn't fire.
+const THREAD_SLAB_CANARY_OFFSET: u64 = 0x800;
+const THREAD_SLAB_CANARY_MAGIC: u64 = 0xF00D_CAFE_C0DE_BABE;
+
+/// Stamp the slab canary at offset 0x800 of the Thread's 4 KiB page.
+/// Called once at allocation time.  `thread_va` is whatever address
+/// the kernel uses to access the Thread struct — identity VA on rv64,
+/// SLAB_THREAD_REGION VA on x86_64/aarch64.  The canary lives within
+/// the same 4 KiB page so all three layouts work uniformly.
+fn stamp_thread_slab_canary(thread_va: u64) {
+    let page_base = thread_va & !0xFFF;
+    let canary_addr = page_base + THREAD_SLAB_CANARY_OFFSET;
+    unsafe {
+        (canary_addr as *mut u64).write_volatile(THREAD_SLAB_CANARY_MAGIC);
+    }
+}
+
+/// Verify the slab canary placed at allocation time.  Returns the
+/// observed value if it doesn't match — caller logs.  Returns None
+/// on intact magic.
+fn check_thread_slab_canary(thread_va: u64) -> Option<u64> {
+    let page_base = thread_va & !0xFFF;
+    let canary_addr = page_base + THREAD_SLAB_CANARY_OFFSET;
+    let v = unsafe { (canary_addr as *const u64).read_volatile() };
+    if v == THREAD_SLAB_CANARY_MAGIC { None } else { Some(v) }
+}
+
 fn alloc_thread_entry() -> Option<*mut Thread> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -3616,6 +3675,7 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
         unsafe {
             core::ptr::write(p, Thread::empty());
         }
+        stamp_thread_slab_canary(p as u64);
         Some(p)
     }
     #[cfg(target_arch = "aarch64")]
@@ -3648,6 +3708,7 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
         unsafe {
             core::ptr::write(p, Thread::empty());
         }
+        stamp_thread_slab_canary(p as u64);
         Some(p)
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -3662,6 +3723,7 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
             core::ptr::write_bytes(p as *mut u8, 0, crate::mm::page::page_size());
             core::ptr::write(p, Thread::empty());
         }
+        stamp_thread_slab_canary(p as u64);
         Some(p)
     }
 }
