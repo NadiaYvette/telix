@@ -429,33 +429,378 @@ mod tests {
         });
     }
 
-    // ----- #228 mode-switch race (placeholder) ---------------------
-    //
-    // The "deliberately not modeled" list at the top of this file
-    // calls out the bitmap↔inline mode-switch as out of scope.  That
-    // is the most likely #228 surface — phys.rs encodes the chunk in
-    // a packed u64 with a mode bit, and the inline↔bitmap transition
-    // is not a single CAS.  At fc=63 a free that pushes fc to 64
-    // races with peer allocs that observed the old mode bit, and the
-    // dropped writes can hand the same PA to two callers.
-    //
-    // To extend this crate:
-    //   1. Replace Chunk's separate `bitmap` + `fc` fields with a
-    //      single AtomicU64 state word holding `mode_bit | fc | payload`.
-    //   2. Reimplement alloc / free as packed-u64 CAS, mirroring
-    //      kernel/src/mm/phys.rs:977 (chunk_alloc_one) and 1178
-    //      (chunk_free_one).
-    //   3. Add a `cross_mode_alloc_free_race` test: 3 threads, 2
-    //      alloc + 1 free, initial fc=62 so any successful op flips
-    //      the boundary at 63→64.
-    //   4. Invariant I5: mode bit consistent with fc (mode_bit==inline
-    //      iff fc ≤ INLINE_CAPACITY).
-    //
-    // Estimated effort: ~half a session.  Same crate scaffold; new
-    // submodule `mod_switch`.
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// #228 inline→bitmap mode-switch race model
+// ─────────────────────────────────────────────────────────────────────
+//
+// Models the race in `kernel/src/mm/phys.rs:386-403`
+// (`chunk_alloc_one` fc==64 branch) where `write_bitmap` precedes the
+// state CAS unconditionally.  A losing CAS path's stale bitmap write
+// can land after a winning concurrent `cas_bitmap` modification,
+// reverting that modification and producing single-page double-issue.
+//
+// State encoding (mirrors phys.rs `make_state`, simplified):
+//
+//   bits  0..6  : fc          (free-count, 0..64)
+//   bit   14    : has_bitmap  (mode flag — 0 = inline all-free, 1 = bitmap)
+//   bits 15..20 : bmp_pg      (page index of the bitmap; always 0 here)
+//
+// Bitmap encoding: bit b set = page b is FREE.
+//
+// Operation modeled (alloc):
+//
+//   loop {
+//     s = state.load();
+//     fc = state_fc(s);
+//     if fc == 64 {
+//       // fc==64 path: this is the RACY branch.
+//       let bmp = ...11..10;  // page 0 = metadata, page 1 = allocated
+//       bitmap.store(bmp, Relaxed);            // ← unconditional write
+//       new_s = make_state(62, has_bitmap=true, bmp_pg=0);
+//       if cas_state(s, new_s) { return Some(1); }
+//       // lost CAS — the unconditional write above is what produces
+//       // the bug; we DON'T undo it.
+//       continue;
+//     }
+//     if has_bitmap(s) {
+//       let bmp = bitmap.load(Acquire);
+//       if bmp == 0 { return None; }
+//       let bit = bmp.trailing_zeros();
+//       let new_bmp = bmp & !(1 << bit);
+//       if !cas_bitmap(bmp, new_bmp) { continue; }
+//       // fc dec loop (per phys.rs current code)
+//       loop {
+//         let cur = state_fc(state.load());
+//         if cur == 0 { break; }
+//         if cas_state_fc(cur, cur-1) { break; }
+//       }
+//       return Some(bit);
+//     }
+//   }
+//
+// Invariant under test: no two successful allocs return the same bit.
+// Under the buggy ordering, T_loser's delayed `bitmap.store(target)`
+// can land after T_winner's CAS + a T_3 cas_bitmap, reverting the
+// bit T_3 cleared.  A 4th allocator then re-issues that bit.
+//
+// To keep loom's exploration tractable we model the minimum: 2 threads
+// in the fc==64 path + 1 thread in the has_bitmap path.  The 4th
+// allocator that observes the clobber is replaced by a final
+// invariant check that reads bitmap.count_ones() against
+// `64 - (successful_allocs_count) - 1` (the bitmap page).  If clobber
+// happened, count_ones is too HIGH (some "free" bits in bitmap that
+// are actually held).
+
+const STATE_FC_MASK: u64 = 0x7F;
+const STATE_HAS_BITMAP_BIT: u64 = 1 << 14;
+const STATE_BMP_PG_SHIFT: u32 = 15;
+
+fn state_fc(s: u64) -> u32 {
+    (s & STATE_FC_MASK) as u32
+}
+
+fn state_has_bitmap(s: u64) -> bool {
+    s & STATE_HAS_BITMAP_BIT != 0
+}
+
+fn make_state_ms(fc: u32, has_bmp: bool, bmp_pg: u32) -> u64 {
+    (fc as u64 & STATE_FC_MASK)
+        | (if has_bmp { STATE_HAS_BITMAP_BIT } else { 0 })
+        | ((bmp_pg as u64) << STATE_BMP_PG_SHIFT)
+}
+
+struct ChunkMs {
+    state: AtomicU64,
+    bitmap: AtomicU64,
+    holders: Mutex<u64>,
+}
+
+impl ChunkMs {
+    fn new_all_free() -> Self {
+        // Start in "inline all-free" mode: fc=64, has_bitmap=false.
+        Self {
+            state: AtomicU64::new(make_state_ms(64, false, 0)),
+            bitmap: AtomicU64::new(0), // garbage / unused while !has_bitmap
+            holders: Mutex::new(0),
+        }
+    }
+}
+
+/// Models the buggy `chunk_alloc_one` fc==64 path: unconditional
+/// `bitmap.store(target, Relaxed)` BEFORE the state CAS.  Loser's
+/// stale write can clobber a later cas_bitmap modification.
+fn alloc_ms_buggy(c: &ChunkMs) -> Option<u32> {
+    let target_fc64: u64 = !0u64 & !1u64 & !(1u64 << 1);
+    loop {
+        let s = c.state.load(Ordering::Acquire);
+        let fc = state_fc(s);
+        if fc == 0 {
+            return None;
+        }
+        if fc == 64 {
+            // THE RACY WRITE: unconditional store before CAS.
+            c.bitmap.store(target_fc64, Ordering::Relaxed);
+            let new_s = make_state_ms(62, true, 0);
+            if c.state
+                .compare_exchange(s, new_s, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let mut h = c.holders.lock().unwrap();
+                let mask = 1u64 << 1;
+                assert!(
+                    *h & mask == 0,
+                    "double-alloc on page 1 (fc64 winner)"
+                );
+                *h |= mask;
+                return Some(1);
+            }
+            // Lost CAS.  In the real code this just `continue`s — and
+            // critically the unconditional bitmap write above is NOT
+            // undone.  Retry.
+            continue;
+        }
+        if state_has_bitmap(s) {
+            let bmp = c.bitmap.load(Ordering::Acquire);
+            if bmp == 0 {
+                return None;
+            }
+            let bit = bmp.trailing_zeros();
+            let new_bmp = bmp & !(1u64 << bit);
+            if c.bitmap
+                .compare_exchange(bmp, new_bmp, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            // fc dec loop
+            loop {
+                let cur = c.state.load(Ordering::Acquire);
+                let cur_fc = state_fc(cur);
+                if cur_fc == 0 {
+                    break;
+                }
+                let upd = (cur & !STATE_FC_MASK) | ((cur_fc - 1) as u64);
+                if c.state
+                    .compare_exchange(cur, upd, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            let mut h = c.holders.lock().unwrap();
+            let mask = 1u64 << bit;
+            assert!(
+                *h & mask == 0,
+                "double-alloc on page {} (has_bitmap path)",
+                bit
+            );
+            *h |= mask;
+            return Some(bit);
+        }
+        // fc != 64 and !has_bitmap — shouldn't happen in this minimal
+        // model; treat as exhausted.
+        return None;
+    }
+}
+
+/// Proposed fix: TRANSITIONING marker bit in state.  Winner takes the
+/// transition under CAS, writes the bitmap, then CASes to final.
+/// Has-bitmap readers skip TRANSITIONING chunks (return None / spin).
+const STATE_TRANSITIONING_BIT: u64 = 1u64 << 63;
+
+fn alloc_ms_fixed(c: &ChunkMs) -> Option<u32> {
+    let target_fc64: u64 = !0u64 & !1u64 & !(1u64 << 1);
+    loop {
+        let s = c.state.load(Ordering::Acquire);
+        if s & STATE_TRANSITIONING_BIT != 0 {
+            // Another thread is initializing the bitmap.  In the real
+            // kernel, the slow-path scan skips this chunk and moves
+            // on; we model that here by returning None.  When the
+            // winner finishes the transition the next caller will
+            // see has_bitmap=true and allocate normally.
+            return None;
+        }
+        let fc = state_fc(s);
+        if fc == 0 {
+            return None;
+        }
+        if fc == 64 {
+            // 1) CAS into TRANSITIONING (still fc=64, has_bitmap=false).
+            let trans_s = s | STATE_TRANSITIONING_BIT;
+            if c.state
+                .compare_exchange(s, trans_s, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            // 2) Winner.  Write bitmap (no race — only winner here).
+            c.bitmap.store(target_fc64, Ordering::Release);
+            // 3) CAS into final state.
+            let final_s = make_state_ms(62, true, 0);
+            // Must succeed: only this thread can move out of TRANSITIONING.
+            let r = c.state.compare_exchange(
+                trans_s,
+                final_s,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            assert!(r.is_ok(), "transitioning->final CAS unexpectedly lost");
+            let mut h = c.holders.lock().unwrap();
+            let mask = 1u64 << 1;
+            assert!(
+                *h & mask == 0,
+                "double-alloc on page 1 (fixed-fc64 winner)"
+            );
+            *h |= mask;
+            return Some(1);
+        }
+        if state_has_bitmap(s) {
+            let bmp = c.bitmap.load(Ordering::Acquire);
+            if bmp == 0 {
+                return None;
+            }
+            let bit = bmp.trailing_zeros();
+            let new_bmp = bmp & !(1u64 << bit);
+            if c.bitmap
+                .compare_exchange(bmp, new_bmp, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            loop {
+                let cur = c.state.load(Ordering::Acquire);
+                let cur_fc = state_fc(cur);
+                if cur_fc == 0 {
+                    break;
+                }
+                let upd = (cur & !STATE_FC_MASK) | ((cur_fc - 1) as u64);
+                if c.state
+                    .compare_exchange(cur, upd, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            let mut h = c.holders.lock().unwrap();
+            let mask = 1u64 << bit;
+            assert!(
+                *h & mask == 0,
+                "double-alloc on page {} (fixed has_bitmap path)",
+                bit
+            );
+            *h |= mask;
+            return Some(bit);
+        }
+        return None;
+    }
+}
+
+#[cfg(test)]
+mod mode_switch_tests {
+    use super::*;
+
+    /// Reproduce the #228 race deterministically: 3 concurrent allocs
+    /// on a fresh all-free chunk.  Under the BUGGY alloc, loom will
+    /// find an interleaving where a loser's stale bitmap.store(target)
+    /// clobbers a winner-+-followup-allocation modification, causing
+    /// the holders Mutex's double-claim assertion to fire.
+    ///
+    /// Marked #[ignore] because loom permutation space at 3 threads is
+    /// large — run on demand with
+    ///   cargo test --release -- --ignored buggy_fc64_race
     #[test]
-    #[ignore = "#228 mode-switch race — placeholder, see TODO above"]
-    fn cross_mode_alloc_free_race_todo() {
-        panic!("cross_mode_alloc_free_race not implemented yet");
+    #[ignore = "loom exploration of 3-thread fc64 race; minutes"]
+    fn buggy_fc64_race() {
+        // Limit loom's exploration depth to keep runtime reasonable.
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let c = Arc::new(ChunkMs::new_all_free());
+            let c1 = c.clone();
+            let c2 = c.clone();
+            let c3 = c.clone();
+            let t1 = thread::spawn(move || alloc_ms_buggy(&c1));
+            let t2 = thread::spawn(move || alloc_ms_buggy(&c2));
+            let t3 = thread::spawn(move || alloc_ms_buggy(&c3));
+            let _r1 = t1.join().unwrap();
+            let _r2 = t2.join().unwrap();
+            let _r3 = t3.join().unwrap();
+            // The holders Mutex's assert! in alloc_ms_buggy would
+            // have panicked on double-claim.  Additionally verify
+            // bitmap consistency: bits-in-bitmap == fc must hold.
+            let bmp = c.bitmap.load(Ordering::Acquire);
+            let s = c.state.load(Ordering::Acquire);
+            let fc = state_fc(s);
+            let bmp_set = bmp.count_ones();
+            assert_eq!(
+                bmp_set, fc,
+                "bitmap-fc mismatch: bmp.count_ones()={} fc={} \
+                 — race clobbered cas_bitmap modification",
+                bmp_set, fc
+            );
+        });
+    }
+
+    /// Same scenario under the proposed TRANSITIONING-bit fix.  Loom
+    /// should explore all interleavings without finding a violation.
+    #[test]
+    #[ignore = "loom exploration of fixed 3-thread fc64 path"]
+    fn fixed_fc64_race() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let c = Arc::new(ChunkMs::new_all_free());
+            let c1 = c.clone();
+            let c2 = c.clone();
+            let c3 = c.clone();
+            let t1 = thread::spawn(move || alloc_ms_fixed(&c1));
+            let t2 = thread::spawn(move || alloc_ms_fixed(&c2));
+            let t3 = thread::spawn(move || alloc_ms_fixed(&c3));
+            let _r1 = t1.join().unwrap();
+            let _r2 = t2.join().unwrap();
+            let _r3 = t3.join().unwrap();
+            let bmp = c.bitmap.load(Ordering::Acquire);
+            let s = c.state.load(Ordering::Acquire);
+            let fc = state_fc(s);
+            assert_eq!(
+                bmp.count_ones(),
+                fc,
+                "fixed path violated bitmap-fc invariant"
+            );
+        });
+    }
+
+    /// Lighter 2-thread variant of the buggy race so we can verify
+    /// the model executes at all without the heavy 3-thread cost.
+    /// With only 2 threads, the bug requires a very narrow window
+    /// (T2's CAS-failed stale write landing after T1's CAS).  Loom
+    /// may or may not find a clobber here depending on its
+    /// exploration order; the assert focuses on the bitmap-fc
+    /// invariant.
+    #[test]
+    fn buggy_fc64_two_thread_smoke() {
+        loom::model(|| {
+            let c = Arc::new(ChunkMs::new_all_free());
+            let c1 = c.clone();
+            let c2 = c.clone();
+            let t1 = thread::spawn(move || alloc_ms_buggy(&c1));
+            let t2 = thread::spawn(move || alloc_ms_buggy(&c2));
+            let _r1 = t1.join().unwrap();
+            let _r2 = t2.join().unwrap();
+            // With 2 threads both racing fc==64, T2's stale write
+            // can clobber after T1's CAS but no third thread to
+            // consume in-between → invariant may hold here but not
+            // at 3 threads.
+            let bmp = c.bitmap.load(Ordering::Acquire);
+            let s = c.state.load(Ordering::Acquire);
+            let fc = state_fc(s);
+            assert_eq!(
+                bmp.count_ones(),
+                fc,
+                "2-thread invariant must hold"
+            );
+        });
     }
 }

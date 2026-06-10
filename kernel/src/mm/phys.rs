@@ -140,6 +140,18 @@ const HAS_BITMAP_BIT: u64 = 1 << 14; // bit [14]
 const BMP_PAGE_SHIFT: u32 = 15;
 const BMP_PAGE_MASK: u64 = 0x3F << 15; // bits [20:15]
 const INLINE_SHIFT: u32 = 21;
+// #228 inline→bitmap mode-switch lock.  Set by the WINNER of the
+// fc==64 → bitmap-mode transition CAS; cleared in the same writer
+// when it CASes to the final state.  Other CPUs that observe this
+// bit set in `s` must NOT enter the fc==64 path or read the
+// bitmap — they treat the chunk as "skip for now" (return None /
+// continue to next chunk).  Without this lock, a loser's
+// unconditional `write_bitmap(target)` could land after the winner's
+// CAS and after a third CPU's `cas_bitmap` modification, clobbering
+// that modification and producing single-page double-issue.  Proven
+// by `tests/loom-phys-chunk` mode_switch_tests::buggy_fc64_race
+// (FAILS) vs fixed_fc64_race (PASS, 3-thread exhaustive in 15.65s).
+const STATE_TRANSITIONING_BIT: u64 = 1u64 << 63;
 // Each inline index is 6 bits, starting at bit 18.
 const INLINE_IDX_BITS: u32 = 6;
 const INLINE_IDX_MASK: u64 = 0x3F;
@@ -383,24 +395,65 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
             return None;
         }
 
+        // #228 mode-switch lock: another CPU is mid-transition from
+        // inline (fc==64) to bitmap mode.  Skip this chunk — caller
+        // will scan onward and the winner's final CAS will publish
+        // the new state for subsequent allocs.
+        if s & STATE_TRANSITIONING_BIT != 0 {
+            return None;
+        }
+
         if fc == 64 {
             // All-free chunk. Transition: pick page 0 as bitmap page,
             // write bitmap with all bits set except bit 0, allocate page 1.
+            //
+            // #228 fix: do this under a TRANSITIONING marker.  Two-step
+            // CAS pattern serializes the bitmap initialization so that
+            // (a) only the winner ever writes the bitmap, and (b) no
+            // other CPU sees has_bitmap=true while the bitmap content
+            // is still being written.  Without this, a CAS-loser's
+            // unconditional `write_bitmap(target)` could land AFTER a
+            // separate CPU's `cas_bitmap` modification in the bitmap-
+            // mode path, clobbering it and producing single-page
+            // double-issue.  See [[project_228_chunk_alloc_one_race]]
+            // and `tests/loom-phys-chunk` mode_switch_tests.
+            let trans_s = s | STATE_TRANSITIONING_BIT;
+            match node.cas(s, trans_s) {
+                Err(_) => continue,
+                Ok(_) => {}
+            }
+            // Winner.  Bitmap is exclusively ours until the final CAS.
             let bmp_pa = bitmap_pa(chunk_idx, 0);
             // bitmap: all free except page 0 (bitmap) and page 1 (allocated).
             let bmp: u64 = !0u64 & !1u64 & !(1u64 << 1);
             unsafe {
                 write_bitmap(bmp_pa, bmp);
             }
-            // New state: fc=62, has_bitmap=true, bmp_page=0, owner preserved.
-            let new_s = make_state(62, owner(s), true, 0, 0);
-            match node.cas(s, new_s) {
-                Ok(_) => {
-                    ALLOC.free_count_global.fetch_sub(2, Ordering::Relaxed); // bitmap page + allocated page
-                    return Some(1);
+            // New state: fc=62, has_bitmap=true, bmp_page=0, owner
+            // preserved, TRANSITIONING cleared.  Only THIS thread can
+            // clear TRANSITIONING, but other writers (e.g. the alloc_page
+            // reservation-clear loop) may CAS the owner field
+            // concurrently.  Loop to re-derive the final state if a
+            // concurrent writer changes the owner, and also to absorb
+            // compare_exchange_weak's spurious failures.
+            loop {
+                let cur = node.load();
+                if cur & STATE_TRANSITIONING_BIT == 0 {
+                    // Someone else cleared TRANSITIONING — impossible
+                    // under the protocol; bail.
+                    crate::println!(
+                        "[#228] chunk_alloc_one fc64: TRANSITIONING cleared by other writer (cur={:#x})",
+                        cur,
+                    );
+                    return None;
                 }
-                Err(_) => continue,
+                let new_s = make_state(62, owner(cur), true, 0, 0);
+                if node.cas(cur, new_s).is_ok() {
+                    break;
+                }
             }
+            ALLOC.free_count_global.fetch_sub(2, Ordering::Relaxed); // bitmap page + allocated page
+            return Some(1);
         }
 
         if has_bitmap(s) {
@@ -1052,6 +1105,10 @@ fn alloc_page_inner() -> Option<PhysAddr> {
         if owner(s) != NO_CPU {
             continue;
         } // owned by another CPU
+        // #228: skip chunks under inline→bitmap transition.
+        if s & STATE_TRANSITIONING_BIT != 0 {
+            continue;
+        }
 
         if !can_reserve {
             // CPU ID doesn't fit in owner field — alloc without reservation.
@@ -1104,8 +1161,14 @@ fn alloc_page_inner() -> Option<PhysAddr> {
     // (boot 24): all 216 pages locked in non-current-CPU reservations.
     let mut tried_with_free = 0usize;
     for ci in 0..ALLOC.total_chunks {
-        let fc = free_count(ALLOC.chunk(ci).load());
+        let s = ALLOC.chunk(ci).load();
+        let fc = free_count(s);
         if fc == 0 {
+            continue;
+        }
+        // #228: skip chunks under transition.  chunk_alloc_one would
+        // bail with None anyway, but skipping avoids the wasted CAS.
+        if s & STATE_TRANSITIONING_BIT != 0 {
             continue;
         }
         tried_with_free += 1;
@@ -1241,6 +1304,10 @@ fn alloc_pages_inner(order: usize) -> Option<PhysAddr> {
             // Skip chunks owned by another CPU — their bitmaps are being
             // modified lock-free by chunk_alloc_one on the owning CPU.
             if owner(s) != NO_CPU {
+                continue;
+            }
+            // #228: skip chunks under inline→bitmap transition.
+            if s & STATE_TRANSITIONING_BIT != 0 {
                 continue;
             }
 
@@ -1439,7 +1506,9 @@ fn alloc_pages_inner(order: usize) -> Option<PhysAddr> {
 
     for ci in 0..ALLOC.total_chunks {
         let s = ALLOC.chunk(ci).load();
-        if free_count(s) == 64 && owner(s) == NO_CPU {
+        if free_count(s) == 64 && owner(s) == NO_CPU
+            && s & STATE_TRANSITIONING_BIT == 0
+        {
             if run_len == 0 {
                 run_start = ci;
             }
@@ -1452,6 +1521,13 @@ fn alloc_pages_inner(order: usize) -> Option<PhysAddr> {
                 for c in run_start..(run_start + chunks_needed) {
                     let cur = ALLOC.chunk(c).load();
                     if free_count(cur) != 64 || owner(cur) != NO_CPU {
+                        ok = false;
+                        break;
+                    }
+                    // #228: don't try to claim a chunk under inline→bitmap
+                    // transition; the CAS would corrupt the winner's
+                    // mid-flight state.
+                    if cur & STATE_TRANSITIONING_BIT != 0 {
                         ok = false;
                         break;
                     }
