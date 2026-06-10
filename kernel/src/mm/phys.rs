@@ -1337,18 +1337,46 @@ fn alloc_pages_inner(order: usize) -> Option<PhysAddr> {
                     bmp &= (1u64 << pages_in_chunk) - 1;
                 }
 
-                // Write bitmap BEFORE publishing the chunk state. Otherwise a
-                // concurrent alloc_page could see has_bitmap=true but read an
-                // uninitialised bitmap page, allocating based on garbage bits.
+                // #228 fix: use the TRANSITIONING-bit lock so that
+                // (a) only the winner of the state CAS ever writes the
+                // bitmap and (b) chunk_alloc_one (lock-free) on the same
+                // chunk skips us during the brief transition window.
+                //
+                // Without this, a CAS-loser's unconditional
+                // `write_bitmap(target)` to page `bmp_pg` would land
+                // AFTER the winner publishes a different bmp_pg.
+                // Once the chunk is in service, page `bmp_pg` is a
+                // regular data page; a future allocator hands it to a
+                // consumer that fills it with their own data; the
+                // loser's stale store then clobbers that data.
+                // See `tests/loom-phys-chunk` mode_switch_tests.
+                let trans_s = s | STATE_TRANSITIONING_BIT;
+                if ALLOC.chunk(ci).cas(s, trans_s).is_err() {
+                    continue; // another CPU is mid-transition or stole the chunk
+                }
+                // Winner.  Bitmap is exclusively ours until the final CAS.
                 let bpa = page_pa(ci, bmp_pg);
                 unsafe {
                     write_bitmap(bpa, bmp);
                 }
 
                 let new_fc = bmp.count_ones();
-                let new_s = make_state(new_fc, NO_CPU, true, bmp_pg, 0);
-                if ALLOC.chunk(ci).cas(s, new_s).is_err() {
-                    continue; // another CPU claimed or modified this chunk
+                // CAS to final state in a retry loop — see analogous
+                // chunk_alloc_one fc==64 fix.  Only this thread can
+                // clear TRANSITIONING.
+                loop {
+                    let cur = ALLOC.chunk(ci).load();
+                    if cur & STATE_TRANSITIONING_BIT == 0 {
+                        crate::println!(
+                            "[#228] alloc_pages_inner fc64: TRANSITIONING cleared by other writer (cur={:#x})",
+                            cur,
+                        );
+                        return None;
+                    }
+                    let new_s = make_state(new_fc, NO_CPU, true, bmp_pg, 0);
+                    if ALLOC.chunk(ci).cas(cur, new_s).is_ok() {
+                        break;
+                    }
                 }
 
                 // Subtract: need pages + 1 bitmap page from the 64 that were free.
