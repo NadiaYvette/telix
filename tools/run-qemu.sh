@@ -68,9 +68,23 @@ qemu-system-aarch64 \
     -cpu cortex-a72 -m "$MEM" -smp "$SMP" \
     "${DISK_ARGS[@]}" "${NET_ARGS[@]}" 2>/dev/null || true
 
-# Compact it (remove padding) and inject at 0x40000000.
+# Compact it (remove padding) and inject at 0x40000000.  Also splice
+# /chosen/bootargs from TELIX_CMDLINE so kernel cmdline knobs land via
+# the DTB path (the kernel reads /chosen/bootargs at boot).
 if command -v dtc &>/dev/null && [ -f "$DTB_FILE" ]; then
-    dtc -I dtb -O dtb -p 0 "$DTB_FILE" -o "$DTB_FILE" 2>/dev/null || true
+    if [ -n "${TELIX_CMDLINE:-}" ]; then
+        DTS_TMP="${DTB_FILE%.dtb}.dts"
+        dtc -I dtb -O dts "$DTB_FILE" -o "$DTS_TMP" 2>/dev/null || true
+        # Insert bootargs="..." inside the chosen { ... } block.
+        # Escape "/&\ in the cmdline for sed.
+        ESCAPED_CMD=$(printf '%s\n' "$TELIX_CMDLINE" | sed -e 's/[\/&"]/\\&/g')
+        sed -i "/chosen {/a\\\t\tbootargs = \"$ESCAPED_CMD\";" "$DTS_TMP"
+        dtc -I dts -O dtb -p 0 "$DTS_TMP" -o "$DTB_FILE" 2>/dev/null || \
+            dtc -I dtb -O dtb -p 0 "$DTB_FILE" -o "$DTB_FILE" 2>/dev/null || true
+        rm -f "$DTS_TMP"
+    else
+        dtc -I dtb -O dtb -p 0 "$DTB_FILE" -o "$DTB_FILE" 2>/dev/null || true
+    fi
 fi
 if [ -f "$DTB_FILE" ]; then
     QEMU_ARGS+=(-device loader,file="$DTB_FILE",addr=0x40000000,force-raw=on)
