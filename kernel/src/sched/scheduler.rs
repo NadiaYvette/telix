@@ -978,18 +978,53 @@ fn log_saved_sp_out_of_range(tid: u32, new_value: u64, kbase: u64, ksize: u64) {
     }
 }
 
-#[inline]
+// #228 caller-frame probe: marked #[inline(never)] so write_saved_sp
+// has its own kstack frame and we can read the caller's frame at a
+// known SP offset above ours.  The 36-boot HW-WP hunt + 12-boot
+// stamp-probe stress missed the corruption; targeting the caller
+// frame is the next-narrowest window for an upstream scribble.
+#[inline(never)]
 #[track_caller]
 pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
     let _thread_addr = thread as *const _ as u64;
-    // #228 kstack stamp probe: place a magic value on the LOCAL stack
-    // frame at entry and check it at function exit.  If a scribble
-    // surface clobbers the caller's spilled `thread*` slot, it likely
-    // also hits a nearby kstack slot — this canary detects that
-    // class of corruption window.  The volatile read at exit
-    // prevents the compiler from optimizing the local away.
+    // Existing local-frame canary (still useful for catching
+    // intra-frame scribble; this and the new caller-frame snapshot
+    // together cover both sides of our return-address slot).
     let canary: u64 = 0xDEAD_C0DE_DEAD_C0DE;
     let canary_ptr: *const u64 = &canary;
+    // Caller-frame snapshot.  Capture entry-time SP, then read 16
+    // u64s starting at sp + CALLER_FRAME_OFFSET (just above our
+    // prologue allocation).  Re-read at exit, log first mismatch.
+    // Offset values pick the caller's return-address slot + a
+    // 128-byte window of its frame body.
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    let entry_sp: u64 = {
+        let v: u64;
+        #[cfg(target_arch = "riscv64")]
+        unsafe { core::arch::asm!("mv {}, sp", out(reg) v, options(nomem, nostack, preserves_flags)); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) v, options(nomem, nostack, preserves_flags)); }
+        v
+    };
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+    let entry_sp: u64 = 0;
+    // Empirically write_saved_sp's prologue allocates ~160 bytes
+    // (rv64 boot disasm).  0xC0 = 192 reaches above that into the
+    // caller's saved-ra slot + body.  Adjust with care if frame
+    // size changes (caller_frame_offset_check below logs first u64
+    // along with snap_base so we can detect bad guesses).
+    const CALLER_FRAME_OFFSET: u64 = 0xC0;
+    const SNAP_WORDS: usize = 16;
+    let snap_base = entry_sp.wrapping_add(CALLER_FRAME_OFFSET);
+    let mut snap_entry = [0u64; SNAP_WORDS];
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    if entry_sp != 0 && snap_base >= 0x4000_0000 && snap_base < 0x1_0000_0000 {
+        for i in 0..SNAP_WORDS {
+            snap_entry[i] = unsafe {
+                (snap_base as *const u64).add(i).read_volatile()
+            };
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     {
         let thread_addr = _thread_addr;
@@ -1240,6 +1275,49 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
                 caller.line(),
                 n,
             );
+        }
+    }
+    // Caller-frame diff: re-read SNAP_WORDS u64s above our frame
+    // and compare to the entry-time snapshot.  The caller's saved
+    // registers + frame body should be stable across our call —
+    // any mismatch points at an external write into the caller's
+    // kstack region during our execution.
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    if entry_sp != 0 && snap_base >= 0x4000_0000 && snap_base < 0x1_0000_0000 {
+        let mut diff_idx: i32 = -1;
+        let mut diff_orig: u64 = 0;
+        let mut diff_now: u64 = 0;
+        for i in 0..SNAP_WORDS {
+            let now = unsafe {
+                (snap_base as *const u64).add(i).read_volatile()
+            };
+            if now != snap_entry[i] {
+                diff_idx = i as i32;
+                diff_orig = snap_entry[i];
+                diff_now = now;
+                break;
+            }
+        }
+        if diff_idx >= 0 {
+            let caller = core::panic::Location::caller();
+            static FRAME_DIFF_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = FRAME_DIFF_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                crate::println!(
+                    "CALLER-FRAME-SCRIBBLE: snap_base={:#x} idx={} orig={:#x} now={:#x} tid={} thread={:#x} new_sp={:#x} caller={}:{} n={}",
+                    snap_base,
+                    diff_idx,
+                    diff_orig,
+                    diff_now,
+                    thread.id,
+                    _thread_addr,
+                    new_value,
+                    caller.file(),
+                    caller.line(),
+                    n,
+                );
+            }
         }
     }
 }
