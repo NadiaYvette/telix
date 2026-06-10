@@ -4294,35 +4294,53 @@ fn percpu_pick_next_and_claim(
     pcpu: &smp::PerCpuData,
     set_by: u8,
 ) -> ThreadId {
-    let mut rq = percpu_rq()[cpu as usize].lock();
-    loop {
-        let tid = match rq.class_pick_next() {
-            Some(t) => t,
-            None => break,
-        };
-        thread_ref(tid).in_queue.store(false, Ordering::Release);
-        if thread_ref(tid)
-            .on_cpu
-            .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
-            thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
-            dispatch_cas_ok(pcpu, tid);
-            unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
-            pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
-            trace_sched(tid, 3); // 3=pick_deq (same tag as legacy path)
-            DISPATCH_CLAIM_LOCAL.fetch_add(1, Ordering::Relaxed);
-            return tid;
+    // #173 TCG-sync-tax mitigation: keep the rq-locked critical section
+    // minimal (pop + in_queue + CAS only).  All success-side bookkeeping
+    // touches per-thread or per-cpu state, never the rq — safe to move
+    // outside the lock.  TCG penalty per atomic-under-lock is ~10x KVM
+    // and stretches the lock-hold time enough to starve peer CPUs that
+    // are stealing or enqueueing onto this rq.
+    let claimed: Option<(ThreadId, u8)> = {
+        let mut rq = percpu_rq()[cpu as usize].lock();
+        let mut result: Option<(ThreadId, u8)> = None;
+        loop {
+            let tid = match rq.class_pick_next() {
+                Some(t) => t,
+                None => break,
+            };
+            thread_ref(tid).in_queue.store(false, Ordering::Release);
+            if thread_ref(tid)
+                .on_cpu
+                .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                result = Some((tid, 3)); // 3=pick_deq trace tag
+                break;
+            }
+            // CAS failed — `tid` was stamped to a real CPU number by another
+            // path (rescue, wake_thread direct, ...).  Drop on the floor and
+            // try the next pick.  We've removed it from the rq; that's
+            // semantically correct since the other path owns the lifecycle.
+            DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
         }
-        // CAS failed — `tid` was stamped to a real CPU number by another
-        // path (rescue, wake_thread direct, ...).  Drop on the floor and
-        // try the next pick.  We've removed it from the rq; that's
-        // semantically correct since the other path owns the lifecycle.
-        DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
+        result
+    }; // <- rq lock released here
+    if let Some((tid, trace_tag)) = claimed {
+        // Commit phase — outside the rq lock.  Safe because none of these
+        // ops touch rq state.
+        record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
+        thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
+        dispatch_cas_ok(pcpu, tid);
+        unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+        pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+        trace_sched(tid, trace_tag);
+        DISPATCH_CLAIM_LOCAL.fetch_add(1, Ordering::Relaxed);
+        return tid;
     }
-    drop(rq);
     // Nothing local — try work stealing.  Same pop-then-CAS dance.
+    // try_steal acquires the *other* CPU's rq lock internally and drops
+    // it before returning, so we're already lock-free here for the
+    // commit phase below.
     if let Some(tid) = try_steal(cpu) {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
         if thread_ref(tid)
@@ -5794,7 +5812,11 @@ pub fn tick(current_sp: u64) -> u64 {
         static LAYER3_DIAG_COUNTER: AtomicU64 = AtomicU64::new(0);
         static LAYER3_DIAG_LOCK: AtomicU32 = AtomicU32::new(0);
         let l3 = LAYER3_DIAG_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if l3 > 0 && l3 % 100 == 0 {
+        // Lowered from 100 → 10 (10× more frequent emit) so slow archs
+        // (mips64 TCG, riscv64 under heavy stress) reach the LAYER3 site
+        // within reasonable wallclock budgets.  Cost: a bit more serial
+        // noise on fast archs.  Reversible.
+        if l3 > 0 && l3 % 10 == 0 {
             if LAYER3_DIAG_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 let frt = FAST_RESCUE_TAKEOVERS.load(Ordering::Relaxed);
                 let cfb = CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed);
