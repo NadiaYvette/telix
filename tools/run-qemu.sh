@@ -28,7 +28,10 @@ DISK_IMG="$SCRIPT_DIR/../test.img"
 # QEMU aarch64 virt doesn't pass DTB to ELF kernels (x0=0).
 # Generate a compact DTB and inject it at RAM base (0x40000000) via the
 # generic loader so the kernel's RAM-scan finds it.
-DTB_FILE="${SCRIPT_DIR}/../.qemu-virt.dtb"
+# Per-instance path so parallel runs don't race on the same file
+# (cleaned up via trap below).  Override with TELIX_DTB_FILE.
+DTB_FILE="${TELIX_DTB_FILE:-${SCRIPT_DIR}/../.qemu-virt-$$.dtb}"
+trap 'rm -f "$DTB_FILE" "${DTB_FILE%.dtb}.dts"' EXIT
 
 QEMU_ARGS=(
     -machine virt,gic-version=3
