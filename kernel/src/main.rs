@@ -209,6 +209,12 @@ pub fn kmain() -> ! {
     if hammer_n > 0 {
         mm::hammer::start_hammers(hammer_n as usize);
     }
+    let hammer_persist_n = crate::boot::cmdline::BOOT_CONFIG
+        .alloc_hammer_persist
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if hammer_persist_n > 0 {
+        mm::hammer::start_persistent_hammers(hammer_persist_n as usize);
+    }
 
     // Background page reclaim daemon (kswapd).
     sched::spawn(mm::kswapd::kswapd, 200, 10).expect("spawn kswapd");

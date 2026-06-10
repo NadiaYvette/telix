@@ -53,6 +53,12 @@ pub struct BootConfig {
     /// sentinel → read-back → free.  See mm/hammer.rs.
     pub alloc_hammer: AtomicU8,
 
+    /// #228 PERSISTENT hammer kthread count.  0 = disabled (default);
+    /// N = spawn N kthreads that allocate PERSISTENT_CHUNKS order=4
+    /// chunks each, fill with sentinel, never free, verify in a loop.
+    /// Mimics kstack lifecycle to surface path-specific corruption.
+    pub alloc_hammer_persist: AtomicU8,
+
     /// Whether command line was successfully parsed.
     pub parsed: AtomicU8,
 }
@@ -64,6 +70,7 @@ pub static BOOT_CONFIG: BootConfig = BootConfig {
     nr_cpus: AtomicU32::new(0),
     dispatch_claim_helper: AtomicU8::new(0),
     alloc_hammer: AtomicU8::new(0),
+    alloc_hammer_persist: AtomicU8::new(0),
     parsed: AtomicU8::new(0),
 };
 
@@ -161,6 +168,12 @@ fn handle_param(key: &[u8], val: &[u8]) {
             // #228 alloc/free hammer thread count.  Caps at 255.
             if let Some(n) = parse_u64(val) {
                 BOOT_CONFIG.alloc_hammer.store(n.min(255) as u8, Ordering::Relaxed);
+            }
+        }
+        b"alloc_hammer_persist" => {
+            // #228 persistent-allocation hammer thread count.  Caps at 255.
+            if let Some(n) = parse_u64(val) {
+                BOOT_CONFIG.alloc_hammer_persist.store(n.min(255) as u8, Ordering::Relaxed);
             }
         }
         _ => {

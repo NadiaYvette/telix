@@ -200,3 +200,117 @@ pub fn start_hammers(n: usize) {
         let _ = crate::sched::spawn(hammer_kthread, 200, 5);
     }
 }
+
+// ===== Persistent variant ============================================
+//
+// The cycle hammer's alloc → fill → hold → verify → free never caught
+// #228 because the bug surface is path-specific to kstack-allocated
+// PAs that stay allocated.  This variant mimics that lifecycle: each
+// kthread allocates PERSISTENT_CHUNKS order=4 (kstack-sized) chunks
+// at startup, fills them with the same sentinel, then loops
+// forever verifying.  Never frees.
+//
+// Memory cost: PERSISTENT_CHUNKS (8) × 2^PERSISTENT_ORDER (16) ×
+// page_size (64 KiB) = 8 MiB per kthread.  With 4 kthreads = 32 MiB,
+// well within the 256 MiB QEMU RAM budget.
+//
+// Verify pass scans every word of every chunk; expected to be the
+// long pole, but order=4 × 8 = 128 pages × 8 K words = 1 M words per
+// pass, ~milliseconds on KVM, ~seconds on TCG.  Mismatch fires
+// immediately on first divergence with full (cpu, chunk_idx,
+// word_off, want, got) for forensics.
+
+const PERSISTENT_CHUNKS: usize = 8;
+const PERSISTENT_ORDER: usize = 4;
+const PERSISTENT_SPINS: u32 = 5_000_000;
+
+fn persistent_hammer_kthread() -> ! {
+    let cpu = smp::cpu_id() as u64;
+    let mut chunks: [Option<PhysAddr>; PERSISTENT_CHUNKS] = [None; PERSISTENT_CHUNKS];
+    let words_per_chunk = (crate::mm::page::page_size() / 8) << PERSISTENT_ORDER;
+
+    // Phase 1: allocate + fill.  Done once.
+    let mut allocated = 0;
+    for i in 0..PERSISTENT_CHUNKS {
+        match phys::alloc_pages(PERSISTENT_ORDER) {
+            Some(pa) => {
+                chunks[i] = Some(pa);
+                let p = pa.as_usize() as *mut u64;
+                unsafe {
+                    for w in 0..words_per_chunk {
+                        // generation=0 baseline so verify can use the same.
+                        let s = sentinel(cpu, 0, i, w);
+                        core::ptr::write_volatile(p.add(w), s);
+                    }
+                }
+                allocated += 1;
+            }
+            None => {
+                crate::println!(
+                    "[#228 persistent-hammer] cpu={} OOM at chunk {}/{}",
+                    cpu, i, PERSISTENT_CHUNKS,
+                );
+                break;
+            }
+        }
+    }
+    crate::println!(
+        "[#228 persistent-hammer] cpu={} allocated {}/{} order-{} chunks ({} MiB)",
+        cpu, allocated, PERSISTENT_CHUNKS, PERSISTENT_ORDER,
+        (allocated * words_per_chunk * 8) >> 20,
+    );
+
+    // Phase 2: verify forever.
+    let mut pass: u64 = 0;
+    loop {
+        pass += 1;
+
+        // Spin between passes so other CPUs get their work done.
+        for _ in 0..PERSISTENT_SPINS {
+            core::hint::spin_loop();
+        }
+
+        let mut pass_mismatches: u64 = 0;
+        for i in 0..allocated {
+            if let Some(pa) = chunks[i] {
+                let p = pa.as_usize() as *mut u64;
+                unsafe {
+                    for w in 0..words_per_chunk {
+                        let want = sentinel(cpu, 0, i, w);
+                        let got = core::ptr::read_volatile(p.add(w));
+                        if got != want {
+                            pass_mismatches += 1;
+                            MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            crate::println!(
+                                "PERSISTENT-MISMATCH: cpu={} pass={} pa={:#x} chunk_idx={} word_off={} want={:#x} got={:#x}",
+                                cpu, pass, pa.as_usize(), i, w, want, got,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if pass % 10 == 0 || pass_mismatches > 0 {
+            crate::println!(
+                "PERSISTENT-PASS: cpu={} pass={} mismatch_this_pass={} mismatch_total={}",
+                cpu, pass, pass_mismatches, MISMATCH_TOTAL.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+/// Spawn `n` PERSISTENT hammer kthreads.  Each holds PERSISTENT_CHUNKS
+/// order=4 allocations forever and verifies their integrity in a loop.
+pub fn start_persistent_hammers(n: usize) {
+    if n == 0 {
+        return;
+    }
+    crate::println!(
+        "[#228 persistent-hammer] starting {} kthreads, {} order-{} chunks each",
+        n, PERSISTENT_CHUNKS, PERSISTENT_ORDER,
+    );
+    for _ in 0..n {
+        let _ = crate::sched::spawn(persistent_hammer_kthread, 200, 5);
+    }
+}
