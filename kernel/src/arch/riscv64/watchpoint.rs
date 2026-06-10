@@ -123,6 +123,88 @@ pub fn re_arm() {
 /// can find the target without the caller threading it through.
 static WATCHED_ADDR: AtomicU64 = AtomicU64::new(0);
 
+/// Mirror of `WATCHED_ADDR` for the second hardware trigger
+/// (per-hart trigger #1).  Used to catch upstream poisoners of the
+/// PerCpuData.current_thread slot in #228 — the prior 36-boot stress
+/// showed write_saved_sp itself faulting on a poisoned `thread*`
+/// argument, suggesting the corrupter overwrites the caller's source
+/// of the pointer.  See memory note 228-stress-36boots-no-writer.
+static WATCHED_ADDR_AUX: AtomicU64 = AtomicU64::new(0);
+static ARMED_ADDR_AUX: AtomicU64 = AtomicU64::new(0);
+
+/// Arm trigger #1 on `addr` for S-mode stores.  Same encoding as
+/// the primary `arm()`, just `csrw tselect, 1` first so the
+/// tdata1/tdata2 writes land on trigger 1 (QEMU reports
+/// "Boot HART Debug Triggers: 2 triggers").
+pub fn arm_aux(addr: u64) {
+    ARMED_ADDR_AUX.store(addr, Ordering::Release);
+    WATCHED_ADDR_AUX.store(addr, Ordering::Release);
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x7a0, {}",
+            in(reg) 1u64,
+            options(nomem, nostack),
+        );
+        core::arch::asm!(
+            "csrw 0x7a2, {}",
+            in(reg) addr,
+            options(nomem, nostack),
+        );
+        let tdata1 = TDATA1_TYPE_MCONTROL | TDATA1_M | TDATA1_S | TDATA1_STORE;
+        core::arch::asm!(
+            "csrw 0x7a1, {}",
+            in(reg) tdata1,
+            options(nomem, nostack),
+        );
+    }
+}
+
+pub fn disarm_aux() {
+    ARMED_ADDR_AUX.store(0, Ordering::Release);
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x7a0, {}",
+            in(reg) 1u64,
+            options(nomem, nostack),
+        );
+        core::arch::asm!(
+            "csrw 0x7a1, {}",
+            in(reg) 0u64,
+            options(nomem, nostack),
+        );
+    }
+}
+
+pub fn re_arm_aux() {
+    let addr = WATCHED_ADDR_AUX.load(Ordering::Acquire);
+    if addr == 0 {
+        return;
+    }
+    ARMED_ADDR_AUX.store(addr, Ordering::Release);
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x7a0, {}",
+            in(reg) 1u64,
+            options(nomem, nostack),
+        );
+        core::arch::asm!(
+            "csrw 0x7a2, {}",
+            in(reg) addr,
+            options(nomem, nostack),
+        );
+        let tdata1 = TDATA1_TYPE_MCONTROL | TDATA1_M | TDATA1_S | TDATA1_STORE;
+        core::arch::asm!(
+            "csrw 0x7a1, {}",
+            in(reg) tdata1,
+            options(nomem, nostack),
+        );
+    }
+}
+
+pub fn watched_addr_aux() -> u64 {
+    WATCHED_ADDR_AUX.load(Ordering::Acquire)
+}
+
 /// Counter incremented on every trap-handler hit.  Useful for a
 /// post-boot sanity check ("did the WP fire at all?") via the
 /// existing scheduler tick log path.

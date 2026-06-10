@@ -292,6 +292,15 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             let ra = frame.regs[0];
             let sp = frame.regs[1];
 
+            // Two triggers may be armed: primary on tid=4 saved_sp,
+            // aux on the local PerCpuData.current_thread slot.  stval
+            // gives the offending access address, so we route by
+            // matching it against each WATCHED_ADDR.
+            let watched_pri = super::watchpoint::watched_addr();
+            let watched_aux = super::watchpoint::watched_addr_aux();
+            let is_aux_hit = watched_aux != 0 && stval as u64 == watched_aux;
+            let _ = watched_pri; // suppress unused if logging changes
+
             // Peek insn at sepc.  Lower 2 bits decide 16- vs 32-bit
             // form per RISC-V spec; we read enough bytes for either.
             let insn_first = unsafe { (frame.sepc as *const u16).read_volatile() };
@@ -342,12 +351,13 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 };
                 let mut buf = [0u8; 512];
                 let mut k = 0;
-                let tag: &[u8] = if is_bad {
-                    b"WP-BAD-WRITER: cpu="
-                } else if learned_slot.is_some() {
-                    b"WP-LEARN: cpu="
-                } else {
-                    b"WP-INSN-SKIP: cpu="
+                let tag: &[u8] = match (is_bad, learned_slot.is_some(), is_aux_hit) {
+                    (true,  _,    true)  => b"WP-AUX-BAD-WRITER: cpu=",
+                    (true,  _,    false) => b"WP-BAD-WRITER: cpu=",
+                    (false, true, true)  => b"WP-AUX-LEARN: cpu=",
+                    (false, true, false) => b"WP-LEARN: cpu=",
+                    (false, false, true) => b"WP-AUX-INSN-SKIP: cpu=",
+                    (false, false, false) => b"WP-INSN-SKIP: cpu=",
                 };
                 put_bytes(&mut buf, &mut k, tag);
                 put_dec_u64(&mut buf, &mut k, cpu as u64);
@@ -382,10 +392,21 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             //   3 = re-arm on every legit-PC hit (catches a future
             //       corrupting writer; loses one saved_sp write per
             //       hit, but kernel observed to survive)
-            super::watchpoint::disarm();
+            //
+            // With two triggers armed we route disarm/re-arm to
+            // the one that fired (selected by stval match above).
+            if is_aux_hit {
+                super::watchpoint::disarm_aux();
+            } else {
+                super::watchpoint::disarm();
+            }
             frame.sepc = frame.sepc.wrapping_add(insn_len);
             if !is_bad && mode_pre >= 3 {
-                super::watchpoint::re_arm();
+                if is_aux_hit {
+                    super::watchpoint::re_arm_aux();
+                } else {
+                    super::watchpoint::re_arm();
+                }
             }
             frame_sp
         }

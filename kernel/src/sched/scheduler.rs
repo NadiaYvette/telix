@@ -1106,6 +1106,22 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
                     crate::arch::riscv64::watchpoint::arm(addr);
                     #[cfg(target_arch = "aarch64")]
                     crate::arch::aarch64::watchpoint::arm(addr);
+                    // Aux trigger on the LOCAL CPU's current_thread
+                    // slot — wp_savedsp >= 4 only.  current_thread
+                    // updates on every context switch; the legit-PC
+                    // re-arm path drops the store, so arming the aux
+                    // breaks scheduling.  Keep aux behind an explicit
+                    // mode so default boots don't wedge.
+                    #[cfg(target_arch = "riscv64")]
+                    if crate::boot::cmdline::BOOT_CONFIG
+                        .wp_savedsp
+                        .load(Ordering::Relaxed)
+                        >= 4
+                    {
+                        let pcpu = smp::current();
+                        let ct_addr = &pcpu.current_thread as *const _ as u64;
+                        crate::arch::riscv64::watchpoint::arm_aux(ct_addr);
+                    }
                 }
             }
         }
