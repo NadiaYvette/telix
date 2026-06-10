@@ -3,6 +3,7 @@ pub mod cowgroup;
 pub mod extent;
 pub mod fault;
 pub mod frame;
+pub mod hammer;
 pub mod hat;
 pub mod radix_pt;
 

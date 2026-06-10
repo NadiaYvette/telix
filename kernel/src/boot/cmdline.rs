@@ -48,6 +48,11 @@ pub struct BootConfig {
     /// matched gate states without rebuilding the kernel.
     pub dispatch_claim_helper: AtomicU8,
 
+    /// #228 alloc/free hammer kthread count.  0 = disabled (default);
+    /// N = spawn N hammer kthreads that loop alloc_page → write
+    /// sentinel → read-back → free.  See mm/hammer.rs.
+    pub alloc_hammer: AtomicU8,
+
     /// Whether command line was successfully parsed.
     pub parsed: AtomicU8,
 }
@@ -58,6 +63,7 @@ pub static BOOT_CONFIG: BootConfig = BootConfig {
     loglevel: AtomicU8::new(5),
     nr_cpus: AtomicU32::new(0),
     dispatch_claim_helper: AtomicU8::new(0),
+    alloc_hammer: AtomicU8::new(0),
     parsed: AtomicU8::new(0),
 };
 
@@ -149,6 +155,12 @@ fn handle_param(key: &[u8], val: &[u8]) {
                 if n <= 2 {
                     BOOT_CONFIG.dispatch_claim_helper.store(n as u8, Ordering::Relaxed);
                 }
+            }
+        }
+        b"alloc_hammer" => {
+            // #228 alloc/free hammer thread count.  Caps at 255.
+            if let Some(n) = parse_u64(val) {
+                BOOT_CONFIG.alloc_hammer.store(n.min(255) as u8, Ordering::Relaxed);
             }
         }
         _ => {

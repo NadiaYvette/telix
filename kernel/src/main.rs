@@ -202,6 +202,14 @@ pub fn kmain() -> ! {
     // Background page pre-zeroing daemon.
     sched::spawn(mm::zeropool::zero_daemon, 1, 5).expect("spawn zero_daemon");
 
+    // #228 alloc/free hammer kthreads if requested via cmdline knob.
+    let hammer_n = crate::boot::cmdline::BOOT_CONFIG
+        .alloc_hammer
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if hammer_n > 0 {
+        mm::hammer::start_hammers(hammer_n as usize);
+    }
+
     // Background page reclaim daemon (kswapd).
     sched::spawn(mm::kswapd::kswapd, 200, 10).expect("spawn kswapd");
 
