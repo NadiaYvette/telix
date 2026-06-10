@@ -1033,21 +1033,35 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
     };
     #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
     let entry_sp: u64 = 0;
-    // Empirically write_saved_sp's prologue allocates ~160 bytes
-    // (rv64 boot disasm).  0xC0 = 192 reaches above that into the
-    // caller's saved-ra slot + body.  Adjust with care if frame
-    // size changes (caller_frame_offset_check below logs first u64
-    // along with snap_base so we can detect bad guesses).
-    const CALLER_FRAME_OFFSET: u64 = 0xC0;
+    // #228 kstack saved-ra mirror: cause=0xc sepc=0x0 in stress runs
+    // = ret loaded ra=0 because some frame's saved-ra slot got
+    // scribbled.  Snapshot uses a per-CPU static buffer (rather than
+    // a local stack array) so it doesn't bloat write_saved_sp's
+    // prologue — earlier the 64-word + saved-ra-check variants
+    // pushed our prologue to 464 bytes, putting the snapshot offset
+    // INSIDE our frame and producing false positives where the body
+    // wrote into the snap_entry storage itself.  With per-CPU
+    // storage our frame stays ~200 bytes and the +0x100 offset
+    // (above prologue) reliably monitors the caller's frame.
+    // Offset chosen to clearly land above write_saved_sp's prologue
+    // (currently 320 bytes per rv64 disasm; bumped from 0x100 once the
+    // snap_entry-on-stack form was retired in favor of the per-CPU
+    // buffer, which kept the prologue under 0x140 in earlier builds
+    // but recent edits pushed it to 0x140 + room for local s-saves).
+    const CALLER_FRAME_OFFSET: u64 = 0x180;
     const SNAP_WORDS: usize = 16;
     let snap_base = entry_sp.wrapping_add(CALLER_FRAME_OFFSET);
-    let mut snap_entry = [0u64; SNAP_WORDS];
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     if entry_sp != 0 && snap_base >= 0x4000_0000 && snap_base < 0x1_0000_0000 {
-        for i in 0..SNAP_WORDS {
-            snap_entry[i] = unsafe {
-                (snap_base as *const u64).add(i).read_volatile()
-            };
+        let cpu = smp::cpu_id() as usize;
+        if cpu < KSTACK_SNAP_MAX_CPUS {
+            unsafe {
+                KSTACK_SNAP[cpu].base = entry_sp;
+                for i in 0..SNAP_WORDS {
+                    KSTACK_SNAP[cpu].words[i] =
+                        (snap_base as *const u64).add(i).read_volatile();
+                }
+            }
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -1312,15 +1326,19 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
         let mut diff_idx: i32 = -1;
         let mut diff_orig: u64 = 0;
         let mut diff_now: u64 = 0;
-        for i in 0..SNAP_WORDS {
-            let now = unsafe {
-                (snap_base as *const u64).add(i).read_volatile()
-            };
-            if now != snap_entry[i] {
-                diff_idx = i as i32;
-                diff_orig = snap_entry[i];
-                diff_now = now;
-                break;
+        let cpu = smp::cpu_id() as usize;
+        if cpu < KSTACK_SNAP_MAX_CPUS && unsafe { KSTACK_SNAP[cpu].base } == entry_sp {
+            for i in 0..SNAP_WORDS {
+                let now = unsafe {
+                    (snap_base as *const u64).add(i).read_volatile()
+                };
+                let orig = unsafe { KSTACK_SNAP[cpu].words[i] };
+                if now != orig {
+                    diff_idx = i as i32;
+                    diff_orig = orig;
+                    diff_now = now;
+                    break;
+                }
             }
         }
         if diff_idx >= 0 {
@@ -3595,6 +3613,37 @@ fn thread_port_handler(
 /// (#208 probe) push Thread past 512 bytes.
 const THREAD_SLAB_SIZE: usize = 1024;
 const _: () = assert!(core::mem::size_of::<Thread>() <= THREAD_SLAB_SIZE);
+
+/// #228 kstack snapshot per-CPU buffer.  Avoids growing
+/// write_saved_sp's stack frame (which previously pushed saved-ra
+/// out of the static probe offset).  Each CPU has its own slot; the
+/// helper is reentrant-safe per-CPU because write_saved_sp doesn't
+/// recurse on the same hart.
+const KSTACK_SNAP_MAX_CPUS: usize = 16;
+const KSTACK_SNAP_WORDS: usize = 16;
+#[repr(align(64))]
+struct KstackSnapSlot {
+    base: u64,
+    words: [u64; KSTACK_SNAP_WORDS],
+}
+static mut KSTACK_SNAP: [KstackSnapSlot; KSTACK_SNAP_MAX_CPUS] = [
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+    KstackSnapSlot { base: 0, words: [0; KSTACK_SNAP_WORDS] },
+];
 
 /// #228 slab-canary probe: each Thread gets its own 4 KiB phys page;
 /// only the first ~1 KiB holds the Thread struct, the rest is unused
