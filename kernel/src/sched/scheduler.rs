@@ -1050,28 +1050,48 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
     // when the watchpoint fires.
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
-        static WP_ARMED: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        // Gated by `wp_savedsp=1` on the kernel cmdline.  Default off
-        // — on rv64 the trigger CSRs need Sdtrig-capable QEMU
-        // (`-cpu max` or hardware); on aarch64 QEMU virt supports
-        // DBGWVR/DBGWCR natively but we still gate behind the same
-        // flag so default boots aren't affected by an unexpected
-        // EC=0x35 trap during early init.
+        // Per-hart arming.  RISC-V Sdtrig triggers and AArch64 DBGWVR
+        // are PER-CPU, so a single global CAS gate would arm only the
+        // first CPU that touched tid=4 — writes from the others would
+        // sail past unobserved.  We need every CPU to arm its OWN
+        // trigger, but each only once.  Use a per-CPU AtomicBool
+        // gated by cmdline.  MAX_CPUS bound is generous (16); arms
+        // beyond fall through.
+        const MAX_CPUS: usize = 16;
+        static WP_ARMED_PER_CPU: [core::sync::atomic::AtomicBool; MAX_CPUS] = [
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+            core::sync::atomic::AtomicBool::new(false),
+        ];
         let enabled = crate::boot::cmdline::BOOT_CONFIG
             .wp_savedsp
             .load(Ordering::Relaxed) != 0;
-        if enabled
-            && thread.id == 4
-            && WP_ARMED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            let addr = &thread.saved_sp as *const u64 as u64;
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::watchpoint::arm(addr);
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::watchpoint::arm(addr);
+        if enabled && thread.id == 4 {
+            let cpu = smp::cpu_id() as usize;
+            if cpu < MAX_CPUS
+                && WP_ARMED_PER_CPU[cpu]
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let addr = &thread.saved_sp as *const u64 as u64;
+                #[cfg(target_arch = "riscv64")]
+                crate::arch::riscv64::watchpoint::arm(addr);
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::watchpoint::arm(addr);
+            }
         }
     }
     thread.saved_sp = new_value;
