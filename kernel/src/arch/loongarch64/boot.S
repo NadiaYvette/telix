@@ -41,52 +41,47 @@ _start:
     idle      0
     b         .halt
 
-// Secondary CPUs: poll a per-core slot in _ap_entry_slot waiting for
-// the BSP to install (entry, stack_top).  Once the entry pointer is
-// non-zero we jump to it with a0 = core_id.  CSR.CPUID (0x20) is the
-// authoritative core identity — QEMU may not preserve the original a0
-// across the lock branch on every release.
+// Secondary CPUs reach here ONLY on platforms that launch every core
+// at the kernel entry point (none of our current targets do — QEMU
+// virt halts APs at reset and starts them via the MailBox+IPI wake
+// protocol implemented in smp::start_secondary_cpus).  Kept as a
+// safety net: an AP that arrives via the boot_lock branch falls into
+// `ap_wake_entry` below, which is the same entry the wake-IPI's
+// firmware stub jumps to.  Either way the AP ends up in
+// secondary_rust_entry with the right stack.
 .secondary_spin:
-    // #257 (partial): configure DMW0/DMW1 so post-wake APs can access
-    // high-half VAs coherently with the BSP.  Currently DEAD CODE on
-    // QEMU virt because APs never reach here — see big comment below.
-    //
-    // KNOWN BUG: QEMU's loongarch64 virt machine does NOT start APs at
-    // _start.  APs are halted at reset and require the LoongArch
-    // mailbox+IPI wake protocol to bring online:
-    //   1. BSP writes (entry_pc, sp, ...) to remote AP's MBUF
-    //      via IOCSR_MBUF*_WR_OTHER (target_cpu encoded in payload).
-    //   2. BSP sends IPI to remote AP via IOCSR_IPI_SEND.
-    //   3. AP, in halt state, wakes and a QEMU-provided stub reads its
-    //      MBUF then jumps to the entry_pc.
-    //
-    // start_secondary_cpus() in smp.rs currently writes
-    // _ap_entry_slot and sends IPI, but the APs aren't polling
-    // _ap_entry_slot — they're waiting on MBUF.  Result: SMP startup
-    // timeout, only BSP runs.  Confirmed empirically by an 'S' marker
-    // at the top of _start showing only 1 core enters.
-    //
-    // The DMW config below is correct preparation; when the mailbox
-    // wake-protocol is implemented in smp.rs, APs will be released
-    // into a fresh entry point that should jump into something like
-    // this stub.  Until then, this code is never reached.
+    b         ap_wake_entry
+
+// #257 LoongArch SMP wake entry point.  Reached either from the
+// `.secondary_spin` fallback or — on QEMU virt and real 3A5000
+// hardware — from the firmware stub that wakes the AP after the BSP
+// stamps this label's VA into the AP's MailBox0 and sends
+// ACTION_BOOT_CPU.
+//
+// Identity to the BSP's `_start` body from here on: install DMW
+// windows so high-half VAs work, look up our stack from
+// `_ap_entry_slot[CSR.CPUID].stack_top`, then call
+// `secondary_rust_entry`.
+.global ap_wake_entry
+ap_wake_entry:
+    // Direct-map windows: DMW0=cached (VSEG=0x9), DMW1=uncached MMIO
+    // (VSEG=0x8).  Matches the BSP's _rust_entry preamble so post-wake
+    // APs can touch the kernel image + IOCSR space without paging on.
     li.d      $t0, 0x9000000000000011  // VSEG=0x9, MAT=cached, PLV0
     csrwr     $t0, 0x180          // CSR.DMW0
     li.d      $t0, 0x8000000000000001  // VSEG=0x8, MAT=uncached, PLV0
     csrwr     $t0, 0x181          // CSR.DMW1
     dbar      0
 
+    // CSR.CPUID is the authoritative core identity post-wake; firmware
+    // may not populate $a0 the way `_start` does for the BSP.
     csrrd     $t0, 0x20           // CSR.CPUID
     la.pcrel  $t1, _ap_entry_slot
-    slli.d    $t2, $t0, 4         // core_id * 16 (slot stride)
+    slli.d    $t2, $t0, 4         // cpuid * 16 (slot stride)
     add.d     $t1, $t1, $t2
-.ap_poll:
-    dbar      0                   // sync each iteration so cached zero
-    ld.d      $t3, $t1, 0         // doesn't lock us out of seeing BSP's write
-    beqz      $t3, .ap_poll
-    ld.d      $sp, $t1, 8         // stack top
-    move      $a0, $t0            // core_id
-    jirl      $zero, $t3, 0
+    ld.d      $sp, $t1, 8         // stack_top (filled by BSP pre-wake)
+    move      $a0, $t0            // cpuid → secondary_rust_entry arg 0
+    bl        secondary_rust_entry
     // Should not return; halt if it does.
 .ap_unreachable:
     idle      0

@@ -1,18 +1,19 @@
-//! LoongArch64 SMP: secondary core bring-up via memory-rendezvous + IPI.
+//! LoongArch64 SMP: secondary core bring-up via IOCSR MailBox + IPI.
 //!
-//! Unlike PSCI (aarch64) or SBI HSM (riscv64), there is no firmware hook
-//! that takes a (target_core, entry, stack) tuple.  QEMU's `virt` machine
-//! launches every core directly at `_start`; the atomic increment of
-//! `_boot_lock` in boot.S elects core 0 as the BSP and the others fall
-//! through to `.secondary_spin`, which polls a per-core slot in
-//! `_ap_entry_slot` for an (entry, stack_top) pair.
+//! Unlike PSCI (aarch64) or SBI HSM (riscv64), the LoongArch wake
+//! protocol uses the per-core IPI/MailBox unit (3A5000 manual chapter
+//! 10).  APs sit halted at hardware reset waiting for any IPI bit; the
+//! BSP wakes each one by stamping its entry_pc into MailBox0 (via the
+//! local `Mail_Send` register) and then sending an `ACTION_BOOT_CPU`
+//! IPI.  Firmware (QEMU virt's emulated stub, or hardware UEFI on real
+//! 3A5000) reads MailBox0 and jumps there — matching the convention
+//! Linux's `arch/loongarch/kernel/smp.c` uses.
 //!
-//! Once the BSP has finished its own MMU/scheduler init it allocates the
-//! AP stacks and fills the slot for each secondary core in turn.  We
-//! also `send_ipi` to that core so a future implementation can have the
-//! APs use `idle 0` instead of busy-polling; the current spin path doesn't
-//! require it but keeping IPIs in the start path is the symmetry the
-//! other arches enforce.
+//! The AP entry point (`ap_wake_entry` in boot.S) reads its own
+//! `CSR.CPUID`, looks up its stack from `_ap_entry_slot` (which the
+//! BSP filled before sending the wake IPI), sets `$sp`, and calls
+//! `secondary_rust_entry`.  Identity with x86_64/aarch64/riscv64 from
+//! there on.
 
 use crate::sched::smp::{self, MAX_CPUS};
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
@@ -28,13 +29,21 @@ static AP_READY_COUNT: AtomicU32 = AtomicU32::new(0);
 /// linear CPU id (0 = BSP, 1.. = secondaries).
 static AP_STACKS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Per-core (entry, stack_top) slots that boot.S's `.ap_poll` reads.
-/// 16 B per slot — see `boot.S`.  Defined as `extern "C"` because the
-/// asm needs the symbol.
+/// Per-core (entry, stack_top) slots that the AP entry stub
+/// (`ap_wake_entry` in boot.S) consults to find its stack.  16 B per
+/// slot.  The `entry` field is no longer required for control flow
+/// (the wake IPI delivers the entry via MailBox0) but we still write
+/// it for diagnostic clarity and to leave room for hot-plug or future
+/// non-MBUF wake paths.  Defined as `extern "C"` because boot.S needs
+/// the symbol.
 unsafe extern "C" {
     /// `[(entry: u64, stack_top: u64); MAX_CPUS]` — written from
-    /// `start_secondary_cpus` below; polled by secondaries in boot.S.
+    /// `start_secondary_cpus` below; the `stack_top` half is what
+    /// `ap_wake_entry` actually reads.
     static _ap_entry_slot: [u64; MAX_CPUS * 2];
+    /// AP wake entry point — destination of the MailBox-delivered
+    /// entry_pc.  Defined as a global label in boot.S.
+    fn ap_wake_entry();
 }
 
 #[inline]
@@ -56,11 +65,22 @@ pub(crate) fn init_dynamic_percpu() {
     }
 }
 
-/// Start secondary CPUs.  Writes (secondary_rust_entry, stack_top) into
-/// each AP's `_ap_entry_slot` entry, sends an IPI as a wake nudge, then
-/// waits for `AP_READY_COUNT` to match the number started.
+/// Start secondary CPUs via the LoongArch IOCSR wake protocol (#257).
+///
+/// For each AP we:
+///   1. Fill `_ap_entry_slot[cpu]` with `(ap_wake_entry, stack_top)`
+///      so the AP's entry stub can find its stack via `CSR.CPUID`
+///      lookup after the firmware hands off control.
+///   2. Stamp `ap_wake_entry`'s VA into the AP's MailBox0 via the
+///      `Mail_Send` register.  Two 32-bit BLOCKING writes; the
+///      BLOCKING flag self-fences each one.
+///   3. Send `ACTION_BOOT_CPU` IPI; the AP wakes from halt, firmware
+///      reads MailBox0 and jumps to `ap_wake_entry`.
+///
+/// Then waits for `AP_READY_COUNT` to match.  Matches the convention
+/// Linux `arch/loongarch/kernel/smp.c` `loongson_boot_secondary` uses.
 pub fn start_secondary_cpus() {
-    let entry = secondary_rust_entry as *const () as u64;
+    let entry = ap_wake_entry as *const () as u64;
     let n = smp::num_cpus();
     let mut started = 0u32;
 
@@ -69,14 +89,19 @@ pub fn start_secondary_cpus() {
     for cpu in 1..n {
         let stack_top = ap_stack_top(cpu);
         unsafe {
-            // Stack first so the secondary observes it once entry != 0.
+            // Stack first so the AP's CSR.CPUID lookup finds it before
+            // we hand off via MailBox.  Both writes precede mail_send_to,
+            // which is BLOCKING and acts as a release boundary.
             core::ptr::write_volatile(slot_ptr.add(cpu * 2 + 1), stack_top);
-            core::sync::atomic::fence(Ordering::Release);
             core::ptr::write_volatile(slot_ptr.add(cpu * 2), entry);
         }
-        // Nudge: if the secondary ever uses `idle 0` in its spin we want
-        // the IPI to wake it.  Today's busy-poll path doesn't need it.
-        super::trap::send_ipi(cpu as u32);
+        // Stamp entry_pc into the AP's MailBox0 and send the wake IPI.
+        // mail_send_to is BLOCKING; send_ipi_action is BLOCKING too.
+        super::trap::mail_send_to(cpu as u32, 0, entry);
+        super::trap::send_ipi_action(
+            cpu as u32,
+            super::trap::ACTION_BOOT_CPU,
+        );
         started += 1;
     }
 

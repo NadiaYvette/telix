@@ -62,10 +62,38 @@ const LOONGARCH_IOCSR_IPI_EN:     u32 = 0x1004;
 const LOONGARCH_IOCSR_IPI_SET:    u32 = 0x1008;
 const LOONGARCH_IOCSR_IPI_CLEAR:  u32 = 0x100c;
 const LOONGARCH_IOCSR_IPI_SEND:   u32 = 0x1040;
+/// 64-bit MailBox transfer register; #257 wake protocol uses this to
+/// stamp a remote AP's MailBox0 with the entry_pc before sending the
+/// BOOT_CPU IPI.  See 3A5000 manual §10.2 Table 63.
+const LOONGARCH_IOCSR_MAIL_SEND:  u32 = 0x1048;
 
-/// Vector used for reschedule IPIs.  IPI_STATUS has 32 bits, so a
-/// simple 0 suffices; nothing else here sends IPIs yet.
-const IPI_VECTOR_RESCHEDULE: u32 = 0;
+/// IPI action / vector numbers (3A5000 §10.1 IPI_Status format).  Each
+/// is a bit position in the per-core IPI_Status register.  Matches the
+/// Linux `arch/loongarch/kernel/smp.c` convention so QEMU virt's
+/// firmware stub (which dispatches the AP wake on ACTION_BOOT_CPU=0)
+/// works without further glue.
+pub(super) const ACTION_BOOT_CPU:      u32 = 0;
+pub(super) const ACTION_RESCHEDULE:    u32 = 1;
+#[allow(dead_code)]
+pub(super) const ACTION_CALL_FUNCTION: u32 = 2;
+
+/// Vector used for reschedule IPIs.  Kept for back-compat with existing
+/// callers; new code should pass `ACTION_RESCHEDULE` directly to
+/// `send_ipi_action`.
+const IPI_VECTOR_RESCHEDULE: u32 = ACTION_RESCHEDULE;
+
+// Mail_Send payload field positions (3A5000 manual §10.2 Table 63).
+const IOCSR_MBUF_BLOCKING:  u64 = 1 << 31;
+const IOCSR_MBUF_CPU_SHIFT: u32 = 16;
+const IOCSR_MBUF_BOX_SHIFT: u32 = 2;
+const IOCSR_MBUF_H32_MASK:  u64 = 0xFFFF_FFFF_0000_0000;
+
+/// Mail_Send subindex: low half of MailBox `b` (0..3).
+#[inline(always)]
+const fn mbox_lo(b: u32) -> u32 { b * 2 }
+/// Mail_Send subindex: high half of MailBox `b` (0..3).
+#[inline(always)]
+const fn mbox_hi(b: u32) -> u32 { b * 2 + 1 }
 
 /// Write a 32-bit value to an IOCSR register (iocsrwr.w).
 #[inline]
@@ -91,6 +119,46 @@ fn iocsr_read32(addr: u32) -> u32 {
         );
     }
     val
+}
+
+/// Write a 64-bit value to an IOCSR register (iocsrwr.d).  Used by
+/// `mail_send_to` to stamp a remote core's MailBox via the per-core
+/// `Mail_Send` register.
+#[inline]
+fn iocsr_write64(addr: u32, val: u64) {
+    unsafe {
+        core::arch::asm!(
+            "iocsrwr.d {val}, {addr}",
+            val = in(reg) val,
+            addr = in(reg) addr,
+        );
+    }
+}
+
+/// Stamp `data` (64 bits) into remote core `cpu`'s MailBox `box_idx`
+/// (0..3).  Mail_Send only transports 32 data bits per write, so this
+/// issues two iocsrwr.d ops — high half first, then low half — matching
+/// Linux's `csr_mail_send` ordering convention.  Both writes use the
+/// BLOCKING flag so each completes before the next instruction issues.
+///
+/// Used by the #257 wake protocol: BSP writes `entry_pc` to AP's
+/// MailBox0, then sends an `ACTION_BOOT_CPU` IPI; the AP's firmware
+/// stub reads MailBox0 and jumps there.
+pub(super) fn mail_send_to(cpu: u32, box_idx: u32, data: u64) {
+    debug_assert!(box_idx < 4);
+    let cpu_field = (cpu as u64) << IOCSR_MBUF_CPU_SHIFT;
+    // High 32 bits first.
+    let hi = (data & IOCSR_MBUF_H32_MASK)
+        | IOCSR_MBUF_BLOCKING
+        | ((mbox_hi(box_idx) as u64) << IOCSR_MBUF_BOX_SHIFT)
+        | cpu_field;
+    iocsr_write64(LOONGARCH_IOCSR_MAIL_SEND, hi);
+    // Low 32 bits.
+    let lo = ((data << 32) & IOCSR_MBUF_H32_MASK)
+        | IOCSR_MBUF_BLOCKING
+        | ((mbox_lo(box_idx) as u64) << IOCSR_MBUF_BOX_SHIFT)
+        | cpu_field;
+    iocsr_write64(LOONGARCH_IOCSR_MAIL_SEND, lo);
 }
 
 /// Read the stable counter (RDTIME instruction).
@@ -183,7 +251,21 @@ pub fn enable_interrupts() {
 /// this with a non-self target.  Wiring it now keeps things consistent
 /// and avoids a sharp edge the moment SMP lands.
 pub fn send_ipi(target_cpu: u32) {
-    let payload = ((target_cpu & 0x3FF) << 16) | (IPI_VECTOR_RESCHEDULE & 0x1F);
+    send_ipi_action(target_cpu, IPI_VECTOR_RESCHEDULE);
+}
+
+/// Raw IPI send with explicit action vector.  Used by the #257 wake
+/// path with `ACTION_BOOT_CPU` to lift APs out of their reset halt;
+/// also the underlying primitive for `send_ipi` (reschedule).
+///
+/// Payload format (3A5000 §10.2 Table 63 IPI_Send): `[31]` = BLOCKING,
+/// `[25:16]` = destination cpu, `[4:0]` = action / vector.  BLOCKING
+/// makes the iocsrwr complete before the next instruction so callers
+/// don't need an explicit `dbar` between mail_send_to + send_ipi_action.
+pub(super) fn send_ipi_action(target_cpu: u32, action: u32) {
+    let payload = (1u32 << 31)
+        | ((target_cpu & 0x3FF) << 16)
+        | (action & 0x1F);
     iocsr_write32(LOONGARCH_IOCSR_IPI_SEND, payload);
     SGI_SEND_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
