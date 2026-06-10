@@ -428,4 +428,34 @@ mod tests {
             check_invariants(&c);
         });
     }
+
+    // ----- #228 mode-switch race (placeholder) ---------------------
+    //
+    // The "deliberately not modeled" list at the top of this file
+    // calls out the bitmap↔inline mode-switch as out of scope.  That
+    // is the most likely #228 surface — phys.rs encodes the chunk in
+    // a packed u64 with a mode bit, and the inline↔bitmap transition
+    // is not a single CAS.  At fc=63 a free that pushes fc to 64
+    // races with peer allocs that observed the old mode bit, and the
+    // dropped writes can hand the same PA to two callers.
+    //
+    // To extend this crate:
+    //   1. Replace Chunk's separate `bitmap` + `fc` fields with a
+    //      single AtomicU64 state word holding `mode_bit | fc | payload`.
+    //   2. Reimplement alloc / free as packed-u64 CAS, mirroring
+    //      kernel/src/mm/phys.rs:977 (chunk_alloc_one) and 1178
+    //      (chunk_free_one).
+    //   3. Add a `cross_mode_alloc_free_race` test: 3 threads, 2
+    //      alloc + 1 free, initial fc=62 so any successful op flips
+    //      the boundary at 63→64.
+    //   4. Invariant I5: mode bit consistent with fc (mode_bit==inline
+    //      iff fc ≤ INLINE_CAPACITY).
+    //
+    // Estimated effort: ~half a session.  Same crate scaffold; new
+    // submodule `mod_switch`.
+    #[test]
+    #[ignore = "#228 mode-switch race — placeholder, see TODO above"]
+    fn cross_mode_alloc_free_race_todo() {
+        panic!("cross_mode_alloc_free_race not implemented yet");
+    }
 }
