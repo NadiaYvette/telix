@@ -1,0 +1,23 @@
+diff --git a/target/riscv/csr.c b/target/riscv/csr.c
+index 94d15c9..e5d07ec 100644
+--- a/target/riscv/csr.c
++++ b/target/riscv/csr.c
+@@ -5582,7 +5582,17 @@ static inline RISCVException riscv_csrrw_check(CPURISCVState *env,
+     }
+ 
+     csr_priv = get_field(csrno, 0x300);
+-    if (!env->debugger && (effective_priv < csr_priv)) {
++    /*
++     * Telix #228 hack: allow S-mode access to the trigger CSRs
++     * (tselect / tdata1 / tdata2 / tdata3 at 0x7A0..0x7A3) so a
++     * kernel-managed hardware watchpoint can fire from S-mode without
++     * going through OpenSBI.  Standard RISC-V puts these in M-mode
++     * address space; this relaxation is a development-only shortcut
++     * gated by cfg.debug.
++     */
++    bool telix_trigger_csr = (csrno >= 0x7A0 && csrno <= 0x7A3 &&
++                              riscv_cpu_cfg(env)->debug);
++    if (!telix_trigger_csr && !env->debugger && (effective_priv < csr_priv)) {
+         if (csr_priv <= (PRV_S + 1) && env->virt_enabled) {
+             return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;
+         }
