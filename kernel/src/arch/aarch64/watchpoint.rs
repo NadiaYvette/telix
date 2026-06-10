@@ -56,13 +56,22 @@ static EVER_ARMED: AtomicBool = AtomicBool::new(false);
 pub fn arm(addr: u64) {
     debug_assert_eq!(addr & 0x7, 0, "watchpoint address must be 8-byte aligned");
     EVER_ARMED.store(true, Ordering::Relaxed);
+    ARM_COUNT.fetch_add(1, Ordering::Relaxed);
     ARMED_ADDR.store(addr, Ordering::Release);
+    WATCHED_ADDR.store(addr, Ordering::Release);
     let wcr = DBGWCR_E
         | DBGWCR_PAC_EL1
         | DBGWCR_LSC_STORE
         | DBGWCR_BAS_8BYTE
         | DBGWCR_SSC_BOTH;
     unsafe {
+        // Clear PSTATE.D (DAIF bit 9) — boot.S leaves it set, which
+        // MASKS all debug exceptions even when MDSCR.MDE/KDE are
+        // enabled.  Without this the watchpoint never fires.
+        core::arch::asm!(
+            "msr daifclr, #8",
+            options(nostack, preserves_flags),
+        );
         // OSLAR_EL1 = 0 (release OS Lock).  Default state varies and
         // a set OS Lock blocks watchpoint events from firing.
         core::arch::asm!(
@@ -120,12 +129,146 @@ pub fn armed_addr() -> u64 {
 }
 
 /// Sticky address — last value passed to arm(), even after disarm().
-/// The aarch64 trap path doesn't have its full re-arm/learn flow yet
-/// so this is currently just a mirror of `armed_addr()`; the scheduler
-/// uses it via a per-arch fn so we can extend the rv64 variant
-/// separately.
 pub fn watched_addr() -> u64 {
-    ARMED_ADDR.load(Ordering::Acquire)
+    WATCHED_ADDR.load(Ordering::Acquire)
+}
+
+/// Persistent record of the last address passed to `arm()`.  Survives
+/// `disarm()` so `re_arm()` can restore the trigger.  Mirrors the
+/// rv64 watchpoint module.
+static WATCHED_ADDR: AtomicU64 = AtomicU64::new(0);
+static WATCHED_ADDR_AUX: AtomicU64 = AtomicU64::new(0);
+static ARMED_ADDR_AUX: AtomicU64 = AtomicU64::new(0);
+
+pub static HIT_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static ARM_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+const LEGIT_PC_SLOTS: usize = 8;
+static LEGIT_PCS: [AtomicU64; LEGIT_PC_SLOTS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+pub fn is_legit_pc(pc: u64) -> bool {
+    for slot in LEGIT_PCS.iter() {
+        let v = slot.load(Ordering::Acquire);
+        if v == pc { return true; }
+        if v == 0 { return false; }
+    }
+    false
+}
+
+pub fn learn_legit_pc(pc: u64) -> Option<usize> {
+    for (i, slot) in LEGIT_PCS.iter().enumerate() {
+        let v = slot.load(Ordering::Acquire);
+        if v == pc { return None; }
+        if v == 0 {
+            if slot.compare_exchange(0, pc, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return Some(i);
+            } else {
+                continue;
+            }
+        }
+    }
+    None
+}
+
+/// Re-arm DBGWVR0 on the previously armed address.
+pub fn re_arm() {
+    let addr = WATCHED_ADDR.load(Ordering::Acquire);
+    if addr == 0 {
+        return;
+    }
+    ARMED_ADDR.store(addr, Ordering::Release);
+    let wcr = DBGWCR_E
+        | DBGWCR_PAC_EL1
+        | DBGWCR_LSC_STORE
+        | DBGWCR_BAS_8BYTE
+        | DBGWCR_SSC_BOTH;
+    unsafe {
+        core::arch::asm!(
+            "msr dbgwvr0_el1, {}",
+            in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "msr dbgwcr0_el1, {}",
+            in(reg) wcr,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Arm watchpoint #1 (DBGWVR1) on `addr`.  Used to catch alias
+/// writes via the slab identity VA (vs the SLAB_THREAD_REGION VA
+/// the primary watches).
+pub fn arm_aux(addr: u64) {
+    debug_assert_eq!(addr & 0x7, 0, "aux watchpoint address must be 8-byte aligned");
+    ARMED_ADDR_AUX.store(addr, Ordering::Release);
+    WATCHED_ADDR_AUX.store(addr, Ordering::Release);
+    let wcr = DBGWCR_E
+        | DBGWCR_PAC_EL1
+        | DBGWCR_LSC_STORE
+        | DBGWCR_BAS_8BYTE
+        | DBGWCR_SSC_BOTH;
+    unsafe {
+        core::arch::asm!(
+            "msr dbgwvr1_el1, {}",
+            in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "msr dbgwcr1_el1, {}",
+            in(reg) wcr,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+pub fn disarm_aux() {
+    ARMED_ADDR_AUX.store(0, Ordering::Release);
+    unsafe {
+        core::arch::asm!(
+            "msr dbgwcr1_el1, {}",
+            in(reg) 0u64,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+pub fn re_arm_aux() {
+    let addr = WATCHED_ADDR_AUX.load(Ordering::Acquire);
+    if addr == 0 {
+        return;
+    }
+    ARMED_ADDR_AUX.store(addr, Ordering::Release);
+    let wcr = DBGWCR_E
+        | DBGWCR_PAC_EL1
+        | DBGWCR_LSC_STORE
+        | DBGWCR_BAS_8BYTE
+        | DBGWCR_SSC_BOTH;
+    unsafe {
+        core::arch::asm!(
+            "msr dbgwvr1_el1, {}",
+            in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "msr dbgwcr1_el1, {}",
+            in(reg) wcr,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+pub fn watched_addr_aux() -> u64 {
+    WATCHED_ADDR_AUX.load(Ordering::Acquire)
 }
 
 /// Deliberately fire the watchpoint to verify the EC=0x35 path is

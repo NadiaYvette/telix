@@ -66,10 +66,12 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
         }
         // #228 Watchpoint exception, same EL.  The hardware watchpoint
         // armed via watchpoint::arm() fired on a store/load to the
-        // tracked address.  Log offender via direct UART (avoid
-        // core::fmt to keep the handler stack-clean), disarm, and
-        // return so the boot continues.
+        // tracked address.  Mirror of the rv64 SCAUSE_BREAKPOINT
+        // handler: legit-PC re-arm + aux-routing by FAR match.
         0x35 => {
+            use crate::arch::aarch64::watchpoint;
+            watchpoint::HIT_COUNT
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let far: u64;
             let elr = frame.elr;
             unsafe {
@@ -79,16 +81,41 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             let sp_caller = frame.sp;
             let x0 = frame.regs[0];
             let x1 = frame.regs[1];
-            let x2 = frame.regs[2];
-            let x3 = frame.regs[3];
-            {
+
+            let watched_aux = watchpoint::watched_addr_aux();
+            let is_aux_hit = watched_aux != 0 && (far & !0x7) == (watched_aux & !0x7);
+
+            let known = watchpoint::is_legit_pc(elr);
+            let learned_slot = if known {
+                None
+            } else {
+                watchpoint::learn_legit_pc(elr)
+            };
+            let is_bad = !known && learned_slot.is_none();
+
+            let mode = crate::boot::cmdline::BOOT_CONFIG
+                .wp_savedsp
+                .load(core::sync::atomic::Ordering::Relaxed);
+
+            let n = watchpoint::HIT_COUNT
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let want_log = is_bad || learned_slot.is_some() || n <= 64;
+            if want_log {
                 use crate::arch::aarch64::serial::{
                     fault_buf_for_current_cpu, handler_write_bytes, put_byte, put_bytes,
                     put_hex_u64,
                 };
                 let buf = fault_buf_for_current_cpu();
                 let mut k = 0;
-                put_bytes(buf, &mut k, b"WP-HIT: ELR=");
+                let tag: &[u8] = match (is_bad, learned_slot.is_some(), is_aux_hit) {
+                    (true,  _,    true)  => b"WP-AUX-BAD-WRITER: ELR=",
+                    (true,  _,    false) => b"WP-BAD-WRITER: ELR=",
+                    (false, true, true)  => b"WP-AUX-LEARN: ELR=",
+                    (false, true, false) => b"WP-LEARN: ELR=",
+                    (false, false, true) => b"WP-AUX-HIT: ELR=",
+                    (false, false, false) => b"WP-HIT: ELR=",
+                };
+                put_bytes(buf, &mut k, tag);
                 put_hex_u64(buf, &mut k, elr);
                 put_bytes(buf, &mut k, b" FAR=");
                 put_hex_u64(buf, &mut k, far);
@@ -102,18 +129,26 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 put_hex_u64(buf, &mut k, x0);
                 put_bytes(buf, &mut k, b" x1=");
                 put_hex_u64(buf, &mut k, x1);
-                put_bytes(buf, &mut k, b" x2=");
-                put_hex_u64(buf, &mut k, x2);
-                put_bytes(buf, &mut k, b" x3=");
-                put_hex_u64(buf, &mut k, x3);
                 put_byte(buf, &mut k, b'\n');
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
-            crate::arch::aarch64::watchpoint::disarm();
+
+            if is_aux_hit {
+                watchpoint::disarm_aux();
+            } else {
+                watchpoint::disarm();
+            }
             // Advance ELR past the trapped instruction (always 4 bytes
             // on AArch64; no Thumb in EL1).  Per ARM ARM, ELR points
             // to the trapped insn for watchpoint exceptions.
             frame.elr = frame.elr.wrapping_add(4);
+            if !is_bad && mode >= 3 {
+                if is_aux_hit {
+                    watchpoint::re_arm_aux();
+                } else {
+                    watchpoint::re_arm();
+                }
+            }
             frame_sp
         }
 

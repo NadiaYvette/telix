@@ -1122,6 +1122,48 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
                         let ct_addr = &pcpu.current_thread as *const _ as u64;
                         crate::arch::riscv64::watchpoint::arm_aux(ct_addr);
                     }
+                    // aarch64 alias-VA aux: addr is the
+                    // SLAB_THREAD_REGION VA per-instance window
+                    // mapping of the Thread struct.  The same
+                    // physical page is ALSO mapped in the kernel's
+                    // identity range (0x4000_0000..0xC000_0000), so
+                    // writes via that alias don't fire the primary.
+                    // wp_savedsp >= 4 enables aux on the identity VA.
+                    #[cfg(target_arch = "aarch64")]
+                    if crate::boot::cmdline::BOOT_CONFIG
+                        .wp_savedsp
+                        .load(Ordering::Relaxed)
+                        >= 4
+                    {
+                        // AT S1E1W performs the EL1 stage-1 write
+                        // translation; PAR_EL1 reports PA on success.
+                        let pa: u64;
+                        let par: u64;
+                        unsafe {
+                            core::arch::asm!(
+                                "at s1e1w, {}",
+                                in(reg) addr,
+                                options(nostack, preserves_flags),
+                            );
+                            core::arch::asm!(
+                                "mrs {}, par_el1",
+                                out(reg) par,
+                                options(nomem, nostack, preserves_flags),
+                            );
+                        }
+                        pa = if par & 1 == 0 {
+                            (par & 0x000F_FFFF_FFFF_F000) | (addr & 0xFFF)
+                        } else {
+                            0
+                        };
+                        if pa != 0
+                            && pa >= 0x4000_0000
+                            && pa < 0xC000_0000
+                            && pa != addr
+                        {
+                            crate::arch::aarch64::watchpoint::arm_aux(pa);
+                        }
+                    }
                 }
             }
         }
