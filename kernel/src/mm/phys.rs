@@ -800,41 +800,56 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
         // Collect existing inline indices + page_idx into a bitmap.
         // (Double-free against existing inline indices already filtered
         // above, so we know page_idx is NOT among indices[0..fc].)
+        //
+        // #228 fix: use the TRANSITIONING-bit lock so concurrent
+        // chunk_free_one calls (each potentially choosing a different
+        // page_idx as bmp_pg) don't both write_bitmap to their own
+        // page_idx and then race on the state CAS — the loser's stale
+        // write_bitmap would clobber a future consumer's data after
+        // page_idx becomes a regular data page.  Same pattern as the
+        // chunk_alloc_one and alloc_pages_inner fc==64 fixes
+        // (93be952 / 77cde8e); proof in
+        // `tests/loom-phys-chunk` mode_switch_tests.
+        let trans_s = s | STATE_TRANSITIONING_BIT;
+        match node.cas(s, trans_s) {
+            Err(_) => continue,
+            Ok(_) => {}
+        }
+        // Winner.  Bitmap write is exclusively ours until the final CAS.
         let mut bmp: u64 = 0;
         for i in 0..fc {
-            bmp |= 1u64 << inline_idx(s, i);
+            bmp |= 1u64 << inline_idx(trans_s, i);
         }
         // page_idx is the bitmap page; its bit is CLEAR (reserved).
         // The existing inline pages are free; their bits are SET.
 
-        // Write bitmap to the freed page.
         let bpa = page_pa(chunk_idx, page_idx);
         unsafe {
             write_bitmap(bpa, bmp);
         }
 
-        let new_s = make_state(fc, owner(s), true, page_idx, 0);
-        // Note: fc stays the same because the freed page becomes the bitmap
-        // page (not counted in fc), and the INLINE_K pages remain free.
-        // Actually: before this free, there were fc=INLINE_K pages free (inline).
-        // We're adding page_idx. Total should be INLINE_K + 1. But page_idx
-        // becomes the bitmap page (not available), so available = INLINE_K.
-        // So fc stays INLINE_K. Correct.
-        match node.cas(s, new_s) {
-            Ok(_) => {
-                // The freed page is consumed as bitmap overhead; don't increment
-                // the global counter (the caller's page was freed, but one page
-                // is now used for the bitmap, net change = 0 to available count).
-                // Actually: the caller freed a page. That page is now the bitmap
-                // page. The INLINE_K pages that were already free are still free.
-                // From the caller's perspective, their page was freed. But from
-                // the available count, nothing changed (the page is used as metadata).
-                // This is correct: the global count tracks pages available to callers.
-                // No change to free_count_global.
+        // CAS to final state in a retry loop — only this thread can
+        // clear TRANSITIONING.  Note: fc stays the same because the
+        // freed page becomes the bitmap page (not counted in fc), and
+        // the INLINE_K pages remain free.
+        loop {
+            let cur = node.load();
+            if cur & STATE_TRANSITIONING_BIT == 0 {
+                crate::println!(
+                    "[#228] chunk_free_one INLINE_K: TRANSITIONING cleared by other writer (cur={:#x})",
+                    cur,
+                );
                 return;
             }
-            Err(_) => continue,
+            let new_s = make_state(fc, owner(cur), true, page_idx, 0);
+            if node.cas(cur, new_s).is_ok() {
+                break;
+            }
         }
+        // No change to free_count_global: the caller's freed page
+        // becomes the chunk's bitmap page (metadata), so net change to
+        // pages-available-to-callers is zero.
+        return;
     }
 }
 
