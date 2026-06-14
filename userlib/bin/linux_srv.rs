@@ -5828,6 +5828,40 @@ fn open_virtual_file(pi: usize, content: &[u8], flags: u64) -> u64 {
     fd as u64
 }
 
+/// Static (process-independent) /proc nodes that real distro roots and
+/// glibc read constantly.  Returns the file content for a recognized path,
+/// or None to fall through to ENOENT.  (T2-T1a)
+///
+/// CPU view is intentionally uniprocessor here: `sched_getaffinity` reports
+/// a single-CPU mask, so /proc/stat + /proc/cpuinfo present one CPU to keep
+/// `nproc`/get_nprocs() consistent with the affinity mask.  Widening this to
+/// the kernel's real SMP count is a separate scheduling decision (must also
+/// widen the affinity mask and validate NPTL-on-SMP) — tracked separately.
+fn static_proc_content(path: &[u8]) -> Option<&'static [u8]> {
+    Some(match path {
+        b"/proc/uptime" => b"100.00 100.00\n",
+        b"/proc/loadavg" => b"0.00 0.00 0.00 1/1 1\n",
+        // One aggregate `cpu` line + one `cpu0` line (uniprocessor view).
+        b"/proc/stat" => b"cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n",
+        b"/proc/version" => b"Linux version 6.1.0-telix (telix@telix) (rustc) #1 SMP Telix\n",
+        b"/proc/cmdline" => b"BOOT_IMAGE=/boot/telix root=/dev/vda rw\n",
+        b"/proc/filesystems" => b"nodev\tproc\nnodev\tsysfs\nnodev\ttmpfs\nnodev\tdevtmpfs\n\text4\n\tbtrfs\n",
+        b"/proc/mounts" => b"rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\ndevtmpfs /dev devtmpfs rw,nosuid 0 0\ntmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n",
+        b"/proc/self/mountinfo" => b"21 1 0:1 / / rw - rootfs rootfs rw\n22 21 0:2 / /proc rw - proc proc rw\n23 21 0:3 / /dev rw - devtmpfs devtmpfs rw\n24 21 0:4 / /tmp rw - tmpfs tmpfs rw\n",
+        b"/proc/sys/kernel/ostype" => b"Linux\n",
+        b"/proc/sys/kernel/hostname" => b"telix\n",
+        b"/proc/sys/kernel/pid_max" => b"32768\n",
+        b"/proc/sys/kernel/threads-max" => b"8192\n",
+        b"/proc/sys/kernel/random/boot_id" => b"00000000-0000-4000-8000-000000000000\n",
+        b"/proc/sys/vm/overcommit_memory" => b"0\n",
+        b"/proc/sys/vm/overcommit_ratio" => b"50\n",
+        b"/proc/sys/vm/max_map_count" => b"65530\n",
+        b"/proc/sys/vm/mmap_min_addr" => b"65536\n",
+        b"/proc/sys/fs/file-max" => b"131072\n",
+        _ => return None,
+    })
+}
+
 /// Open a /proc pseudo-file by generating content into a ProcBuf slot.
 fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 {
     // Find a free ProcBuf slot.
@@ -5973,6 +6007,14 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
         len = n;
     } else if path == b"/proc/sys/kernel/version" {
         let content = b"#1 SMP Telix\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if let Some(content) = static_proc_content(path) {
+        // Static global /proc nodes that real distro roots + glibc read
+        // constantly (T2-T1a).  Pure content generation; same shape as the
+        // arms above.  Per-process nodes (self/maps, self/cmdline, …) and
+        // readlink targets (self/exe, self/fd/N) are handled elsewhere.
         let n = content.len().min(PROCBUF_SIZE);
         buf[..n].copy_from_slice(&content[..n]);
         len = n;
