@@ -2846,6 +2846,54 @@ fn deferred_kill() -> &'static [AtomicUsize] {
     unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
 }
 
+/// Phase-5 kstack-leak fix: drain a prior pending deferred kstack BEFORE a
+/// store site overwrites the single per-CPU `deferred_kstack()[cpu]` slot.
+///
+/// That slot holds at most ONE pending kstack PA to free, but two store
+/// sites write it (the try_switch death path and the thread-exit
+/// self-defer path), while the only drain runs in try_switch and is
+/// skipped whenever the exiting thread is still current (`cur==deferred`).
+/// Under rapid same-CPU exits a second store therefore OVERWROTE — and
+/// leaked — the first thread's 1 MiB kstack phys.  init's Phase-5 server
+/// smoke tests churn ~1000+ threads, leaking ~1 GB on a 2 GB guest →
+/// `alloc_kstack_zeroed` fails → `do_spawn_heavy_work FAILED
+/// step=kstack_alloc` → the boot wedges at Phase 5.  Calling this before
+/// each store frees the prior entry first, bounding the leak to zero.
+///
+/// Safe to free here: the prior entry belongs to an already-dead thread
+/// that has been switched off this CPU.  We never free `exclude_pa` (the
+/// stack about to be stored) nor the currently-running stack — the same
+/// guard the try_switch drain uses.  The slot is per-CPU, so the CAS only
+/// races with this CPU's own try_switch drain; whichever wins is the sole
+/// owner and the other no-ops.
+fn drain_prior_deferred_kstack(cpu: usize, exclude_pa: usize) {
+    let prior = deferred_kstack()[cpu].load(Ordering::Acquire);
+    if prior == 0 || prior == exclude_pa {
+        return;
+    }
+    let cur_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let cur_stack = thread_ref(cur_tid).stack_phys_base;
+    if prior == cur_stack {
+        return; // never free the stack we're executing on
+    }
+    if deferred_kstack()[cpu]
+        .compare_exchange(prior, 0, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // the try_switch drain claimed it first
+    }
+    kstack_pa_audit(prior, kstack_size(), -1, "free-prior");
+    kstack_pa_unregister(prior as u64);
+    crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(prior), KSTACK_ORDER);
+    let dead_tid = deferred_thread()[cpu].swap(usize::MAX, Ordering::AcqRel);
+    if dead_tid < RadixTable::capacity() {
+        // Safety: dead thread is Dead, not on any queue or CPU.
+        let t = unsafe { thread_mut_from_ref(dead_tid as ThreadId) };
+        t.stack_base = 0;
+        bump_kstack_epoch(t); // #208
+    }
+}
+
 const NUM_PRIORITIES: usize = 256;
 
 /// Sentinel value for empty linked-list pointers (head/tail/next/prev).
@@ -6957,6 +7005,10 @@ fn try_switch(current_sp: u64) -> u64 {
                 // can pass it to phys::free_pages directly.
                 let kstack_phys_base = prev_t.stack_phys_base;
                 spb_check(prev_id, kstack_phys_base as u64, "kill_defer");
+                // Phase-5 leak fix: free any prior pending deferred kstack
+                // before overwriting the single-slot — otherwise a rapid
+                // second exit on this CPU leaks the first thread's kstack.
+                drain_prior_deferred_kstack(cpu as usize, kstack_phys_base);
                 deferred_thread()[cpu as usize].store(prev_id as usize, Ordering::Release);
                 deferred_kstack()[cpu as usize].store(kstack_phys_base, Ordering::Release);
             } else {
@@ -9956,6 +10008,12 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     // Defer freeing our own kernel stack — we're running on it.
     // Also store our thread ID so try_switch can mark the slot as reusable.
     let cpu = smp::cpu_id();
+    // Phase-5 leak fix: drain any prior pending deferred kstack (a thread
+    // that exited on this CPU before its slot was drained) before we
+    // overwrite the single slot with our own — otherwise that prior 1 MiB
+    // kstack leaks.  This is the dominant leak: each exiting thread defers
+    // its own stack here, and rapid same-CPU exits clobber each other.
+    drain_prior_deferred_kstack(cpu as usize, kstack_base);
     deferred_thread()[cpu as usize].store(tid as usize, Ordering::Release);
     deferred_kstack()[cpu as usize].store(kstack_base, Ordering::Release);
 
