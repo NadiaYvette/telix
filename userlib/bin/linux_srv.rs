@@ -250,6 +250,8 @@ const __NR_CHROOT: u64 = 161;
 const __NR_PIVOT_ROOT: u64 = 155;
 const __NR_MOUNT: u64 = 165;
 const __NR_UMOUNT2: u64 = 166;
+const __NR_SETHOSTNAME: u64 = 170;
+const __NR_SETDOMAINNAME: u64 = 171;
 
 // arch_prctl subcodes
 const ARCH_SET_FS: u64 = 0x1002;
@@ -14629,7 +14631,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 sec
             }
             __NR_SYNC | __NR_SYNCFS => 0, // no durable storage
-            __NR_CHROOT | __NR_PIVOT_ROOT | __NR_MOUNT | __NR_UMOUNT2 => linux_err(EPERM),
+            // T2-T1c: a real distro init runs `mount -t proc proc /proc`,
+            // tmpfs on /tmp|/run, devtmpfs on /dev, and may chroot/pivot_root.
+            // Returning EPERM aborts init.  The pseudo-filesystems Telix
+            // pre-provides (procfs via open_proc_file, devfs, tmpfs_srv) are
+            // already present, so accept these as success (logged no-ops)
+            // and let init proceed.  NOTE: this does NOT yet bind tmpfs at an
+            // arbitrary mountpoint, nor confine chroot to a subtree — those
+            // are follow-ups; the unblock is not aborting on the syscall.
+            __NR_MOUNT => { syscall::debug_puts(b"[linux_srv] mount: accept (no-op)\n"); 0 }
+            __NR_UMOUNT2 => 0,
+            __NR_CHROOT => { syscall::debug_puts(b"[linux_srv] chroot: accept (no-op, not yet confining)\n"); 0 }
+            __NR_PIVOT_ROOT => { syscall::debug_puts(b"[linux_srv] pivot_root: accept (no-op)\n"); 0 }
+            // T2-T1c: distro init sets the hostname early; accept as no-op
+            // (the synthetic /etc/hostname + /proc/sys/kernel/hostname stay
+            // "telix").  Was hitting the ENOSYS catch-all and failing init.
+            __NR_SETHOSTNAME | __NR_SETDOMAINNAME => 0,
 
             // Phase 162: close_range, faccessat2.
             __NR_CLOSE_RANGE => handle_close_range(pi, &msg.data),
