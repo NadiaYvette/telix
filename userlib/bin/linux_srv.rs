@@ -260,6 +260,7 @@ const ARCH_GET_FS: u64 = 0x1003;
 // Linux errno values
 const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
+const ENOEXEC: u64 = 8;
 const EBADF: u64 = 9;
 const EFAULT: u64 = 14;
 const EIO: u64 = 5;
@@ -1071,6 +1072,34 @@ enum PendingAsyncKind {
     ///   buf_va           → caller's destination VA (8 bytes)
     ///   buf_len          → 0
     TimerFdRead,
+    /// #268-B exec-from-disk, OPEN stage.  handle_execve missed the
+    /// kernel initramfs and is opening the path against vfs_srv via
+    /// VFS_OPEN_ASYNC.  On VFS_OPEN_REPLY (`finish_exec_open`, main
+    /// thread) we allocate an image buffer sized to file_size and
+    /// transition this same slot in place to `ExecRead`.  Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → caller_port (BOTH the exec target and the
+    ///                      reply destination on failure)
+    ///   flags            → argv_va (in the *client's* old aspace)
+    ///   listen_fd        → envp_va (in the *client's* old aspace)
+    /// The execve filename rides in EXEC_PENDING_NAME[slot] (for the
+    /// post-exec exe_name / trace bookkeeping), not in the struct.
+    ExecOpen,
+    /// #268-B exec-from-disk, READ stage.  Streaming the whole ELF into
+    /// a linux_srv-local buffer via FS_READ_ASYNC chunks.  Completed by
+    /// FS_READ_REPLY on IRFS_REPLY_PORT (`finish_exec_read`, reply
+    /// thread).  On the final chunk we call `personality_exec_image`;
+    /// the kernel installs the image and wakes the target (no reply).
+    /// Any failure replies an errno to the still-intact caller.  Field
+    /// reuse (inherited in place from ExecOpen, plus):
+    ///   buf_va           → image buffer base in linux_srv's aspace
+    ///                      (munmap'd once exec_image returns)
+    ///   buf_len          → total ELF size (the fill target)
+    ///   scratch_slot     → FS async scratch slot for the in-flight chunk
+    ///   total_so_far     → bytes copied into the buffer so far
+    ///   extra_handle     → FS file handle (for issuing further chunks)
+    ///   aux_port         → FS server port (for issuing further chunks)
+    ExecRead,
 }
 
 /// `#[repr(C)]` pins `kind` at offset 0 so we can take an
@@ -1121,6 +1150,10 @@ struct PendingAsync {
     /// On reply, the bytes go to backing[chunk * CACHE_CHUNK_SIZE..]
     /// and we mark `LIB_CACHE[cache_slot].chunks_cached |= 1 << chunk`.
     in_flight_chunk: u8,
+    /// ExecRead (#268-B): the FS server port serving the ELF, so the
+    /// reply-thread continuation can issue subsequent FS_READ_ASYNC
+    /// chunks.  0 for all other kinds.
+    aux_port: u64,
 }
 
 impl PendingAsync {
@@ -1141,12 +1174,26 @@ impl PendingAsync {
             extra_handle: 0,
             cache_slot: 0xFF,
             in_flight_chunk: 0,
+            aux_port: 0,
         }
     }
 }
 
 static mut PENDING_ASYNC: [PendingAsync; MAX_PENDING_ASYNC] =
     [PendingAsync::empty(); MAX_PENDING_ASYNC];
+
+/// #268-B: per-pending-slot stash of the execve filename (with any
+/// leading '/'), so the async ExecRead continuation can run the same
+/// post-exec bookkeeping (exe_name store + diagnostic trace-attach) the
+/// initramfs fast path does inline.  Indexed by PENDING_ASYNC slot;
+/// persists across the in-place ExecOpen→ExecRead transition (same slot)
+/// and is cleared (len=0) whenever the slot is retired.  16 bytes is the
+/// exe_name capacity in ProcessState — longer names are truncated there
+/// regardless.
+static mut EXEC_PENDING_NAME: [[u8; 16]; MAX_PENDING_ASYNC] =
+    [[0u8; 16]; MAX_PENDING_ASYNC];
+static mut EXEC_PENDING_NAME_LEN: [u8; MAX_PENDING_ASYNC] =
+    [0u8; MAX_PENDING_ASYNC];
 
 /// Plan A.2c: lockless slot index management.  PENDING_ASYNC[i].kind
 /// is the single source of truth for slot ownership: the discriminant
@@ -1234,6 +1281,7 @@ fn async_free_slot(idx: usize) {
         PENDING_ASYNC[idx].extra_handle = 0;
         PENDING_ASYNC[idx].cache_slot = 0xFF;
         PENDING_ASYNC[idx].in_flight_chunk = 0;
+        PENDING_ASYNC[idx].aux_port = 0;
     }
     pending_kind_atomic(idx).store(KIND_UNUSED, Ordering::Release);
 }
@@ -3200,6 +3248,7 @@ fn try_fs_read_async(
             extra_handle: 0,
             cache_slot: 0xFF,
             in_flight_chunk: 0,
+            aux_port: 0,
         };
     }
     // Wire format mirrors IRFS_IO_READ_ASYNC:
@@ -3490,6 +3539,7 @@ fn try_irfs_read_async(
             extra_handle: 0,
             cache_slot: 0xFF,
             in_flight_chunk: 0,
+            aux_port: 0,
         };
         // Pack args per the IRFS_IO_READ_ASYNC contract:
         //   d0 = handle (low 32) | length (high 32)
@@ -3645,6 +3695,7 @@ fn try_irfs_read_mmap(
             extra_handle: handle,
             cache_slot,
             in_flight_chunk: next_to_fetch as u8,
+            aux_port: 0,
         };
         let d0 = (handle & 0xFFFF_FFFF) | (((fetch_len as u64) & 0xFFFF_FFFF) << 32);
         let r = syscall::send_nb_4(
@@ -4979,6 +5030,7 @@ fn try_open_initramfs(pi: usize, caller_port: u64, flags: u64, path: &[u8]) -> T
             extra_handle: w0,
             cache_slot: 0xFF,
             in_flight_chunk: 0,
+            aux_port: 0,
         };
     }
     // Repack d2 for the async ABI:
@@ -5103,6 +5155,7 @@ fn try_open_vfs_async(
             extra_handle: w0,             // path[0..8]
             cache_slot: 0xFF,
             in_flight_chunk: 0,
+            aux_port: 0,
         };
     }
     // d2 layout: bits 0..16 = pathlen, bits 16..48 = correlation (low 32).
@@ -5159,6 +5212,7 @@ fn try_stat_vfs_async(
             extra_handle: 0,
             cache_slot: 0xFF,
             in_flight_chunk: 0,
+            aux_port: 0,
         };
     }
     let d2 = (path.len() as u64 & 0xFFFF)
@@ -8592,18 +8646,39 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     // before tearing down its address space.
     let result = syscall::personality_execve(caller_port, lookup_name, argv_va, envp_va);
     if result == u64::MAX {
-        return Some(linux_err(ENOENT));
+        // Not in the kernel initramfs.  Fall through to the disk-backed
+        // root (#268-B): open + stream the ELF off the (ext/btrfs/…) root
+        // via the async VFS path, then install it with
+        // personality_exec_image.  See try_exec_open_vfs_async and the
+        // ExecOpen/ExecRead continuations.  On a successful kick-off the
+        // chain DEFERS (a later continuation wakes the target or replies an
+        // errno); if we can't even start it, return ENOENT so a PATH-walking
+        // caller keeps probing the next directory.
+        match try_exec_open_vfs_async(pi, caller_port, name, argv_va, envp_va) {
+            TryAsyncVfs::Deferred => return None,
+            TryAsyncVfs::NotTaken => return Some(linux_err(ENOENT)),
+        }
     }
 
-    // Auto-attach TRACE_PI for xeyes / Xwayland diagnosis.  xeyes:
-    // env-propagation hypothesis (now resolved).  Xwayland: premature
-    // exit chase — Xwayland reports xw_exit=-9 within ~3s of fork
-    // without ever binding /tmp/.X11-unix/X0; need the syscall trace
-    // to identify the last call before exit.  glibc_pthread_hello /
-    // pthread_test: Phase 200 Tier-2 wedge — task=39 (single tid)
-    // stuck in PENDING after execve, never reaches pthread_create.
-    // Logging fires from the dispatch loop (line ~11172/11652) for the
-    // new image's syscalls.
+    // Initramfs fast path succeeded: the kernel has already woken the target
+    // with its new image.  Run the post-exec bookkeeping and skip the reply
+    // (return None → the dispatch arm `continue`s without replying).
+    apply_exec_success(pi, name);
+    None
+}
+
+/// Post-exec bookkeeping shared by the initramfs fast path (`handle_execve`)
+/// and the #268-B disk exec path (`finish_exec_read`): attach a diagnostic
+/// syscall trace for known targets, close CLOEXEC fds, reset brk, and record
+/// the exe name for /proc/self/exe.  `name` is the original execve filename
+/// (may start with '/').  Callers MUST hold `proc_lock(pi)` — the main
+/// dispatch arm holds it for the whole iteration; the reply-thread
+/// continuation takes it explicitly.
+fn apply_exec_success(pi: usize, name: &[u8]) {
+    let lookup_name = if name.first() == Some(&b'/') { &name[1..] } else { name };
+
+    // Auto-attach TRACE_PI for xeyes / Xwayland / pthread diagnosis.  Logging
+    // fires from the dispatch loop for the new image's syscalls.
     unsafe {
         let trace = matches!(lookup_name, b"xeyes" | b"Xwayland"
                                        | b"glibc_pthread_hello" | b"pthread_test"
@@ -8624,7 +8699,7 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
         }
     }
 
-    // On success: close CLOEXEC FDs and reset BRK.
+    // Close CLOEXEC FDs and reset BRK; record exe name.
     unsafe {
         for i in 3..MAX_FDS {
             if PROC_TABLE[pi].fds[i].in_use && (PROC_TABLE[pi].fds[i].fd_flags & FD_CLOEXEC) != 0 {
@@ -8633,16 +8708,296 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
         }
         PROC_TABLE[pi].brk_base = 0;
         PROC_TABLE[pi].brk_current = 0;
-        // Store exe name for /proc/self/exe.
-        let elen = name_len.min(16);
+        let elen = name.len().min(16);
         PROC_TABLE[pi].exe_name = [0u8; 16];
-        for j in 0..elen { PROC_TABLE[pi].exe_name[j] = name_buf[j]; }
+        for j in 0..elen { PROC_TABLE[pi].exe_name[j] = name[j]; }
         PROC_TABLE[pi].exe_name_len = elen as u8;
     }
+}
 
-    // Success: the kernel has already woken the target with its new image.
-    // Do NOT call personality_reply — return None to signal the main loop to skip reply.
-    None
+/// #268-B exec-from-disk, OPEN stage.  Kick off VFS_OPEN_ASYNC for an
+/// execve that missed the kernel initramfs.  Mirrors `try_open_vfs_async`
+/// but tags the slot `ExecOpen`, stashes argv/envp + the exec filename, and
+/// (unlike a normal open) does NOT install a Dir-FD fallback on miss — an
+/// exec of a non-file just becomes ENOENT.  Returns `Deferred` once the open
+/// is in flight (caller returns None → no reply); `NotTaken` if the async
+/// path doesn't apply (caller returns ENOENT).
+///
+/// `name` is the original execve filename (absolute or relative, possibly
+/// with a leading '/').  We resolve it to an absolute path ≤24 bytes for the
+/// short-VFS_OPEN_ASYNC ABI; longer paths fall back to NotTaken for now (a
+/// VFS_OPEN_LONG async variant is the documented follow-up).
+fn try_exec_open_vfs_async(
+    pi: usize,
+    caller_port: u64,
+    name: &[u8],
+    argv_va: u64,
+    envp_va: u64,
+) -> TryAsyncVfs {
+    unsafe {
+        if !VFS_ASYNC_REGISTERED {
+            return TryAsyncVfs::NotTaken;
+        }
+    }
+    // Resolve to an absolute path.  Relative names get CWD prepended (mirrors
+    // resolve_path, but we already hold the bytes).
+    let mut abs = [0u8; 64];
+    let abs_len = if name.first() == Some(&b'/') {
+        let n = name.len().min(64);
+        abs[..n].copy_from_slice(&name[..n]);
+        n
+    } else {
+        unsafe {
+            let clen = PROC_TABLE[pi].cwd_len;
+            let mut pos = 0usize;
+            for i in 0..clen { if pos < 64 { abs[pos] = PROC_TABLE[pi].cwd[i]; pos += 1; } }
+            if pos == 0 || abs[pos - 1] != b'/' { if pos < 64 { abs[pos] = b'/'; pos += 1; } }
+            for &b in name { if pos < 64 { abs[pos] = b; pos += 1; } }
+            pos
+        }
+    };
+    if abs_len == 0 || abs_len > 24 {
+        if abs_len > 24 {
+            syscall::debug_puts(b"[lsrv] exec-from-disk: path >24B unsupported (async); ENOENT: ");
+            syscall::debug_puts(&abs[..abs_len.min(48)]);
+            syscall::debug_puts(b"\n");
+        }
+        return TryAsyncVfs::NotTaken;
+    }
+    let path = &abs[..abs_len];
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 {
+        return TryAsyncVfs::NotTaken;
+    }
+    let slot = match async_alloc_slot() {
+        Some(s) => s,
+        None => return TryAsyncVfs::NotTaken,
+    };
+    let correlation = next_correlation_id();
+    let (w0, w1, w3) = pack_path_async24(path);
+    unsafe {
+        PENDING_ASYNC[slot] = PendingAsync {
+            kind: PendingAsyncKind::ExecOpen,
+            correlation,
+            pi,
+            caller_task_port: caller_port,
+            listen_fd: envp_va as usize, // envp (client aspace VA)
+            flags: argv_va,              // argv (client aspace VA)
+            buf_va: 0,
+            buf_len: 0,
+            scratch_slot: 0xFF,
+            total_so_far: 0,
+            mmap_prot_flags: 0,
+            mmap_aligned_len: 0,
+            extra_handle: 0,
+            cache_slot: 0xFF,
+            in_flight_chunk: 0,
+            aux_port: 0,
+        };
+        // Stash the exec filename for the post-exec bookkeeping done by the
+        // ExecRead continuation (persists across the in-place transition).
+        let nl = name.len().min(16);
+        EXEC_PENDING_NAME[slot] = [0u8; 16];
+        EXEC_PENDING_NAME[slot][..nl].copy_from_slice(&name[..nl]);
+        EXEC_PENDING_NAME_LEN[slot] = nl as u8;
+    }
+    let d2 = (path.len() as u64 & 0xFFFF)
+        | (((correlation as u32) as u64 & 0xFFFF_FFFF) << 16);
+    let r = syscall::send_nb_4(vfs_port, VFS_OPEN_ASYNC, w0, w1, d2, w3);
+    if r != 0 {
+        async_free_slot(slot);
+        unsafe { EXEC_PENDING_NAME_LEN[slot] = 0; }
+        return TryAsyncVfs::NotTaken;
+    }
+    TryAsyncVfs::Deferred
+}
+
+/// Fail an in-flight exec chain: free the held scratch slot (if any) and the
+/// image buffer (if allocated), retire the pending slot, and reply an errno
+/// to the (still-intact) caller.  Used by every error arm of
+/// finish_exec_open / exec_issue_read_chunk / finish_exec_read.
+fn exec_fail(slot: usize, errno_pos: u64) {
+    unsafe {
+        let info = PENDING_ASYNC[slot];
+        if info.scratch_slot != 0xFF {
+            free_async_scratch_slot(info.scratch_slot);
+        }
+        if info.buf_va != 0 {
+            let _ = syscall::munmap(info.buf_va);
+        }
+        let caller = info.caller_task_port;
+        async_free_slot(slot);
+        EXEC_PENDING_NAME_LEN[slot] = 0;
+        let _ = syscall::personality_reply(caller, errno_pos);
+    }
+}
+
+/// Issue the next FS_READ_ASYNC chunk for an ExecRead slot.  Allocates a
+/// fresh scratch slot, records it + a new correlation on the pending slot,
+/// and sends the read.  On any failure it calls `exec_fail` (reply EIO +
+/// cleanup) and returns false; true means a chunk is in flight.  Runs on
+/// whichever thread drives the chain (main thread for the first chunk from
+/// finish_exec_open, reply thread for subsequent ones from finish_exec_read).
+fn exec_issue_read_chunk(slot: usize) -> bool {
+    unsafe {
+        let info = PENDING_ASYNC[slot];
+        let remaining = info.buf_len - info.total_so_far as usize;
+        if remaining == 0 {
+            return true; // nothing left to read (defensive)
+        }
+        if FS_ASYNC_SCRATCH_LOCAL == 0 || !FS_ASYNC_SCRATCH_GRANTED {
+            exec_fail(slot, linux_err(EIO));
+            return false;
+        }
+        let chunk = remaining.min(FS_ASYNC_SCRATCH_PAGES * 4096);
+        let ss = match alloc_async_scratch_slot() {
+            Some(s) => s,
+            None => { exec_fail(slot, linux_err(EIO)); return false; }
+        };
+        let correlation = next_correlation_id();
+        PENDING_ASYNC[slot].scratch_slot = ss;
+        PENDING_ASYNC[slot].correlation = correlation;
+        // Wire format mirrors try_fs_read_async:
+        //   d0 = handle (low 32) | chunk_len (high 32)
+        //   d1 = offset, d2 = remote scratch va, d3 = correlation
+        let d0 = (info.extra_handle & 0xFFFF_FFFF) | (((chunk as u64) & 0xFFFF_FFFF) << 32);
+        let r = syscall::send_nb_4(
+            info.aux_port,
+            FS_READ_ASYNC,
+            d0,
+            info.total_so_far as u64,
+            async_scratch_remote_va(ss) as u64,
+            correlation,
+        );
+        if r != 0 {
+            free_async_scratch_slot(ss);
+            PENDING_ASYNC[slot].scratch_slot = 0xFF;
+            exec_fail(slot, linux_err(EIO));
+            return false;
+        }
+        true
+    }
+}
+
+/// Continuation for the #268-B exec OPEN stage (VFS_OPEN_REPLY, main thread).
+/// `fs_port`==0 means the open failed (real ENOENT, or it was a directory) —
+/// reply ENOENT and leave the caller intact.  Otherwise allocate an image
+/// buffer sized to `file_size`, transition this slot in place to ExecRead,
+/// and kick the first FS_READ_ASYNC chunk.
+fn finish_exec_open(slot: usize, fs_port: u64, handle: u64, file_size: u64) {
+    const MAX_EXEC_IMAGE: u64 = 64 * 1024 * 1024;
+    unsafe {
+        if fs_port == 0 {
+            // Open miss / directory — execve of a non-file ⇒ ENOENT.
+            let caller = PENDING_ASYNC[slot].caller_task_port;
+            async_free_slot(slot);
+            EXEC_PENDING_NAME_LEN[slot] = 0;
+            let _ = syscall::personality_reply(caller, linux_err(ENOENT));
+            return;
+        }
+        if file_size == 0 {
+            exec_fail(slot, linux_err(ENOEXEC));
+            return;
+        }
+        if file_size > MAX_EXEC_IMAGE {
+            exec_fail(slot, linux_err(ENOMEM));
+            return;
+        }
+        if !is_fs_async_registered(fs_port) {
+            // No async read path to this FS server.  We deliberately do NOT
+            // fall back to a sync blocking backend read (the cross-client
+            // deadlock class the async sweep removes); surface EIO instead.
+            syscall::debug_puts(b"[lsrv] exec-from-disk: fs_port not async-registered; EIO\n");
+            exec_fail(slot, linux_err(EIO));
+            return;
+        }
+        let (buf_va, _pages) = match syscall::mmap_anon_bytes(file_size as usize, 1 /* RW */) {
+            Some(p) => p,
+            None => { exec_fail(slot, linux_err(ENOMEM)); return; }
+        };
+        // Transition in place to the READ stage (same slot ⇒ EXEC_PENDING_NAME
+        // entry persists).
+        PENDING_ASYNC[slot].kind = PendingAsyncKind::ExecRead;
+        PENDING_ASYNC[slot].buf_va = buf_va;
+        PENDING_ASYNC[slot].buf_len = file_size as usize;
+        PENDING_ASYNC[slot].extra_handle = handle;
+        PENDING_ASYNC[slot].aux_port = fs_port;
+        PENDING_ASYNC[slot].total_so_far = 0;
+        PENDING_ASYNC[slot].scratch_slot = 0xFF;
+    }
+    let _ = exec_issue_read_chunk(slot); // replies + cleans up on failure
+}
+
+/// Continuation for the #268-B exec READ stage (FS_READ_REPLY, reply thread).
+/// Copy the just-fetched chunk into the image buffer; if more remains, issue
+/// the next chunk.  On the final chunk, install the image via
+/// personality_exec_image: on success the kernel wakes the target (no reply)
+/// and we run the post-exec bookkeeping; on a pre-teardown failure the caller
+/// is intact and gets ENOEXEC.
+fn finish_exec_read(slot: usize, bytes_read: u64) {
+    unsafe {
+        let info = PENDING_ASYNC[slot];
+        if bytes_read == 0 {
+            // Short read mid-stream — treat as EIO (matches sync-path
+            // SHORT-READ semantics).
+            if DEBUG_SHORT_READ {
+                syscall::debug_puts(b"[lsrv] SHORT-READ async exec h=");
+                print_num(info.extra_handle);
+                syscall::debug_puts(b" off=");
+                print_num(info.total_so_far as u64);
+                syscall::debug_puts(b"\n");
+            }
+            exec_fail(slot, linux_err(EIO));
+            return;
+        }
+        let n = (bytes_read as usize).min(info.buf_len - info.total_so_far as usize);
+        // Copy scratch → image buffer at the running offset.
+        let src = async_scratch_local_va(info.scratch_slot) as *const u8;
+        let dst = (info.buf_va + info.total_so_far as usize) as *mut u8;
+        core::ptr::copy_nonoverlapping(src, dst, n);
+        free_async_scratch_slot(info.scratch_slot);
+        PENDING_ASYNC[slot].scratch_slot = 0xFF;
+        PENDING_ASYNC[slot].total_so_far += n as u32;
+
+        if (PENDING_ASYNC[slot].total_so_far as usize) < info.buf_len {
+            // More to read — issue the next chunk (handles its own failure).
+            let _ = exec_issue_read_chunk(slot);
+            return;
+        }
+
+        // Whole ELF is in the buffer.  Install it.  argv/envp are still VAs in
+        // the *client's* old aspace; the kernel reads them via copy_from_user
+        // before teardown (see exec_for_task).  caller_task_port doubles as
+        // the exec target and the error-reply destination.
+        let caller = info.caller_task_port;
+        let argv_va = info.flags;
+        let envp_va = info.listen_fd as u64;
+        let buf_va = info.buf_va;
+        let img_len = info.buf_len as u64;
+        let pi = info.pi;
+        let r = syscall::personality_exec_image(caller, buf_va as u64, img_len, argv_va, envp_va);
+        // The kernel read the image synchronously inside the call; the buffer
+        // is no longer needed either way.
+        let _ = syscall::munmap(buf_va);
+        if r == u64::MAX {
+            // Pre-teardown failure (bad ELF / OOM): the caller still has its
+            // old image, so report ENOEXEC and let it carry on.
+            async_free_slot(slot);
+            EXEC_PENDING_NAME_LEN[slot] = 0;
+            let _ = syscall::personality_reply(caller, linux_err(ENOEXEC));
+            return;
+        }
+        // Success: kernel woke the target with its new image.  Post-exec
+        // bookkeeping under proc_lock, then retire the slot — NO reply.
+        let nl = EXEC_PENDING_NAME_LEN[slot] as usize;
+        let name = EXEC_PENDING_NAME[slot];
+        {
+            let _g = proc_lock(pi);
+            apply_exec_success(pi, &name[..nl]);
+        }
+        async_free_slot(slot);
+        EXEC_PENDING_NAME_LEN[slot] = 0;
+    }
 }
 
 /// Resolve a path from caller's address space. If relative, prepend CWD.
@@ -10965,6 +11320,7 @@ fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va:
                 extra_handle: 0,
                 cache_slot: 0xFF,
                 in_flight_chunk: 0,
+                aux_port: 0,
             };
         }
         let rp = unsafe { BACKEND_REPLY_PORT };
@@ -11558,6 +11914,7 @@ fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64)
                 extra_handle: 0,
                 cache_slot: 0xFF,
                 in_flight_chunk: 0,
+                aux_port: 0,
             };
             let uds_port = PROC_TABLE[pi].fds[fd].fs_port;
             let handle   = PROC_TABLE[pi].fds[fd].handle;
@@ -11766,6 +12123,9 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
             match kind {
                 PendingAsyncKind::OpenVfs => {
                     finish_open_vfs(slot, fs_port, handle, file_size);
+                }
+                PendingAsyncKind::ExecOpen => {
+                    finish_exec_open(slot, fs_port, handle, file_size);
                 }
                 _ => async_free_slot(slot),
             }
@@ -12185,6 +12545,7 @@ extern "C" fn reply_thread_entry(_arg: u64) -> ! {
         match kind {
             PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
             PendingAsyncKind::IrfsReadMmap => finish_irfs_read_mmap(slot, bytes_read),
+            PendingAsyncKind::ExecRead => finish_exec_read(slot, bytes_read),
             _ => {
                 let scratch = unsafe { PENDING_ASYNC[slot].scratch_slot };
                 async_free_slot(slot);
