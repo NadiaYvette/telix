@@ -701,6 +701,7 @@ pub fn personality_execve(
         name,
         argv_va as usize,
         envp_va as usize,
+        None, // initramfs lookup (existing fast path)
     );
     if result != 0 {
         return u64::MAX;
@@ -718,6 +719,65 @@ pub fn personality_execve(
         .store(0, core::sync::atomic::Ordering::Release);
     crate::sched::wake_thread(target_tid);
 
+    0
+}
+
+/// #268-B: exec a target task from an ELF image supplied by the personality
+/// server, rather than looked up in the kernel initramfs.  This is the
+/// native-Telix half of "exec from a disk-backed root": linux_srv reads the
+/// ELF off the (ext/btrfs) root via the async VFS path into its own buffer,
+/// then invokes this to install it.  Mirrors `personality_execve` but passes
+/// the image bytes through to `exec_for_task` instead of a name to look up.
+///
+/// `image_va`/`image_len` describe the ELF bytes in the PERSONALITY SERVER's
+/// address space.  We run on its thread (its aspace is the current CR3), so
+/// the slice is directly readable and stays valid through `load_elf` — the
+/// only aspace torn down by exec is the *client's*, not the server's.
+pub fn personality_exec_image(
+    target_port: u64,
+    image_va: u64,
+    image_len: u64,
+    argv_va: u64,
+    envp_va: u64,
+) -> u64 {
+    let _caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    // Bound the image to a sane size and read it from the server's aspace.
+    const MAX_EXEC_IMAGE: usize = 64 * 1024 * 1024;
+    let len = image_len as usize;
+    if image_va == 0 || len == 0 || len > MAX_EXEC_IMAGE {
+        return u64::MAX;
+    }
+    let image = unsafe { core::slice::from_raw_parts(image_va as *const u8, len) };
+
+    // Empty name: the image supplies the binary, so no initramfs lookup.
+    let result = crate::syscall::handlers::exec_for_task(
+        target_task_id,
+        target_tid,
+        &[],
+        argv_va as usize,
+        envp_va as usize,
+        Some(image),
+    );
+    if result != 0 {
+        return u64::MAX;
+    }
+
+    crate::sched::scheduler::thread_ref(target_tid)
+        .personality_result
+        .store(0, core::sync::atomic::Ordering::Release);
+    crate::sched::wake_thread(target_tid);
     0
 }
 

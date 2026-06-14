@@ -142,6 +142,10 @@ pub const SYS_PERSONALITY_READ_FRAME: u64 = 0xF012;
 pub const SYS_PERSONALITY_WRITE_FRAME: u64 = 0xF013;
 pub const SYS_PERSONALITY_MAP_SHARED: u64 = 0xF014;
 pub const SYS_PERSONALITY_PEEK_SIGNALS: u64 = 0xF015;
+/// #268-B: exec a task from a personality-supplied ELF image (disk-backed
+/// root) rather than an initramfs lookup.  Args: target_port, image_va,
+/// image_len, argv_va, envp_va (image_va/len in the personality server aspace).
+pub const SYS_PERSONALITY_EXEC_IMAGE: u64 = 0xF016;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 pub const SYS_PORT_ALIVE: u64 = 110;
 pub const SYS_IRQ_ATTACH: u64 = 111;
@@ -614,6 +618,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_EXECVE => {
             crate::syscall::personality::personality_execve(a0, a1, a2, a3, a4)
+        }
+        SYS_PERSONALITY_EXEC_IMAGE => {
+            crate::syscall::personality::personality_exec_image(a0, a1, a2, a3, a4)
         }
         SYS_PERSONALITY_MMAP_ANON => {
             crate::syscall::personality::personality_mmap_anon(a0, a1, a2, a3)
@@ -3130,6 +3137,13 @@ pub(crate) fn exec_for_task(
     name: &[u8],
     argv_ptr: usize,
     envp_ptr: usize,
+    // #268-B: when Some, the ELF bytes are supplied by the personality
+    // server (read from a disk-backed root via the async VFS path) instead
+    // of looked up in the kernel initramfs cpio.  The slice points into the
+    // personality server's aspace, which is the current CR3 throughout this
+    // call (we run on its thread), so it stays readable through load_elf.
+    // None => the existing initramfs fast path (servers, Telix-native bins).
+    supplied_image: Option<&[u8]>,
 ) -> u64 {
     use crate::mm::page::{self, MMUPAGE_SIZE};
 
@@ -3144,10 +3158,14 @@ pub(crate) fn exec_for_task(
     // not in our CR3 — copy_from_user(client_pt_root, ...) is the only way
     // to read its argv/envp strings.
     let client_pt_root = task.page_table_root;
-    // Look up the ELF in initramfs.
-    let elf_data = match crate::io::initramfs::lookup_file(name) {
-        Some(d) => d,
-        None => return u64::MAX,
+    // ELF bytes: a personality-supplied image (#268-B, disk-backed root)
+    // takes precedence; otherwise look up in the kernel initramfs.
+    let elf_data = match supplied_image {
+        Some(img) => img,
+        None => match crate::io::initramfs::lookup_file(name) {
+            Some(d) => d,
+            None => return u64::MAX,
+        },
     };
 
     // Validate ELF header.

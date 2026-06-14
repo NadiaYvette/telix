@@ -86,6 +86,7 @@ const SYS_PERSONALITY_COPY_OUT: u64 = 0xF006;
 const SYS_PERSONALITY_FORK: u64 = 0xF007;
 const SYS_PERSONALITY_WAIT4: u64 = 0xF008;
 const SYS_PERSONALITY_EXECVE: u64 = 0xF009;
+const SYS_PERSONALITY_EXEC_IMAGE: u64 = 0xF016;
 const SYS_PERSONALITY_MMAP_ANON: u64 = 0xF00A;
 const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
 const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
@@ -194,6 +195,29 @@ pub fn personality_execve(
             target_port,
             name.as_ptr() as u64,
             name.len() as u64,
+            argv_va,
+            envp_va,
+        )
+    }
+}
+
+/// #268-B: exec a target task from an ELF image already in THIS (personality
+/// server) address space, instead of an initramfs name lookup.  Used by the
+/// Linux personality to exec a binary read off a disk-backed root via the
+/// async VFS path.  image_va/image_len point at the ELF bytes in our aspace.
+pub fn personality_exec_image(
+    target_port: u64,
+    image_va: u64,
+    image_len: u64,
+    argv_va: u64,
+    envp_va: u64,
+) -> u64 {
+    unsafe {
+        arch::syscall5(
+            SYS_PERSONALITY_EXEC_IMAGE,
+            target_port,
+            image_va,
+            image_len,
             argv_va,
             envp_va,
         )
