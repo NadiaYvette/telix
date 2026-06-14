@@ -22669,6 +22669,101 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 268: exec-from-disk (#268-B) ---
+    //
+    // Same shape as Phase 171, but execve()s a path that lives ONLY on the
+    // disk-backed root ("/diskhello"), NOT in the kernel initramfs.  This is
+    // the first exerciser of linux_srv's exec-from-disk fall-through: the
+    // initramfs lookup misses, so handle_execve drives VFS_OPEN_ASYNC →
+    // FS_READ_ASYNC → personality_exec_image instead of returning ENOENT.
+    //
+    // /diskhello is a copy of the static-PIE glibc_hello (no PT_INTERP, so the
+    // kernel needs nothing from initramfs to run it) placed on the ext2 root
+    // at 17 MiB via `debugfs write`.  glibc_hello returns argc, so the 2-arg
+    // argv below yields exit code 2 on success.  When /diskhello is absent
+    // (no disk, or a disk without the file) execve fails ENOENT and the child
+    // exits 99 → SKIPPED, keeping this phase harmless on ordinary boots.
+    syscall::debug_puts(b"  init: Phase 268 exec-from-disk...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        let ext_ok = syscall::ns_lookup(b"ext").is_some();
+        if linux_ok && ext_ok {
+            syscall::debug_puts(b"  [268] forking child\n");
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    syscall::debug_puts(b"  [268 child] personality set, execve /diskhello...\n");
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/diskhello\0";
+                        static A0: &[u8] = b"diskhello\0";
+                        static A1: &[u8] = b"x\0";
+                        let argv: [u64; 3] = [
+                            A0.as_ptr() as u64,
+                            A1.as_ptr() as u64,
+                            0,
+                        ];
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        // execve only returns on failure (e.g. /diskhello not
+                        // present on the disk root) → distinctive exit 99.
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(99);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 2 {
+                    syscall::debug_puts(b"Phase 268 exec-from-disk: PASSED\n");
+                } else if exit_code == 99 {
+                    syscall::debug_puts(b"Phase 268 exec-from-disk: SKIPPED (/diskhello not on disk root)\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 268 exec-from-disk: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 268 exec-from-disk: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 268 exec-from-disk: SKIPPED (no linux/ext)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
