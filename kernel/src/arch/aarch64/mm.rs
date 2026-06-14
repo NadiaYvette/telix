@@ -345,8 +345,14 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
     let parent_l1 = Aarch64Pte::table_pa(parent_l0_0) as *mut u64;
     let child_l1 = Aarch64Pte::table_pa(child_l0_0) as *mut u64;
 
-    // L1[0-1] are kernel/device blocks. Share L1[2+] (user entries).
-    for i in 2..512 {
+    // Slot map (see setup_tables): L1[0]=device block, L1[1..2]=RAM-identity
+    // L2s, L1[3]=globally-shared SLAB_THREAD L2.  All of L1[0..=3] are
+    // kernel/shared and the child already has them from
+    // create_user_page_table(); COW-sharing them here would treat kernel
+    // RAM as COW (L1[1..2]) or hand the globally-shared Thread L2 to the
+    // fork group's refcount (L1[3]) — the #261 bug via the fork path.
+    // Share only true-user slots L1[4..].
+    for i in 4..512 {
         let entry = unsafe { *parent_l1.add(i) };
         if Aarch64Pte::is_valid(entry) && Aarch64Pte::is_table(entry) {
             let sub_pa = Aarch64Pte::table_pa(entry);
@@ -845,11 +851,28 @@ pub fn free_page_table_tree(root: usize, fg: *mut crate::mm::ptshare::ForkGroup)
 
     let l0 = root as *const u64;
     unsafe {
-        // L0[0] → per-process L1 table. Free with shared-aware logic.
-        // Kernel/device blocks at L1[0-1] are skipped (is_table = false).
+        // L0[0] → per-process L1 table.  Slot map (see setup_tables):
+        //   L1[0]    device 1 GiB block (not a table — skipped naturally)
+        //   L1[1..2] per-process RAM-identity L2 tables (2 MiB blocks;
+        //            the L2 table pages are per-process, freeing them is
+        //            correct and the block leaves are never freed)
+        //   L1[3]    GLOBALLY-SHARED SLAB_THREAD_REGION L2
+        //            (SHARED_SLAB_THREAD_L2_PA) — installed identically in
+        //            every aspace by setup_tables(); MUST NOT be freed.
+        //   L1[4..]  user mappings (processes load at VA 0x1_0000_0000+)
+        //
+        // #261: freeing L1[3]'s subtree on aspace teardown returns the
+        // shared L2 + its L3 leaf tables to the allocator; the next
+        // allocation reuses them, unmapping every live Thread's
+        // 0xC000_0000+ VA window, after which the scheduler takes EL1
+        // translation-level-3 Data Aborts dereferencing Thread structs.
+        // Detach the slot before the recursive free so the shared L2 is
+        // never descended into or freed (twin of x86 PML4[507..] fix).
         let entry0 = *l0.add(0);
         if entry0 & PT_VALID != 0 && entry0 & PT_TABLE != 0 {
             let l1 = (entry0 & PA_MASK) as usize;
+            let l1p = l1 as *mut u64;
+            *l1p.add(3) = 0;
             free_shared_user_subtree(l1, 1, fg);
             crate::mm::phys::free_page(PhysAddr::new(l1));
         }
