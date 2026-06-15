@@ -8021,8 +8021,19 @@ pub fn wake_thread(tid: ThreadId) {
             // produced on this CPU.  percpu_enqueue's in_queue swap is
             // the double-enqueue guard if a concurrent path also
             // enqueues.
+            // NEW_INV: on_cpu must be ON_CPU_PENDING before state=Ready.  Every
+            // other wake/Ready-transition site does this store; wake_thread was
+            // the lone gap.  Without it the woken thread keeps the stale CPU it
+            // last ran on before blocking, so the #173 claim helper's pop+CAS
+            // (PENDING->cpu) on the next pick FAILS (on_cpu != PENDING) and the
+            // helper DROPS it off the heap -> orphan (Ready, on_cpu=realcpu, not
+            // enqueued), which the rescue then bounces cpu-to-cpu: the #198
+            // tid=17 (compositor_srv) starvation.  Benign under the legacy pick
+            // (dequeue_set_pending overwrote on_cpu=PENDING after the pop), but
+            // an orphan source under the claim helper (gate=ON default on x86_64).
+            tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
-            record_trans(tid as u32, 14, ThreadState::Ready, tref.on_cpu.load(Ordering::Relaxed));
+            record_trans(tid as u32, 14, ThreadState::Ready, ON_CPU_PENDING);
             tref.prio.store(tref.base_priority, Ordering::Release);
             unsafe { thread_mut_from_ref(tid) }.effective_priority =
                 tref.base_priority;
