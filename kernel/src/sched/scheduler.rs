@@ -10863,7 +10863,14 @@ pub fn park_faulting_from_ist(frame_sp: u64) -> u64 {
     // without the IPC-specific arbitration (no port, no PARK_ENQUEUED
     // CAS dance — this thread is being parked unconditionally on
     // PagerWait, and only async_pf_wake will re-enqueue it).
-    let next_id = percpu_pick_next(cpu, idle_id);
+    // #173: gated dispatch — this thread is going Blocked, so no self-pick
+    // concern.  Routes the pick through the atomic claim helper when the
+    // gate is on so this park tail can't leave a stranded PENDING.
+    let next_id = if DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed) {
+        percpu_pick_next_and_claim(cpu, idle_id, pcpu, 3 /* park */)
+    } else {
+        percpu_pick_next(cpu, idle_id)
+    };
 
     let prev_task = t.task_id;
     let next_task = thread_ref(next_id).task_id;
@@ -12705,7 +12712,15 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     let sa_enabled = task_ref(parked_task_id).sa_enabled;
 
     // Pick next thread from per-CPU queue.
-    let next_id = percpu_pick_next(cpu_idx, idle_id);
+    // #173: gated dispatch — parker is going Blocked (already sleep-queue
+    // inserted), so no self-pick concern.  Route through the atomic claim
+    // helper when the gate is on so the high-frequency sleep/timer park tail
+    // can't strand a PENDING (this was a residual stuck_gate_on source).
+    let next_id = if DISPATCH_USE_CLAIM_HELPER.load(Ordering::Relaxed) {
+        percpu_pick_next_and_claim(cpu_idx, idle_id, pcpu, 3 /* park */)
+    } else {
+        percpu_pick_next(cpu_idx, idle_id)
+    };
     let prev_task = thread_ref(tid as ThreadId).task_id;
     let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
