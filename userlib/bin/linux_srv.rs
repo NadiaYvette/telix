@@ -551,6 +551,21 @@ const NET_TCP_LISTEN_OK: u64 = 0x4701;
 const NET_TCP_ACCEPT: u64 = 0x4710;
 const NET_TCP_ACCEPT_OK: u64 = 0x4711;
 
+// pty_srv protocol (master_h = slot*2, slave_h = slot*2+1; N = handle/2).
+const PTY_OPEN: u64 = 0x9000;
+const PTY_OPEN_OK: u64 = 0x9001;
+const PTY_WRITE: u64 = 0x9010;
+const PTY_WRITE_OK: u64 = 0x9011;
+const PTY_READ: u64 = 0x9020;
+const PTY_READ_OK: u64 = 0x9021;
+const PTY_CLOSE: u64 = 0x9030;
+const PTY_IOCTL: u64 = 0x9040;
+const PTY_IOCTL_OK: u64 = 0x9041;
+const PTY_POLL: u64 = 0x9050;
+const PTY_POLL_OK: u64 = 0x9051;
+const PTY_EOF: u64 = 0x90FF;
+const PTY_MAX_PAIRS: usize = 8; // must match pty_srv MAX_PTYS
+
 // Epoll constants
 const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
@@ -586,6 +601,12 @@ enum FdKind {
     Evdev,   // /dev/input/event* — evdev input device (handle=0 kbd, 1 mouse)
     Inotify, // inotify instance — stub (no events, prevents ENOSYS crashes)
     SignalFd, // signalfd — stub (no events, prevents ENOSYS crashes)
+    /// PTY master end (/dev/ptmx open).  fs_port = pty_srv port, handle =
+    /// pty master handle (= slot*2).  N (pts number) = handle/2.
+    PtyMaster,
+    /// PTY slave end (/dev/pts/N open).  fs_port = pty_srv port, handle =
+    /// pty slave handle (= slot*2+1).  N = handle/2.
+    PtySlave,
     /// Initramfs-backed file: fs_port = initramfs_srv port, handle = cpio
     /// file index.  Reads use IO_READ (initramfs protocol), not FS_READ.
     /// Used as a fast path for /lib64/* and other paths whose content
@@ -809,6 +830,179 @@ fn get_net_port() -> u64 {
             NET_PORT = syscall::ns_lookup(b"net").unwrap_or(0);
         }
         NET_PORT
+    }
+}
+
+static mut PTY_PORT: u64 = 0;
+
+/// Lazily resolve pty_srv's service port (registered as "pty").
+fn get_pty_port() -> u64 {
+    unsafe {
+        if PTY_PORT == 0 {
+            PTY_PORT = syscall::ns_lookup(b"pty").unwrap_or(0);
+        }
+        PTY_PORT
+    }
+}
+
+/// Forward a write to pty_srv (master or slave end, selected by handle&1).
+/// pty_srv accepts ≤16 bytes per PTY_WRITE, so loop until all `count` bytes
+/// are sent (or the server stops accepting).  Returns bytes written.
+fn pty_write(caller_port: u64, pty_port: u64, handle: u64, buf_va: usize, count: usize) -> u64 {
+    let mut total = 0usize;
+    while total < count {
+        let chunk = (count - total).min(16);
+        let mut tmp = [0u8; 16];
+        let copied = syscall::personality_copy_in(caller_port, buf_va + total, &mut tmp[..chunk]);
+        if copied == 0 { break; }
+        // PTY_WRITE wire: d0=handle, d1=first 8 bytes, d2=len, d3=next 8 bytes.
+        let mut w0 = 0u64;
+        let mut w1 = 0u64;
+        for i in 0..copied.min(8) { w0 |= (tmp[i] as u64) << (i * 8); }
+        for i in 8..copied.min(16) { w1 |= (tmp[i] as u64) << ((i - 8) * 8); }
+        match syscall::call(pty_port, PTY_WRITE, handle, w0, copied as u64, w1) {
+            Some(m) if m.tag == PTY_WRITE_OK => {
+                let n = m.data[0] as usize;
+                total += n;
+                if n < copied { break; } // server buffer full — short write
+            }
+            _ => {
+                if total > 0 { break; }
+                return linux_err(EIO);
+            }
+        }
+    }
+    total as u64
+}
+
+/// Forward a read to pty_srv.  pty_srv returns ≤16 bytes per PTY_READ and
+/// blocks (deferred reply) when empty; for O_NONBLOCK we PTY_POLL first and
+/// return EAGAIN rather than blocking the worker.  Returns bytes read, 0 on
+/// EOF, or a linux_err.
+fn pty_read(caller_port: u64, pty_port: u64, handle: u64, buf_va: usize, count: usize, nonblock: bool) -> u64 {
+    if nonblock {
+        // PTY_POLL wire: d0=handle, d2=events; reply data[0]=revents.
+        let pr = syscall::call(pty_port, PTY_POLL, handle, 0, 0x0001 /*POLLIN*/, 0);
+        let readable = matches!(pr, Some(m) if m.tag == PTY_POLL_OK && (m.data[0] & 0x0001) != 0);
+        if !readable {
+            return linux_err(EAGAIN);
+        }
+    }
+    match syscall::call(pty_port, PTY_READ, handle, 0, 0, 0) {
+        Some(m) if m.tag == PTY_READ_OK => {
+            let n = (m.data[2] as usize).min(count).min(16);
+            let mut tmp = [0u8; 16];
+            let w0 = m.data[0].to_le_bytes();
+            let w1 = m.data[1].to_le_bytes();
+            for i in 0..n.min(8) { tmp[i] = w0[i]; }
+            for i in 8..n { tmp[i] = w1[i - 8]; }
+            syscall::personality_copy_out(caller_port, buf_va, &tmp[..n]) as u64
+        }
+        Some(m) if m.tag == PTY_EOF => 0,
+        _ => linux_err(EIO),
+    }
+}
+
+/// Handle a pty fd ioctl.  Returns Some(result) when handled here (locally or
+/// forwarded to pty_srv PTY_IOCTL), or None to fall through to the generic
+/// ioctl handler (FIONBIO/FIONREAD etc.).  `handle` is the pty handle, so
+/// N (pts number) = handle/2.
+fn handle_pty_ioctl(caller_port: u64, pty_port: u64, handle: u64, request: u64, arg_va: usize) -> Option<u64> {
+    const TIOCGPTN: u64 = 0x5430;
+    const TIOCSPTLCK: u64 = 0x5431;
+    const TIOCGPTLCK: u64 = 0x5439;
+    const TIOCSCTTY: u64 = 0x540E;
+    const TIOCNOTTY: u64 = 0x5422;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TIOCGPGRP: u64 = 0x540F;
+    const TIOCSPGRP: u64 = 0x5410;
+    let n = handle / 2;
+    match request {
+        // ptsname(3): return the pts number N.
+        TIOCGPTN => {
+            if arg_va != 0 {
+                syscall::personality_copy_out(caller_port, arg_va, &(n as u32).to_le_bytes());
+            }
+            Some(0)
+        }
+        // unlockpt(3) / lock query — Telix never locks slaves; report unlocked.
+        TIOCSPTLCK | TIOCGPTLCK => {
+            if request == TIOCGPTLCK && arg_va != 0 {
+                syscall::personality_copy_out(caller_port, arg_va, &0i32.to_le_bytes());
+            }
+            Some(0)
+        }
+        // Controlling-terminal: stub success (full job control is follow-on).
+        TIOCSCTTY | TIOCNOTTY => Some(0),
+        TIOCGWINSZ => match syscall::call(pty_port, PTY_IOCTL, handle | (TIOCGWINSZ << 32), 0, 0, 0) {
+            Some(m) if m.tag == PTY_IOCTL_OK => {
+                let row = (m.data[0] & 0xFFFF) as u16;
+                let col = ((m.data[0] >> 16) & 0xFFFF) as u16;
+                let mut ws = [0u8; 8];
+                ws[0..2].copy_from_slice(&row.to_le_bytes());
+                ws[2..4].copy_from_slice(&col.to_le_bytes());
+                if arg_va != 0 { syscall::personality_copy_out(caller_port, arg_va, &ws); }
+                Some(0)
+            }
+            _ => Some(linux_err(EINVAL)),
+        },
+        TIOCSWINSZ => {
+            let mut ws = [0u8; 8];
+            if arg_va != 0 { syscall::personality_copy_in(caller_port, arg_va, &mut ws); }
+            let row = u16::from_le_bytes([ws[0], ws[1]]) as u64;
+            let col = u16::from_le_bytes([ws[2], ws[3]]) as u64;
+            let _ = syscall::call(pty_port, PTY_IOCTL, handle | (TIOCSWINSZ << 32), row | (col << 16), 0, 0);
+            Some(0)
+        }
+        TCGETS => match syscall::call(pty_port, PTY_IOCTL, handle | (TCGETS << 32), 0, 0, 0) {
+            Some(m) if m.tag == PTY_IOCTL_OK => {
+                let lflag = (m.data[0] & 0xFFFF_FFFF) as u32;
+                let oflag = (m.data[0] >> 32) as u32;
+                let mut termios = [0u8; 60];
+                termios[0..4].copy_from_slice(&0x100u32.to_le_bytes()); // c_iflag = ICRNL
+                termios[4..8].copy_from_slice(&oflag.to_le_bytes());    // c_oflag
+                termios[8..12].copy_from_slice(&0xBFu32.to_le_bytes()); // c_cflag = CS8|CREAD|HUPCL
+                termios[12..16].copy_from_slice(&lflag.to_le_bytes());  // c_lflag
+                // c_cc[0..8] at offset 17 (after c_line at 16). pty_srv's compact
+                // cc[] aligns with Linux for VINTR/VERASE/VKILL; VEOF/VSUSP differ.
+                for i in 0..8 { termios[17 + i] = ((m.data[1] >> (i * 8)) & 0xFF) as u8; }
+                if arg_va != 0 { syscall::personality_copy_out(caller_port, arg_va, &termios); }
+                Some(0)
+            }
+            _ => Some(linux_err(EINVAL)),
+        },
+        TCSETS | TCSETSW | TCSETSF => {
+            let mut termios = [0u8; 60];
+            if arg_va != 0 { syscall::personality_copy_in(caller_port, arg_va, &mut termios); }
+            let oflag = u32::from_le_bytes([termios[4], termios[5], termios[6], termios[7]]) as u64;
+            let lflag = u32::from_le_bytes([termios[12], termios[13], termios[14], termios[15]]) as u64;
+            let mut cc = 0u64;
+            for i in 0..8 { cc |= (termios[17 + i] as u64) << (i * 8); }
+            let _ = syscall::call(pty_port, PTY_IOCTL, handle | (TCSETS << 32), lflag | (oflag << 32), 0, cc);
+            Some(0)
+        }
+        TIOCGPGRP => match syscall::call(pty_port, PTY_IOCTL, handle | (TIOCGPGRP << 32), 0, 0, 0) {
+            Some(m) if m.tag == PTY_IOCTL_OK => {
+                if arg_va != 0 {
+                    syscall::personality_copy_out(caller_port, arg_va, &(m.data[0] as u32).to_le_bytes());
+                }
+                Some(0)
+            }
+            _ => Some(linux_err(EINVAL)),
+        },
+        TIOCSPGRP => {
+            let mut b = [0u8; 4];
+            if arg_va != 0 { syscall::personality_copy_in(caller_port, arg_va, &mut b); }
+            let pgrp = u32::from_le_bytes(b) as u64;
+            let _ = syscall::call(pty_port, PTY_IOCTL, handle | (TIOCSPGRP << 32), pgrp, 0, 0);
+            Some(0)
+        }
+        _ => None, // fall through to generic ioctl
     }
 }
 
@@ -1767,6 +1961,18 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         return 0;
     }
 
+    // A pty end dup'd onto stdout/stderr (forkpty child) must reach pty_srv,
+    // not the debug console — check the fd table before the console shortcut.
+    if (fd == 1 || fd == 2) && (fd as usize) < MAX_FDS {
+        let (is_pty, port, handle) = unsafe {
+            let e = &PROC_TABLE[pi].fds[fd as usize];
+            (e.in_use && (e.kind == FdKind::PtyMaster || e.kind == FdKind::PtySlave), e.fs_port, e.handle)
+        };
+        if is_pty {
+            return pty_write(caller_port, port, handle, buf_va, count);
+        }
+    }
+
     if fd == 1 || fd == 2 {
         // stdout/stderr → debug console, copying from caller's address space.
         let mut total = 0usize;
@@ -1800,6 +2006,11 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let dom = PROC_TABLE[pi].fds[fd_idx].sock_domain;
             return write_socket(pi, caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
                                 PROC_TABLE[pi].fds[fd_idx].handle, dom, fd_idx, buf_va, count);
+        }
+        if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::PtyMaster
+            || PROC_TABLE[pi].fds[fd_idx].kind == FdKind::PtySlave {
+            return pty_write(caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
+                             PROC_TABLE[pi].fds[fd_idx].handle, buf_va, count);
         }
         if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::EventFd {
             if count < 8 { return linux_err(EINVAL); }
@@ -2037,6 +2248,11 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if kind == FdKind::Socket {
         let dom = unsafe { PROC_TABLE[pi].fds[fd].sock_domain };
         return read_socket(caller_port, fs_port, handle, dom, buf_va, count);
+    }
+
+    if kind == FdKind::PtyMaster || kind == FdKind::PtySlave {
+        let nonblock = unsafe { PROC_TABLE[pi].fds[fd].status_flags & (O_NONBLOCK as u32) != 0 };
+        return pty_read(caller_port, fs_port, handle, buf_va, count, nonblock);
     }
 
     if kind == FdKind::EventFd {
@@ -2978,6 +3194,21 @@ static mut FS_ASYNC_SCRATCH_GRANTED: bool = false;
 static FS_ASYNC_SCRATCH_BUSY: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 
+// #258 observability: the mmap fast path (try_irfs_read_mmap) returns Failed
+// and falls back to a SYNC irfs_read_bulk loop when no async scratch slot is
+// free (all FS_ASYNC_SCRATCH_SLOTS in flight) — among other reasons.  That
+// fallback was silent, so we couldn't tell whether raising the slot count
+// would actually help.  These counters make it measurable:
+//   FS_MMAP_SYNC_FALLBACK   — # of handle_mmap Failed->sync-fallback entries
+//   FS_ASYNC_SCRATCH_EXHAUST — # of alloc_async_scratch_slot()==None (the
+//                              slot-exhaustion reason specifically)
+// A one-shot debug marker fires on the first of each so it's grep-able even
+// without a periodic dump.
+static FS_MMAP_SYNC_FALLBACK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static FS_ASYNC_SCRATCH_EXHAUST: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Per-FS-task grant tracking for the shared async scratch region.
 /// Each successful grant_pages records the target aspace_id here so we
 /// don't re-grant.  Sized for 14 FS servers + initramfs + headroom.
@@ -3072,7 +3303,18 @@ fn alloc_async_scratch_slot() -> Option<u8> {
                 break;
             }
         }
-        let i = chosen?;
+        let i = match chosen {
+            Some(i) => i,
+            None => {
+                // #258 observability: all FS_ASYNC_SCRATCH_SLOTS in flight.
+                // This is the slot-exhaustion reason behind mmap sync fallbacks.
+                let n = FS_ASYNC_SCRATCH_EXHAUST.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    syscall::debug_puts(b"[lsrv] FS_ASYNC_SCRATCH_EXHAUST: all scratch slots busy\n");
+                }
+                return None;
+            }
+        };
         let bit = 1u8 << i;
         match FS_ASYNC_SCRATCH_BUSY.compare_exchange_weak(
             busy,
@@ -5550,6 +5792,77 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return fd as u64;
     }
 
+    // /dev/ptmx — allocate a NEW pty pair via pty_srv.  Each open yields a
+    // fresh master end (glibc posix_openpt/openpty/forkpty).  The matching
+    // slave is opened later as /dev/pts/N where N is from TIOCGPTN.
+    if &path[..pathlen] == b"/dev/ptmx" {
+        let pty_port = get_pty_port();
+        if pty_port == 0 {
+            return linux_err(ENODEV);
+        }
+        let resp = match syscall::call(pty_port, PTY_OPEN, 0, 0, 0, 0) {
+            Some(m) if m.tag == PTY_OPEN_OK => m,
+            _ => return linux_err(ENODEV),
+        };
+        // PTY_OPEN_OK: data[0] = master_h | (slave_h<<32), data[1] = slot (=N).
+        let master_h = resp.data[0] & 0xFFFF_FFFF;
+        let fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => return linux_err(EMFILE),
+        };
+        unsafe {
+            PROC_TABLE[pi].fds[fd] = FdEntry::empty();
+            PROC_TABLE[pi].fds[fd].in_use = true;
+            PROC_TABLE[pi].fds[fd].kind = FdKind::PtyMaster;
+            PROC_TABLE[pi].fds[fd].fs_port = pty_port;
+            PROC_TABLE[pi].fds[fd].handle = master_h;
+            if flags & 0x80000 != 0 { // O_CLOEXEC
+                PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+            }
+            if flags & O_NONBLOCK != 0 {
+                PROC_TABLE[pi].fds[fd].status_flags |= O_NONBLOCK as u32;
+            }
+        }
+        return fd as u64;
+    }
+
+    // /dev/pts/N — open the slave end of an existing pty pair.  glibc always
+    // opens /dev/ptmx first (so pair N exists), then ptsname()→/dev/pts/N.
+    if pathlen > 9 && &path[..9] == b"/dev/pts/" {
+        let mut n: u64 = 0;
+        let mut valid = true;
+        for i in 9..pathlen {
+            let c = path[i];
+            if !c.is_ascii_digit() { valid = false; break; }
+            n = n.wrapping_mul(10).wrapping_add((c - b'0') as u64);
+        }
+        if valid && (n as usize) < PTY_MAX_PAIRS {
+            let pty_port = get_pty_port();
+            if pty_port == 0 {
+                return linux_err(ENODEV);
+            }
+            let slave_h = n * 2 + 1;
+            let fd = match alloc_fd(pi) {
+                Some(f) => f,
+                None => return linux_err(EMFILE),
+            };
+            unsafe {
+                PROC_TABLE[pi].fds[fd] = FdEntry::empty();
+                PROC_TABLE[pi].fds[fd].in_use = true;
+                PROC_TABLE[pi].fds[fd].kind = FdKind::PtySlave;
+                PROC_TABLE[pi].fds[fd].fs_port = pty_port;
+                PROC_TABLE[pi].fds[fd].handle = slave_h;
+                if flags & 0x80000 != 0 { // O_CLOEXEC
+                    PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+                }
+                if flags & O_NONBLOCK != 0 {
+                    PROC_TABLE[pi].fds[fd].status_flags |= O_NONBLOCK as u32;
+                }
+            }
+            return fd as u64;
+        }
+    }
+
     // /dev/shm — tmpfs-backed shared memory (glibc shm_open uses this).
     // open("/dev/shm/name", O_RDWR|O_CREAT, ...) → MemFd-backed file.
     if pathlen > 9 && &path[..9] == b"/dev/shm/" {
@@ -6182,6 +6495,9 @@ fn do_close(pi: usize, fd: usize) {
                     let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
                 }
             }
+            FdKind::PtyMaster | FdKind::PtySlave => {
+                let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, PTY_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
+            }
             FdKind::Dir => {} // No server handle to close.
             FdKind::Epoll => {
                 let idx = PROC_TABLE[pi].fds[fd].handle as usize;
@@ -6355,16 +6671,28 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
     let pathlen = path.iter().position(|&b| b == 0).unwrap_or(copied);
 
     // Virtual device stat — return char device for /dev/*.
-    let dev_rdev: Option<u64> = match &path[..pathlen] {
-        b"/dev/null" => Some((1 << 8) | 3),
-        b"/dev/zero" => Some((1 << 8) | 5),
-        b"/dev/urandom" | b"/dev/random" => Some((1 << 8) | 9),
-        b"/dev/tty" | b"/dev/console" => Some((5 << 8) | 0),
-        b"/dev/dri/card0" => Some((226 << 8) | 0),
-        b"/dev/dri/renderD128" => Some((226 << 8) | 128),
-        b"/dev/input/event0" => Some((13 << 8) | 64),
-        b"/dev/input/event1" => Some((13 << 8) | 65),
-        _ => None,
+    let dev_rdev: Option<u64> = if pathlen > 9 && &path[..9] == b"/dev/pts/" {
+        // /dev/pts/N — UNIX98 pty slave, char major 136:N.
+        let mut n: u64 = 0;
+        let mut valid = true;
+        for i in 9..pathlen {
+            if !path[i].is_ascii_digit() { valid = false; break; }
+            n = n.wrapping_mul(10).wrapping_add((path[i] - b'0') as u64);
+        }
+        if valid { Some((136 << 8) | n) } else { None }
+    } else {
+        match &path[..pathlen] {
+            b"/dev/null" => Some((1 << 8) | 3),
+            b"/dev/zero" => Some((1 << 8) | 5),
+            b"/dev/urandom" | b"/dev/random" => Some((1 << 8) | 9),
+            b"/dev/tty" | b"/dev/console" => Some((5 << 8) | 0),
+            b"/dev/ptmx" => Some((5 << 8) | 2), // /dev/ptmx = 5:2
+            b"/dev/dri/card0" => Some((226 << 8) | 0),
+            b"/dev/dri/renderD128" => Some((226 << 8) | 128),
+            b"/dev/input/event0" => Some((13 << 8) | 64),
+            b"/dev/input/event1" => Some((13 << 8) | 65),
+            _ => None,
+        }
     };
     if let Some(rdev) = dev_rdev {
         let mut stat_buf = [0u8; 144];
@@ -6419,6 +6747,7 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         | b"/dev" | b"/dev/" | b"/dev/dri" | b"/dev/dri/"
         | b"/dev/input" | b"/dev/input/"
         | b"/dev/shm" | b"/dev/shm/"
+        | b"/dev/pts" | b"/dev/pts/"
         | b"/run" | b"/run/" | b"/run/user" | b"/run/user/"
         | b"/run/user/0" | b"/run/user/0/"
         | b"/tmp" | b"/tmp/"
@@ -6582,7 +6911,8 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         // Virtual device fstat — report as character device.
         let dk = PROC_TABLE[pi].fds[fd].kind;
         if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom
-            || dk == FdKind::DevTty || dk == FdKind::Drm || dk == FdKind::Evdev {
+            || dk == FdKind::DevTty || dk == FdKind::Drm || dk == FdKind::Evdev
+            || dk == FdKind::PtyMaster || dk == FdKind::PtySlave {
             let mut stat_buf = [0u8; 144];
             let mode: u32 = 0o020666; // S_IFCHR | 0666
             stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -6593,6 +6923,8 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 FdKind::DevTty => (5 << 8) | 0, // /dev/tty = 5:0
                 FdKind::Drm => (226 << 8) | 0, // /dev/dri/card0 = 226:0
                 FdKind::Evdev => (13 << 8) | (64 + PROC_TABLE[pi].fds[fd].handle), // 13:64+dev
+                FdKind::PtyMaster => (5 << 8) | 2, // /dev/ptmx = 5:2
+                FdKind::PtySlave => (136 << 8) | (PROC_TABLE[pi].fds[fd].handle / 2), // 136:N
                 _ => 0,
             };
             stat_buf[40..48].copy_from_slice(&rdev.to_le_bytes());
@@ -8230,6 +8562,19 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 return 0; // REPLY_DEFERRED suppresses reply
                             }
                             MmapFillResult::Failed => {
+                                // #258 observability: the async mmap fast path
+                                // declined; we fall through to the SYNC
+                                // irfs_read_bulk loop (slower, blocks this
+                                // thread).  Count it + one-shot marker so the
+                                // fallback rate (and whether raising
+                                // FS_ASYNC_SCRATCH_SLOTS would reduce it — cf.
+                                // FS_ASYNC_SCRATCH_EXHAUST) is measurable.
+                                let n = FS_MMAP_SYNC_FALLBACK
+                                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if n == 0 {
+                                    syscall::debug_puts(
+                                        b"[lsrv] FS_MMAP_SYNC_FALLBACK: mmap async fill declined -> sync read\n");
+                                }
                                 // fall through to sync irfs_read_bulk loop
                             }
                         }
@@ -10266,6 +10611,19 @@ fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         unsafe { if !PROC_TABLE[pi].fds[fd].in_use { return linux_err(EBADF); } }
     } else if fd >= MAX_FDS {
         return linux_err(EBADF);
+    }
+
+    // PTY fds: route terminal ioctls (TIOCGPTN/TIOCSPTLCK/TIOCSCTTY locally,
+    // termios/winsize/pgrp to pty_srv).  Falls through for FIONBIO/FIONREAD.
+    if fd < MAX_FDS {
+        let (k, pty_port, handle) = unsafe {
+            (PROC_TABLE[pi].fds[fd].kind, PROC_TABLE[pi].fds[fd].fs_port, PROC_TABLE[pi].fds[fd].handle)
+        };
+        if k == FdKind::PtyMaster || k == FdKind::PtySlave {
+            if let Some(r) = handle_pty_ioctl(caller_port, pty_port, handle, request, args[2] as usize) {
+                return r;
+            }
+        }
     }
 
     const TIOCGWINSZ: u64 = 0x5413;
@@ -13489,6 +13847,16 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
                 }
             }
             FdKind::ProcBuf => EPOLLIN, // readable synthetic file
+            FdKind::PtyMaster | FdKind::PtySlave => {
+                // pty_srv revents use POLLIN/POLLOUT/POLLHUP bits that match
+                // the EPOLL* low-bit values; query both readability+writability.
+                let resp = syscall::call(entry.fs_port, PTY_POLL, entry.handle, 0,
+                                         (EPOLLIN | EPOLLOUT) as u64, 0);
+                match resp {
+                    Some(m) if m.tag == PTY_POLL_OK => m.data[0] as u32,
+                    _ => EPOLLERR,
+                }
+            }
             _ => EPOLLERR,
         }
     }

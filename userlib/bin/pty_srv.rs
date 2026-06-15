@@ -202,52 +202,56 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
     (w0, w1)
 }
 
-fn reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
-    syscall::send(port, tag, d0, d1, d2, d3);
+/// Reply to the kernel reply-cap installed by the current recv_with_cap
+/// message (seL4-style call/reply, same model as pipe_srv).  A no-op if no
+/// cap is held (message arrived via send_nb).
+fn reply_now(tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
+    let _ = syscall::reply(tag, d0, d1, d2, d3, 0);
 }
 
-/// Try to deliver data to a blocked master reader.
+/// Try to deliver data to a blocked master reader.  `master_reader` holds a
+/// deferred reply-cap (from sys_reply_take), fulfilled here via reply_to.
 fn try_wake_master(slot: usize) {
     let p = unsafe { &mut PTYS[slot] };
     if p.master_reader == NO_READER {
         return;
     }
     if p.s2m.len() > 0 {
-        let rp = p.master_reader;
+        let cap = p.master_reader;
         let mut tmp = [0u8; 16];
         let n = p.s2m.pop(&mut tmp);
         let (w0, w1) = pack_bytes(&tmp, n);
         p.master_reader = NO_READER;
-        reply(rp, PTY_READ_OK, w0, w1, n as u64, 0);
+        let _ = syscall::reply_to(cap, PTY_READ_OK, w0, w1, n as u64, 0);
     } else if p.slave_closed {
-        let rp = p.master_reader;
+        let cap = p.master_reader;
         p.master_reader = NO_READER;
-        reply(rp, PTY_EOF, 0, 0, 0, 0);
+        let _ = syscall::reply_to(cap, PTY_EOF, 0, 0, 0, 0);
     }
 }
 
-/// Try to deliver data to a blocked slave reader.
+/// Try to deliver data to a blocked slave reader (deferred reply-cap).
 fn try_wake_slave(slot: usize) {
     let p = unsafe { &mut PTYS[slot] };
     if p.slave_reader == NO_READER {
         return;
     }
     if p.m2s.len() > 0 {
-        let rp = p.slave_reader;
+        let cap = p.slave_reader;
         let mut tmp = [0u8; 16];
         let n = p.m2s.pop(&mut tmp);
         let (w0, w1) = pack_bytes(&tmp, n);
         p.slave_reader = NO_READER;
-        reply(rp, PTY_READ_OK, w0, w1, n as u64, 0);
+        let _ = syscall::reply_to(cap, PTY_READ_OK, w0, w1, n as u64, 0);
     } else if p.slave_eof {
-        let rp = p.slave_reader;
+        let cap = p.slave_reader;
         p.slave_reader = NO_READER;
         p.slave_eof = false;
-        reply(rp, PTY_EOF, 0, 0, 0, 0);
+        let _ = syscall::reply_to(cap, PTY_EOF, 0, 0, 0, 0);
     } else if p.master_closed {
-        let rp = p.slave_reader;
+        let cap = p.slave_reader;
         p.slave_reader = NO_READER;
-        reply(rp, PTY_EOF, 0, 0, 0, 0);
+        let _ = syscall::reply_to(cap, PTY_EOF, 0, 0, 0, 0);
     }
 }
 
@@ -404,13 +408,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::ns_register(b"pty", svc_port);
 
     loop {
-        let msg = match syscall::recv_msg(svc_port) {
+        let msg = match syscall::recv_with_cap(svc_port) {
             Some(m) => m,
             None => continue,
         };
 
         let tag = msg.tag;
-        let reply_port = msg.data[2] >> 32;
 
         match tag {
             PTY_OPEN => {
@@ -427,12 +430,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if slot == usize::MAX {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                 } else {
                     let master_h = (slot * 2) as u32;
                     let slave_h = (slot * 2 + 1) as u32;
                     let d0 = (master_h as u64) | ((slave_h as u64) << 32);
-                    reply(reply_port, PTY_OPEN_OK, d0, slot as u64, 0, 0);
+                    reply_now(PTY_OPEN_OK, d0, slot as u64, 0, 0);
                 }
             }
 
@@ -445,16 +448,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot = (handle / 2) as usize;
 
                 if slot >= MAX_PTYS {
-                    if reply_port != NO_READER {
-                        reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
-                    }
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let active = unsafe { PTYS[slot].active };
                 if !active {
-                    if reply_port != NO_READER {
-                        reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
-                    }
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -492,9 +491,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     notify_poll_master(slot);
                 }
 
-                if reply_port != NO_READER {
-                    reply(reply_port, PTY_WRITE_OK, len as u64, 0, 0, 0);
-                }
+                reply_now(PTY_WRITE_OK, len as u64, 0, 0, 0);
             }
 
             PTY_READ => {
@@ -503,13 +500,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot = (handle / 2) as usize;
 
                 if slot >= MAX_PTYS {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
                 let p = unsafe { &mut PTYS[slot] };
                 if !p.active {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -519,15 +516,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         let mut tmp = [0u8; 16];
                         let n = p.m2s.pop(&mut tmp);
                         let (w0, w1) = pack_bytes(&tmp, n);
-                        reply(reply_port, PTY_READ_OK, w0, w1, n as u64, 0);
+                        reply_now(PTY_READ_OK, w0, w1, n as u64, 0);
                     } else if p.slave_eof {
                         p.slave_eof = false;
-                        reply(reply_port, PTY_EOF, 0, 0, 0, 0);
+                        reply_now(PTY_EOF, 0, 0, 0, 0);
                     } else if p.master_closed {
-                        reply(reply_port, PTY_EOF, 0, 0, 0, 0);
+                        reply_now(PTY_EOF, 0, 0, 0, 0);
                     } else {
-                        // Block.
-                        p.slave_reader = reply_port;
+                        // Block: stash the reply-cap; fulfilled by try_wake_slave.
+                        p.slave_reader = syscall::reply_take();
                     }
                 } else {
                     // Master reads from s2m.
@@ -535,12 +532,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         let mut tmp = [0u8; 16];
                         let n = p.s2m.pop(&mut tmp);
                         let (w0, w1) = pack_bytes(&tmp, n);
-                        reply(reply_port, PTY_READ_OK, w0, w1, n as u64, 0);
+                        reply_now(PTY_READ_OK, w0, w1, n as u64, 0);
                     } else if p.slave_closed {
-                        reply(reply_port, PTY_EOF, 0, 0, 0, 0);
+                        reply_now(PTY_EOF, 0, 0, 0, 0);
                     } else {
-                        // Block.
-                        p.master_reader = reply_port;
+                        // Block: stash the reply-cap; fulfilled by try_wake_master.
+                        p.master_reader = syscall::reply_take();
                     }
                 }
             }
@@ -551,13 +548,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot = (handle / 2) as usize;
 
                 if slot >= MAX_PTYS {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
                 let p = unsafe { &mut PTYS[slot] };
                 if !p.active {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -575,7 +572,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     p.active = false;
                 }
 
-                reply(reply_port, PTY_CLOSE_OK, 0, 0, 0, 0);
+                reply_now(PTY_CLOSE_OK, 0, 0, 0, 0);
             }
 
             PTY_IOCTL => {
@@ -584,24 +581,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot = (handle / 2) as usize;
 
                 if slot >= MAX_PTYS {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let p = unsafe { &mut PTYS[slot] };
                 if !p.active {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
                 match request {
                     TIOCGWINSZ => {
                         let d0 = (p.ws_row as u64) | ((p.ws_col as u64) << 16);
-                        reply(reply_port, PTY_IOCTL_OK, d0, 0, 0, 0);
+                        reply_now(PTY_IOCTL_OK, d0, 0, 0, 0);
                     }
                     TIOCSWINSZ => {
                         p.ws_row = (msg.data[1] & 0xFFFF) as u16;
                         p.ws_col = ((msg.data[1] >> 16) & 0xFFFF) as u16;
-                        reply(reply_port, PTY_IOCTL_OK, 0, 0, 0, 0);
+                        reply_now(PTY_IOCTL_OK, 0, 0, 0, 0);
                     }
                     TCGETS => {
                         // Pack lflag and oflag into d0, cc into d1.
@@ -610,7 +607,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         for i in 0..8 {
                             d1 |= (p.cc[i] as u64) << (i * 8);
                         }
-                        reply(reply_port, PTY_IOCTL_OK, d0, d1, 0, 0);
+                        reply_now(PTY_IOCTL_OK, d0, d1, 0, 0);
                     }
                     TCSETS => {
                         // Unpack lflag, oflag from arg0, cc from arg1.
@@ -620,17 +617,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         for i in 0..8 {
                             p.cc[i] = ((cc_val >> (i * 8)) & 0xFF) as u8;
                         }
-                        reply(reply_port, PTY_IOCTL_OK, 0, 0, 0, 0);
+                        reply_now(PTY_IOCTL_OK, 0, 0, 0, 0);
                     }
                     TIOCGPGRP => {
-                        reply(reply_port, PTY_IOCTL_OK, p.fg_pgrp as u64, 0, 0, 0);
+                        reply_now(PTY_IOCTL_OK, p.fg_pgrp as u64, 0, 0, 0);
                     }
                     TIOCSPGRP => {
                         p.fg_pgrp = msg.data[1];
-                        reply(reply_port, PTY_IOCTL_OK, 0, 0, 0, 0);
+                        reply_now(PTY_IOCTL_OK, 0, 0, 0, 0);
                     }
                     _ => {
-                        reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                        reply_now(PTY_ERROR, 0, 0, 0, 0);
                     }
                 }
             }
@@ -642,12 +639,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot = (handle / 2) as usize;
 
                 if slot >= MAX_PTYS {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let p = unsafe { &PTYS[slot] };
                 if !p.active {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
+                    reply_now(PTY_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -673,7 +670,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         revents |= 0x0004; // POLLOUT
                     }
                 }
-                reply(reply_port, PTY_POLL_OK, revents as u64, 0, 0, 0);
+                reply_now(PTY_POLL_OK, revents as u64, 0, 0, 0);
             }
 
             POLL_SUBSCRIBE => {
@@ -693,9 +690,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 // Consume reply cap (harmless no-op for fire-and-forget).
-                if reply_port != 0 && reply_port != NO_READER {
-                    reply(reply_port, PTY_POLL_OK, 0, 0, 0, 0);
-                }
+                reply_now(PTY_POLL_OK, 0, 0, 0, 0);
                 // Send immediate notification if already ready.
                 if slot < MAX_PTYS {
                     if is_slave {
@@ -719,15 +714,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         p.poll_notify_master = u64::MAX;
                     }
                 }
-                if reply_port != 0 && reply_port != NO_READER {
-                    reply(reply_port, PTY_POLL_OK, 0, 0, 0, 0);
-                }
+                reply_now(PTY_POLL_OK, 0, 0, 0, 0);
             }
 
             _ => {
-                if reply_port != 0 && reply_port != NO_READER {
-                    reply(reply_port, PTY_ERROR, 0, 0, 0, 0);
-                }
+                reply_now(PTY_ERROR, 0, 0, 0, 0);
             }
         }
     }
