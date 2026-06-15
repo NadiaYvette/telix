@@ -88,7 +88,15 @@ pub fn handle_page_fault(
     // (or kswapd, once PFF grow/shrink is wired up) to compute the
     // aspace's fault rate and react.
     aspace::bump_pf_count(aspace_id);
-    aspace::with_aspace(aspace_id, |aspace| {
+    // Use the graceful with_aspace_mut (returns None if the aspace is gone)
+    // rather than with_aspace (panics).  A page fault can race the teardown
+    // of its own aspace — the faulting thread is being killed while a fault
+    // for it is still in flight — and host descheduling (multi-second vCPU
+    // stalls) widens that window.  "aspace gone" means the thread is already
+    // dying, so fail the fault (the caller then kills the thread) instead of
+    // panicking the whole kernel.  Same lifecycle-race family as the earlier
+    // grant.rs / elf.rs with_aspace_mut + AspaceGone fixes.
+    aspace::with_aspace_mut(aspace_id, |aspace| {
         let pt_root = aspace.page_table_root;
         let fork_group = aspace.fork_group;
 
@@ -294,6 +302,9 @@ pub fn handle_page_fault(
         stats::PTES_INSTALLED.fetch_add(1, Ordering::Relaxed);
         FaultResult::HandledMajor
     })
+    // Aspace was torn down concurrently with this in-flight fault → fail it
+    // gracefully (caller kills the already-dying thread) rather than panic.
+    .unwrap_or(FaultResult::Failed)
 }
 
 /// Public version of pte_flags_for_vma (for WSCLOCK demotion).
