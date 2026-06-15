@@ -4642,6 +4642,12 @@ fn finalize_spawn(
             thread_id, task_id, priority, quantum,
         );
     }
+    // #208 5f hunt: arm the exception-entry GDT/IDT/CR3 descriptor
+    // validator from the first userspace spawn (scheduler up), so it covers
+    // ALL Phase-5 death points — the silent triple's location varies boot
+    // to boot (some die in FS-server init before tid 34/pipe_srv spawns).
+    #[cfg(all(target_arch = "x86_64", feature = "vm_debug_probes"))]
+    crate::arch::x86_64::gdt::DESC_VALIDATE_ARMED.store(true, Ordering::Release);
     // #233 DR0 watchpoint on tid 34 (linux_srv main thread)'s iretq frame
     // CS slot.  This is the slot[1] location that's been showing garbage
     // across boots.  Address is kstack_top - 32 (CS slot = regs[18] at

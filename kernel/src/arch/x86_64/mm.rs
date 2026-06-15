@@ -379,7 +379,16 @@ pub fn free_shared_user_subtree(table_pa: usize, level: usize, fg: *mut crate::m
 ///
 /// On x86-64:
 /// - PML4[0] → PDPT: entries 0-3 are kernel gigapages (skip), 4+ are user (share).
-/// - PML4[1..512]: share entire entries (all user).
+/// - PML4[1..507]: share entire entries (all user).
+/// - PML4[507..=511] are the kernel-half VA-isolation regions (PHYS_DIRECT_MAP
+///   / KSTACK_REGION / SLAB_REGION / PT_REGION / kernel high-half).  They are
+///   shallow-shared across every CR3 by `create_user_page_table` and must NEVER
+///   be turned into COW markers: doing so makes the direct map, kernel stacks,
+///   and kernel code non-present in the forked aspaces, so the first kernel
+///   fault taken while on such a CR3 can't even fetch its handler → silent
+///   triple fault (caught by the USER-CR3-BAD probe: PML4[507] exp=…023
+///   got=…800).  `free_page_table_tree` already excludes them (loop 4..507);
+///   the share path must match.
 pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
     use crate::mm::ptshare::ForkGroup;
 
@@ -418,8 +427,11 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
         }
     }
 
-    // PML4[1..512]: share directly (all user).
-    for i in 1..512 {
+    // PML4[1..507]: share directly (all user).  Upper bound STOPS at 507 to
+    // skip the kernel-half regions [507..=511] — see the doc comment above:
+    // COW-marking them de-maps the direct map / kstacks / kernel code in the
+    // forked aspaces and triple-faults the kernel.
+    for i in 1..507 {
         let entry = unsafe { *parent_pml4.add(i) };
         if X86Pte::is_valid(entry) && X86Pte::is_table(entry) {
             let sub_pa = X86Pte::table_pa(entry);
@@ -747,6 +759,58 @@ pub fn create_user_page_table() -> Option<usize> {
 /// Switch the page table to a different PML4.
 /// Used on context switch between tasks with different address spaces.
 pub fn switch_page_table(root: usize) {
+    // #208 5f hunt: validate the target user PT carries the kernel-half
+    // region PML4 entries (507..=511) BEFORE we run on it.  A user CR3
+    // missing/mismatching one of these means the first kernel fault taken
+    // while on this CR3 can't fetch its handler — handler RIP (PML4[511]),
+    // IST/rsp0 kstacks (PML4[508]), direct map (PML4[507]) all live there —
+    // so it escalates straight to a silent triple with NO handler output.
+    // Exact shape of the prior PML4[511] regression (see create_user_page_
+    // table, ~mm.rs:726).  Runs on the CURRENT (good) CR3, reads `root` via
+    // the direct map.  Gated on the descriptor-validator arm; rate-limited.
+    #[cfg(feature = "vm_debug_probes")]
+    {
+        use core::sync::atomic::Ordering;
+        if crate::arch::x86_64::gdt::DESC_VALIDATE_ARMED.load(Ordering::Relaxed) {
+            let boot = BOOT_PML4.load(Ordering::Acquire);
+            if boot != 0 && root != boot {
+                unsafe {
+                    let nr = pt_kva(root) as *const u64;
+                    let br = pt_kva(boot) as *const u64;
+                    for i in 507..=511usize {
+                        let got = *nr.add(i);
+                        let exp = *br.add(i);
+                        if got != exp {
+                            static CR3_BAD_N: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(0);
+                            let n = CR3_BAD_N.fetch_add(1, Ordering::Relaxed);
+                            if n < 16 {
+                                use crate::arch::x86_64::serial::{
+                                    put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                                };
+                                let mut buf = [0u8; 160];
+                                let mut k = 0;
+                                put_bytes(&mut buf, &mut k, b"USER-CR3-BAD: root=");
+                                put_hex_u64(&mut buf, &mut k, root as u64);
+                                put_bytes(&mut buf, &mut k, b" pml4[");
+                                put_dec_u64(&mut buf, &mut k, i as u64);
+                                put_bytes(&mut buf, &mut k, b"] exp=");
+                                put_hex_u64(&mut buf, &mut k, exp);
+                                put_bytes(&mut buf, &mut k, b" got=");
+                                put_hex_u64(&mut buf, &mut k, got);
+                                put_bytes(&mut buf, &mut k, b" n=");
+                                put_dec_u64(&mut buf, &mut k, n as u64);
+                                put_byte(&mut buf, &mut k, b'\n');
+                                crate::arch::x86_64::serial::handler_write_bytes(
+                                    &buf[..k.min(buf.len())],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     unsafe {
         core::arch::asm!(
             "mov cr3, {root}",

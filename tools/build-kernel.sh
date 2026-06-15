@@ -45,6 +45,11 @@ EXTRA_FLAGS=""
 if [ "$ARCH" = "mips64" ]; then
     EXTRA_FLAGS="-Z build-std=core -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
 fi
+# Opt-in x86_64 VM/descriptor debug probes (USER-CR3-BAD / DESC-ANOMALY /
+# EARLY-FAULT).  Off by default; set TELIX_VM_PROBES=1 to compile them in.
+if [ "${TELIX_VM_PROBES:-}" = "1" ]; then
+    EXTRA_FLAGS="$EXTRA_FLAGS --features vm_debug_probes"
+fi
 RUSTUP_TOOLCHAIN=nightly \
     RUSTC="${RUSTC:-$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc}" \
     "$HOME/.cargo/bin/cargo" build \

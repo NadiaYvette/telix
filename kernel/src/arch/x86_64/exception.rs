@@ -1472,9 +1472,124 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             crate::arch::x86_64::gdt::dr0_ensure_watching(target);
         }
     }
+    // #208 5f hunt: validate the loaded GDT/IDT descriptor tables + CR3 at
+    // every exception entry (armed at first userspace spawn).  The 5f
+    // silent triple showed NO frame/stack/rsp0/IST/CS-slot corruption, so
+    // the cause is most likely a corrupted code descriptor (GDT) or
+    // exception gate (IDT) — iretq/dispatch then loads a bad CS or can't
+    // dispatch a fault → escalates to #DF → (bad gate) → silent triple.
+    // A non-fatal exception that fires after the corruption but before the
+    // fatal one catches it here.  Logs the first 8 anomalies.
+    #[cfg(feature = "vm_debug_probes")]
+    {
+        if crate::arch::x86_64::gdt::DESC_VALIDATE_ARMED
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64, put_hex_u64};
+            static DESC_ANOM_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let gdt = crate::arch::x86_64::gdt::gdt_anomaly();
+            let idt = crate::arch::x86_64::idt::idt_anomaly();
+            let cr3: u64;
+            unsafe {
+                core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+            }
+            // CR3 sane: non-zero, 4 KiB-aligned, PA within a generous bound.
+            let cr3_bad = cr3 == 0 || (cr3 & 0xFFF) != 0 || (cr3 >> 12) > 0x100_0000;
+            if (gdt.is_some() || idt.is_some() || cr3_bad)
+                && DESC_ANOM_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel) < 8
+            {
+                let cpu = crate::sched::smp::cpu_id() as usize;
+                let tid = crate::sched::scheduler::current_thread_id();
+                let mut buf = [0u8; 256];
+                let mut k = 0;
+                put_bytes(&mut buf, &mut k, b"DESC-ANOMALY: cpu=");
+                put_dec_u64(&mut buf, &mut k, cpu as u64);
+                put_bytes(&mut buf, &mut k, b" tid=");
+                put_dec_u64(&mut buf, &mut k, tid as u64);
+                if let Some((c, e, a)) = gdt {
+                    put_bytes(&mut buf, &mut k, b" GDT[code=");
+                    put_dec_u64(&mut buf, &mut k, c as u64);
+                    put_bytes(&mut buf, &mut k, b" exp=");
+                    put_hex_u64(&mut buf, &mut k, e);
+                    put_bytes(&mut buf, &mut k, b" got=");
+                    put_hex_u64(&mut buf, &mut k, a);
+                    put_byte(&mut buf, &mut k, b']');
+                }
+                if let Some((c, v, h)) = idt {
+                    put_bytes(&mut buf, &mut k, b" IDT[code=");
+                    put_dec_u64(&mut buf, &mut k, c as u64);
+                    put_bytes(&mut buf, &mut k, b" vec=");
+                    put_dec_u64(&mut buf, &mut k, v);
+                    put_bytes(&mut buf, &mut k, b" handler=");
+                    put_hex_u64(&mut buf, &mut k, h);
+                    put_byte(&mut buf, &mut k, b']');
+                }
+                if cr3_bad {
+                    put_bytes(&mut buf, &mut k, b" CR3=");
+                    put_hex_u64(&mut buf, &mut k, cr3);
+                }
+                put_byte(&mut buf, &mut k, b'\n');
+                crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+            }
+        }
+    }
 
     let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let vector = frame.vector();
+
+    // #208 5f hunt: unconditional EARLY-FAULT emit.  Placed before any
+    // output path that could itself re-fault.  For the fault classes that
+    // participate in a #DF cascade (8/10/11/12/13/14/17/18) dump
+    // vec/rip/cs/err (+cr2 for #PF) via the atomic UART path.  If the 5f
+    // silent triple is a *dispatched* fault whose normal printer faults,
+    // this catches it here; if NOTHING emits before the triple, the triple
+    // is a delivery-stack fault — the CPU couldn't push the frame, so no
+    // handler ever ran (points at rsp0/IST/CR3, not at corruption).
+    #[cfg(feature = "vm_debug_probes")]
+    if crate::arch::x86_64::gdt::DESC_VALIDATE_ARMED
+        .load(core::sync::atomic::Ordering::Relaxed)
+        && matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 18)
+    {
+        static EARLY_FAULT_N: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = EARLY_FAULT_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 40 {
+            let rip = unsafe { core::ptr::read_volatile(&frame.regs[17] as *const u64) };
+            let cs = unsafe { core::ptr::read_volatile(&frame.regs[18] as *const u64) };
+            let err = frame.error_code();
+            let cr2: u64 = if vector == 14 {
+                let v: u64;
+                unsafe {
+                    core::arch::asm!("mov {}, cr2", out(reg) v, options(nomem, nostack));
+                }
+                v
+            } else {
+                0
+            };
+            let tid = crate::sched::scheduler::current_thread_id();
+            let mut buf = [0u8; 176];
+            let mut k = 0;
+            put_bytes(&mut buf, &mut k, b"EARLY-FAULT: vec=");
+            put_dec_u64(&mut buf, &mut k, vector);
+            put_bytes(&mut buf, &mut k, b" cpu=");
+            put_dec_u64(&mut buf, &mut k, cpu as u64);
+            put_bytes(&mut buf, &mut k, b" tid=");
+            put_dec_u64(&mut buf, &mut k, tid as u64);
+            put_bytes(&mut buf, &mut k, b" rip=");
+            put_hex_u64(&mut buf, &mut k, rip);
+            put_bytes(&mut buf, &mut k, b" cs=");
+            put_hex_u64(&mut buf, &mut k, cs);
+            put_bytes(&mut buf, &mut k, b" err=");
+            put_hex_u64(&mut buf, &mut k, err);
+            put_bytes(&mut buf, &mut k, b" cr2=");
+            put_hex_u64(&mut buf, &mut k, cr2);
+            put_bytes(&mut buf, &mut k, b" n=");
+            put_dec_u64(&mut buf, &mut k, n as u64);
+            put_byte(&mut buf, &mut k, b'\n');
+            crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+        }
+    }
 
     // #208 early-stage CS sanity check.  Runs IMMEDIATELY at handler
     // entry, before any other Rust code that could write to the

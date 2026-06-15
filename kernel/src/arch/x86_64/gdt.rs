@@ -347,6 +347,64 @@ pub fn tss_rsp0_for(cpu: usize) -> u64 {
     unsafe { (*tss_for(cpu)).rsp0 }
 }
 
+/// #208 5f hunt: armed once the first userspace thread spawns (scheduler
+/// up).  Gates the exception-entry GDT/IDT/CR3 descriptor validator so it
+/// covers all Phase-5 death points (the silent triple's location varies
+/// boot to boot).
+#[cfg(feature = "vm_debug_probes")]
+pub static DESC_VALIDATE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Read the loaded GDTR via `sgdt`.  Returns (limit, base).
+#[cfg(feature = "vm_debug_probes")]
+#[inline]
+fn read_gdtr() -> (u16, u64) {
+    let mut buf = [0u8; 10];
+    unsafe {
+        core::arch::asm!("sgdt [{}]", in(reg) buf.as_mut_ptr(), options(nostack));
+    }
+    let limit = u16::from_le_bytes([buf[0], buf[1]]);
+    let base = u64::from_le_bytes([
+        buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+    ]);
+    (limit, base)
+}
+
+/// #208 5f hunt: validate the LOADED GDT (via sgdt) — GDTR base canonical
+/// + the kernel-CS (0x08) and user-CS (0x20) descriptor qwords match the
+/// known-good GDT_INIT values (those slots are never modified at runtime;
+/// only the TSS slots 5/6 are).  A corrupted code descriptor makes
+/// iretq/exception-dispatch load a bad CS → #GP → (if dispatch is also
+/// broken) → silent triple.  Returns (code, expected, actual) of the
+/// first anomaly: 1=GDTR base non-canonical, 2=kernel-CS, 3=user-CS.
+#[cfg(feature = "vm_debug_probes")]
+pub fn gdt_anomaly() -> Option<(u32, u64, u64)> {
+    let (limit, base) = read_gdtr();
+    if base < 0xFFFF_8000_0000_0000 {
+        return Some((1, 0, base));
+    }
+    if (limit as usize) < 6 * 8 - 1 {
+        return Some((1, (6 * 8 - 1) as u64, limit as u64));
+    }
+    // The CPU sets the Accessed bit (bit 40) in a code/data descriptor the
+    // first time its selector is loaded into a segment register — this is
+    // architectural, NOT corruption.  Mask it off both sides before
+    // comparing, else every kernel-CS / user-CS load trips a false positive
+    // (0x..9a -> 0x..9b, 0x..fa -> 0x..fb) and burns the emission budget,
+    // blinding us to a real anomaly that fires later.
+    const ACCESSED: u64 = 1 << 40;
+    let gp = base as *const u64;
+    let kcs = unsafe { core::ptr::read_unaligned(gp.add(1)) };
+    if kcs & !ACCESSED != GDT_INIT.entries[1] & !ACCESSED {
+        return Some((2, GDT_INIT.entries[1], kcs));
+    }
+    let ucs = unsafe { core::ptr::read_unaligned(gp.add(4)) };
+    if ucs & !ACCESSED != GDT_INIT.entries[4] & !ACCESSED {
+        return Some((3, GDT_INIT.entries[4], ucs));
+    }
+    None
+}
+
 /// #208 DR0 watchpoint helpers.  Used to catch the writer that
 /// corrupts iretq frame slots.  Single-CPU watch: arms DR0 on the
 /// calling CPU only; if the writer is on another CPU, this won't

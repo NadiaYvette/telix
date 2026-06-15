@@ -28,3 +28,13 @@ max_cpus_4096 = []
 # per-CPU caches.  Lets us A/B test whether the smart allocator's
 # concurrency machinery is implicated in the #208 corruption family.
 dumb_phys_alloc = []
+
+# Debug-only x86_64 VM/descriptor validation probes.  Default off — these
+# add a per-context-switch PML4[507..=511] check (USER-CR3-BAD), a per-
+# exception-entry GDT/IDT/CR3 validator (DESC-ANOMALY) + early-fault dump
+# (EARLY-FAULT), all armed at first userspace spawn.  They found the #208 5f
+# silent triple (fork COW-marking kernel PML4 regions).  Kept behind this
+# flag so the corruption-family hunt has them in a pinch without paying the
+# per-switch / per-trap cost in production builds.  Enable with
+# `--features vm_debug_probes` (or TELIX_VM_PROBES=1 via build-kernel.sh).
+vm_debug_probes = []

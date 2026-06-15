@@ -70,6 +70,56 @@ unsafe extern "C" {
     static __isr_stub_table: [u64; IDT_ENTRIES];
 }
 
+/// Read the loaded IDTR via `sidt`.  Returns (limit, base).
+#[cfg(feature = "vm_debug_probes")]
+#[inline]
+fn read_idtr() -> (u16, u64) {
+    let mut buf = [0u8; 10];
+    unsafe {
+        core::arch::asm!("sidt [{}]", in(reg) buf.as_mut_ptr(), options(nostack));
+    }
+    let limit = u16::from_le_bytes([buf[0], buf[1]]);
+    let base = u64::from_le_bytes([
+        buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+    ]);
+    (limit, base)
+}
+
+/// #208 5f hunt: validate the LOADED IDT (via sidt).  Reads the raw 16-byte
+/// hardware gate format (layout-independent) for the key vectors — #DF(8),
+/// #GP(13), #PF(14), syscall(0x80) — and checks each is Present, selector
+/// == KERNEL_CS, canonical handler offset.  A corrupted IDT entry means the
+/// CPU can't dispatch that exception → escalates to #DF → (if #DF's gate is
+/// also bad) → silent triple, exactly the no-output Phase-5f signature.
+/// Returns (code, vector, handler) of the first anomaly: 1=IDTR base
+/// non-canonical (vector=base), 2=limit wrong (vector=limit), 3=entry bad.
+#[cfg(feature = "vm_debug_probes")]
+pub fn idt_anomaly() -> Option<(u32, u64, u64)> {
+    let (limit, base) = read_idtr();
+    if base < 0xFFFF_8000_0000_0000 {
+        return Some((1, 0, base));
+    }
+    if limit as usize != IDT_ENTRIES * 16 - 1 {
+        return Some((2, (IDT_ENTRIES * 16 - 1) as u64, limit as u64));
+    }
+    for &v in &[8u64, 13, 14, 0x80] {
+        let p = (base + v * 16) as *const u8;
+        unsafe {
+            let ol = core::ptr::read_unaligned(p as *const u16) as u64;
+            let sel = core::ptr::read_unaligned(p.add(2) as *const u16);
+            let type_attr = core::ptr::read_unaligned(p.add(5));
+            let om = core::ptr::read_unaligned(p.add(6) as *const u16) as u64;
+            let oh = core::ptr::read_unaligned(p.add(8) as *const u32) as u64;
+            let handler = ol | (om << 16) | (oh << 32);
+            let present = type_attr & 0x80 != 0;
+            if !present || sel != KERNEL_CS || handler < 0xFFFF_8000_0000_0000 {
+                return Some((3, v, handler));
+            }
+        }
+    }
+    None
+}
+
 /// Load the IDT with all 256 vector stubs.
 pub fn init() {
     unsafe {
