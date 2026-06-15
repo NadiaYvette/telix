@@ -4827,6 +4827,75 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
     idle_id
 }
 
+/// #173 fix B: reclaim a stale-`on_cpu` orphan during dispatch claim.
+///
+/// Precondition: `tid` was just popped from a run queue by the claim helper
+/// (so `in_queue == false` — we hold it "in hand"), and the normal claim
+/// `CAS(on_cpu, PENDING → cpu)` already FAILED, meaning `on_cpu` is not
+/// PENDING.
+///
+/// The gate=ON wedge (project_gate_on_residual_reframed_host_pressure):
+/// some path left a Ready, enqueued thread with `on_cpu` = a *stale* real-CPU
+/// number (a CPU that already finished running it).  The old helper dropped
+/// such a pick "on the floor", assuming another path owned its lifecycle —
+/// but nothing did, so the thread became a permanent orphan (Ready, not in
+/// any heap), endlessly re-rescued without ever dispatching (tid=17 bounce).
+///
+/// This recovers it: if `on_cpu` names a real CPU that is **not** actually
+/// running or mid-dispatching `tid` (same `current_thread`/`dispatching_tid`
+/// predicate the rescue uses, scheduler.rs:12077-12082), claim it with a
+/// single `CAS(stale_cpu → cpu)`.
+///
+/// Safety (no double-dispatch):
+///   * `tid` is in our hand (popped, `in_queue == false`).  A *genuinely*
+///     running thread is NOT also sitting in our run queue (single-owner
+///     `in_queue`), so we could not have popped it — hence a real-CPU
+///     `on_cpu` we observe on a popped thread is necessarily stale.  The
+///     `current_thread`/`dispatching_tid` check is a belt-and-suspenders
+///     guard against the source-bug's leftover stamp.
+///   * The reclaim is a single `compare_exchange(on, cpu)`: it succeeds only
+///     while `on_cpu` is still the exact stale value `on`.  A concurrent wake
+///     that re-stamps `on_cpu = PENDING`, or a rescue `→ MAX`, makes the CAS
+///     fail and we drop (the wake's re-enqueue / rescue then makes it
+///     claimable again).  `on_cpu` cannot ABA back to `on`, because the only
+///     path that writes a real CPU is a `PENDING → that_cpu` claim, and that
+///     CPU cannot claim `tid` while `tid` is in our hand (not in its heap).
+///   * Therefore dispatch stays single-arbiter: exactly one CPU wins a CAS
+///     into its own id.  Verified by the loom model in
+///     tests/loom-claim-helper (`stale_reclaim_*`).
+///
+/// Returns true iff it claimed `tid` for `cpu` (caller dispatches it).
+fn reclaim_stale_on_cpu(tid: ThreadId, cpu: u32) -> bool {
+    let on = thread_ref(tid).on_cpu.load(Ordering::Acquire);
+    let ncpus = smp::num_cpus() as u32;
+    // Only a *real-CPU* on_cpu is a candidate.  PENDING/RELEASING/MAX and
+    // other sentinels are >= ncpus and mean "owned by a park/release/rescue
+    // lifecycle path" — leave them for that path (the caller drops).
+    if on >= ncpus {
+        return false;
+    }
+    // Is the named CPU genuinely running or mid-dispatching tid?  If so this
+    // is the legitimate "direct-dispatch raced the heap pick" case — leave it.
+    let owner = smp::get(on);
+    if owner.current_thread.load(Ordering::Acquire) == tid as u32
+        || owner.dispatching_tid.load(Ordering::Acquire) == tid as u32
+    {
+        return false;
+    }
+    // Stale orphan — claim it for this CPU.  Single CAS from the observed
+    // stale value; any concurrent re-stamp loses us the race (we drop).
+    if thread_ref(tid)
+        .on_cpu
+        .compare_exchange(on, cpu, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        DISPATCH_CLAIM_STALE_RECLAIM.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 /// #173 Phase 1+2: pop + CAS-claim in one critical section.
 ///
 /// The legacy `percpu_pick_next` pops a thread from the rq, drops the rq
@@ -4867,18 +4936,30 @@ fn percpu_pick_next_and_claim(
                 None => break,
             };
             thread_ref(tid).in_queue.store(false, Ordering::Release);
+            // #173 fix B: publish dispatch intent BEFORE the claim CAS, so a
+            // concurrent `reclaim_stale_on_cpu` on another CPU observes this
+            // in-flight claim (via `dispatching_tid`) and will NOT mistake our
+            // just-claimed thread for a stale orphan and steal it.  Mirrors the
+            // legacy path (see try_switch ~7117).  Cleared below if we lose the
+            // claim, and overwritten by the next pick; left = tid on success.
+            pcpu.dispatching_tid.store(tid as u32, Ordering::Release);
             if thread_ref(tid)
                 .on_cpu
                 .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
+                || reclaim_stale_on_cpu(tid, cpu)
             {
-                result = Some((tid, 3)); // 3=pick_deq trace tag
+                result = Some((tid, 3)); // 3=pick_deq trace tag (reclaim shares it)
                 break;
             }
-            // CAS failed — `tid` was stamped to a real CPU number by another
-            // path (rescue, wake_thread direct, ...).  Drop on the floor and
-            // try the next pick.  We've removed it from the rq; that's
-            // semantically correct since the other path owns the lifecycle.
+            // Normal claim AND stale-reclaim both declined — `tid` is genuinely
+            // owned by another path (running/dispatching elsewhere, or parking /
+            // RELEASING).  Clear our dispatch intent, then drop on the floor and
+            // try the next pick; we've removed it from the rq, which is correct
+            // since the owner's lifecycle path (or the rescue backstop) handles
+            // it.  See `reclaim_stale_on_cpu` for the gate=ON orphan this branch
+            // used to strand (#173 fix B).
+            pcpu.dispatching_tid.store(0, Ordering::Release);
             DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
         }
         result
@@ -4901,10 +4982,15 @@ fn percpu_pick_next_and_claim(
     // commit phase below.
     if let Some(tid) = try_steal(cpu) {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        // #173 fix B: publish dispatch intent before the claim CAS (see local
+        // path above).  Cleared on failure so a reclaimer never sees a stale
+        // dispatching_tid for a steal we lost.
+        pcpu.dispatching_tid.store(tid as u32, Ordering::Release);
         if thread_ref(tid)
             .on_cpu
             .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+            || reclaim_stale_on_cpu(tid, cpu)
         {
             record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
             thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
@@ -4915,8 +5001,9 @@ fn percpu_pick_next_and_claim(
             DISPATCH_CLAIM_STEAL.fetch_add(1, Ordering::Relaxed);
             return tid;
         }
-        // CAS failed on a stolen tid — return idle.  Phase 1: don't retry
-        // try_steal (cost vs benefit unclear).  Phase 2+ may revisit.
+        // CAS failed on a stolen tid — clear intent and return idle.  Phase 1:
+        // don't retry try_steal (cost vs benefit unclear).  Phase 2+ may revisit.
+        pcpu.dispatching_tid.store(0, Ordering::Release);
         DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
     }
     idle_id
@@ -5096,6 +5183,20 @@ pub static DISPATCH_CLAIM_LOCAL: core::sync::atomic::AtomicU64 =
 pub static DISPATCH_CLAIM_STEAL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static DISPATCH_CLAIM_FAIL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// #173 fix B: count of stale-on_cpu orphans the claim helper recovered by
+/// resetting on_cpu PENDING + re-enqueueing (instead of floor-dropping them).
+/// A non-zero value under gate=ON means the helper is breaking the tid=17
+/// orphan-bounce that previously wedged Phase 3-4.  See
+/// `reclaim_stale_on_cpu` and project_gate_on_residual_reframed_host_pressure.
+pub static DISPATCH_CLAIM_STALE_RECLAIM: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// #173 confirming probe: count of times block_current stored state=Blocked
+/// while on_cpu == ON_CPU_PENDING — the torn-creating write of the
+/// block_current‖wake_thread race (a concurrent wake stamped on_cpu=PENDING
+/// before/while we re-set Blocked, losing the wakeup).  Non-zero confirms the
+/// root cause in project_gate_on_residual_reframed_host_pressure.
+pub static TORN_BLOCK_FIRES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// Pick next thread, preferring a cosched group mate on the current CPU.
@@ -6436,10 +6537,12 @@ pub fn tick(current_sp: u64) -> u64 {
                 let stuck_off = RESCUE_STUCK_PENDING_FIRES_GATE_OFF.load(Ordering::Relaxed);
                 let claim_fail = DISPATCH_CLAIM_FAIL.load(Ordering::Relaxed);
                 let claim_self_pick = DISPATCH_CLAIM_SELF_PICK.load(Ordering::Relaxed);
+                let stale_reclaim = DISPATCH_CLAIM_STALE_RECLAIM.load(Ordering::Relaxed);
+                let torn_block = TORN_BLOCK_FIRES.load(Ordering::Relaxed);
                 crate::println!(
-                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={}",
+                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={} stale_reclaim={} torn_block={}",
                     if gate_on { "ON" } else { "OFF" },
-                    stuck_on, stuck_off, claim_fail, claim_self_pick,
+                    stuck_on, stuck_off, claim_fail, claim_self_pick, stale_reclaim, torn_block,
                 );
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
             }
@@ -7750,6 +7853,22 @@ pub fn block_current(_reason: BlockReason) {
         // resolves correctly: either we see wakeup=true here (exit
         // immediately), or wake_thread sees state=Blocked and enqueues us
         // (we resume after WFI via normal dispatch).
+        // #173 confirming probe: if a concurrent wake_thread already stamped
+        // on_cpu=ON_CPU_PENDING (Blocked→Ready transition in flight) and we are
+        // about to (re)set state=Blocked, that is the torn-creating write of the
+        // block_current‖wake race — the wakeup will be lost (we stay parked while
+        // the wake's Ready/enqueue is clobbered).  Count + rate-limited log.
+        if tref.on_cpu.load(Ordering::Acquire) == ON_CPU_PENDING {
+            let n = TORN_BLOCK_FIRES.fetch_add(1, Ordering::Relaxed);
+            if n < 12 {
+                let task_id = thread_ref(tid).task_id;
+                let rtag: u32 = match _reason { BlockReason::FutexWait => 4, _ => 99 };
+                crate::println!(
+                    "TORN-BLOCK: tid={} task={} reason={} on_cpu=PENDING wakeup={} yielded={} (block_current racing wake)",
+                    tid, task_id, rtag, tref.wakeup.load(Ordering::Relaxed), yielded
+                );
+            }
+        }
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Blocked;
         record_trans(tid as u32, 13, ThreadState::Blocked, tref.on_cpu.load(Ordering::Relaxed));
         if tref.killed.load(Ordering::Acquire) {
@@ -12239,10 +12358,18 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 let src = t.saved_sp_source;
                 let blk = t.blocked_on;
                 let heap_pos = t.eevdf_heap_pos;
+                // #173 orphan-source probe: on_cpu_set_by identifies which
+                // dispatch path last stamped on_cpu (1=try_switch, 2=vol_resched,
+                // 3=park_ipc); enq/pick counts show whether the strand was ever
+                // dispatched.  Triangulates the Running→Ready strand that fix B
+                // mislocated (see project_gate_on_residual_reframed_host_pressure).
+                let set_by = t.on_cpu_set_by.load(Ordering::Relaxed);
+                let enq_n = t.enqueue_count.load(Ordering::Relaxed);
+                let pick_n = t.picked_count.load(Ordering::Relaxed);
                 crate::println!(
-                    "RESCUE: tid={} prio={} cpu={} task={} on_cpu={} trace=(evt={} cpu={} seq={}) park={} wake={} src={} blk={:?} hp={}",
+                    "RESCUE: tid={} prio={} cpu={} task={} on_cpu={} trace=(evt={} cpu={} seq={}) park={} wake={} src={} blk={:?} hp={} set_by={} enq={} pick={}",
                     tid, prio, target, t.task_id, on2, tevt, tcpu, tseq,
-                    park, wake, src, blk, heap_pos
+                    park, wake, src, blk, heap_pos, set_by, enq_n, pick_n
                 );
                 if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
                 // Reset on_cpu so that when this thread is later dispatched,
