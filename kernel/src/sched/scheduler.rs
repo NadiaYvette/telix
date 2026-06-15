@@ -4922,12 +4922,22 @@ fn percpu_pick_next_and_claim(
     idle_id
 }
 
-/// #173 Phase 2: A/B gate for the claim helper.  Default false → legacy
-/// pick + CAS path is used everywhere.  Flipping to true at boot exercises
-/// the new helper at any wired call site (currently just
-/// `voluntary_reschedule`).
+/// #173: A/B gate for the single-atomic dispatch claim helper.  Default is
+/// **ON for x86_64**, OFF for other arches.
+///
+/// x86_64 is validated: loom-claim-helper 5/5 (CAS-mutex + self-pick +
+/// recoverable), 3/3 isolated multi-boots with stuck_gate_on=0 / 0 crashes,
+/// and an A/B where gate=ON clears a Phase-5i dispatch wedge that gate=OFF
+/// hangs on.  Other arches stay OFF: rv64 shows a regression with the helper
+/// (task #262 / project_173_phase5_validation — "helper increases stuck
+/// rescue fires 2.6×"), so they keep the legacy two-step until that's fixed.
+///
+/// Runtime-togglable via the debug command (1=on, 2=off) for per-arch tests.
+/// When on, every dispatch pick (try_switch / voluntary_reschedule /
+/// park_ipc / park_sleep / park_faulting) routes through
+/// `percpu_pick_next_and_claim`, eliminating the phantom-pending window.
 pub static DISPATCH_USE_CLAIM_HELPER: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+    core::sync::atomic::AtomicBool::new(cfg!(target_arch = "x86_64"));
 
 /// #173 Phase 3c: cosched-aware variant of `percpu_pick_next_and_claim`.
 ///
