@@ -5824,6 +5824,190 @@ pub fn reschedule_ipi(current_sp: u64) -> u64 {
     result
 }
 
+// =========================================================================
+// PROACTIVE radix / THREAD_TABLE integrity scan (#208 / #233).
+//
+// The #208 wild-pointer-write corruption family overwrites a struct-pointer
+// slot so that `THREAD_TABLE.get(tid)` later returns a kstack-region VA
+// (0xFFFF_FE00_xxxx) or a stray SLAB VA instead of a valid Thread-struct VA
+// in SLAB_THREAD_REGION (0xFFFF_FE80_xxxx).  Phys double-allocation has been
+// ruled out (0/11 boots) — it is a wild CPU write through a mis-computed
+// destination pointer (see project_phase5_spawn_heavy_wedge_2026_06_14).
+//
+// The reactive `VALIDATOR-BAD-TREF` guard in exception::validate_iretq_frame
+// only fires for the faulting tid at iretq time — too late and too narrow.
+// This proactive scan runs at the timer tick (frequent, cheap) and:
+//   1. validates THREAD_TABLE's radix L0 page + L0[0] entry are sane
+//      pointers (the L0/L1 pages live in PHYS_DIRECT_MAP, never in the
+//      kstack/SLAB regions),
+//   2. validates the CURRENT thread's THREAD_TABLE.get(tid) is in
+//      SLAB_THREAD_REGION (catches the corrupted tid the next time it is
+//      scheduled — a tight window after the scribble),
+//   3. once every 256 ticks, does a bounded full scan of low tids.
+// On the FIRST detected corruption it latches a one-shot AtomicBool and
+// emits a single corruption-safe direct-UART block + the SET-LOG trajectory
+// + the phys event ring for the bad pointer's chunk, to capture
+// write-provenance context.
+//
+// Read-only checks + a one-shot latch: does not perturb scheduling.
+// =========================================================================
+
+/// Master gate for the proactive radix/THREAD_TABLE integrity scan.
+/// Default OFF — validated false-positive-free (6 boots) but targets the rarer
+/// table-entry-corruption face; the common Phase-5 face is the kstack-frame-slot
+/// scribble (separate HW-WP probe). Flip true to re-arm as a regression guard.
+const RADIX_INTEGRITY_SCAN: bool = false;
+
+/// One-shot latch: the corruption is caught once with full context; we then
+/// stay quiet so a meltdown cascade doesn't flood the UART (the SET-LOG /
+/// evt-ring dumps after the cascade started would be noise anyway).
+#[cfg(target_arch = "x86_64")]
+static RADIX_INTEGRITY_FAILED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// True iff `p` is a valid Thread-struct VA (in SLAB_THREAD_REGION /
+/// SLAB_REGION, PML4[509]).  A pointer here is what `THREAD_TABLE.get(tid)`
+/// must return for a live thread; a kstack VA / direct-map VA / garbage
+/// here is the #208 corruption signature.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn is_thread_struct_va(p: u64) -> bool {
+    use crate::arch::x86_64::mm::{PML4_SLOT_SIZE, SLAB_REGION_BASE};
+    p >= SLAB_REGION_BASE && p < SLAB_REGION_BASE.wrapping_add(PML4_SLOT_SIZE)
+}
+
+/// True iff `p` is a sane radix backing-page VA.  The radix L0 page and all
+/// L1 pages are allocated via `phys::alloc_page()` and stored as
+/// `phys_to_kva(pa)` (radix.rs init/ensure_l1), so a healthy L0 page / L0[0]
+/// L1-page pointer lives in PHYS_DIRECT_MAP (PML4[507]).  A value in the
+/// kstack/SLAB region here means L0/L0[0] itself was scribbled.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn is_radix_backing_va(p: u64) -> bool {
+    use crate::arch::x86_64::mm::{PHYS_DIRECT_MAP_BASE, PML4_SLOT_SIZE};
+    p >= PHYS_DIRECT_MAP_BASE && p < PHYS_DIRECT_MAP_BASE.wrapping_add(PML4_SLOT_SIZE)
+}
+
+/// Emit the one-shot RADIX-INTEGRITY-FAIL block + provenance dumps.  Uses
+/// only the corruption-safe direct-UART `put_*` path (no fmt machinery, no
+/// heap) so the dump survives even when the formatter scratch is scribbled
+/// (the boot-1823 failure mode).  `got` is the bad pointer, `l0` / `l0_0`
+/// are the raw radix L0 page addr + L0[0] entry, `which` is a short tag.
+#[cfg(target_arch = "x86_64")]
+#[cold]
+fn radix_integrity_report(which: &[u8], tid: u32, got: u64, l0: u64, l0_0: u64, cpu: u32, tick: u64) {
+    // One-shot: only the FIRST detection prints (latch via swap).
+    if RADIX_INTEGRITY_FAILED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    use crate::arch::x86_64::serial::{handler_write_bytes, put_bytes, put_dec_u64, put_hex_u64};
+    let mut buf = [0u8; 256];
+    let mut k = 0;
+    put_bytes(&mut buf, &mut k, b"RADIX-INTEGRITY-FAIL: which=");
+    put_bytes(&mut buf, &mut k, which);
+    put_bytes(&mut buf, &mut k, b" tid=");
+    put_dec_u64(&mut buf, &mut k, tid as u64);
+    put_bytes(&mut buf, &mut k, b" got=");
+    put_hex_u64(&mut buf, &mut k, got);
+    put_bytes(&mut buf, &mut k, b" expected=SLAB_REGION[");
+    put_hex_u64(&mut buf, &mut k, crate::arch::x86_64::mm::SLAB_REGION_BASE);
+    put_bytes(&mut buf, &mut k, b"..");
+    put_hex_u64(
+        &mut buf,
+        &mut k,
+        crate::arch::x86_64::mm::SLAB_REGION_BASE
+            .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE),
+    );
+    put_bytes(&mut buf, &mut k, b") L0=");
+    put_hex_u64(&mut buf, &mut k, l0);
+    put_bytes(&mut buf, &mut k, b" L0[0]=");
+    put_hex_u64(&mut buf, &mut k, l0_0);
+    put_bytes(&mut buf, &mut k, b" cpu=");
+    put_dec_u64(&mut buf, &mut k, cpu as u64);
+    put_bytes(&mut buf, &mut k, b" tick=");
+    put_dec_u64(&mut buf, &mut k, tick);
+    put_bytes(&mut buf, &mut k, b"\n");
+    handler_write_bytes(&buf[..k.min(buf.len())]);
+
+    // Write-provenance context: SET-LOG trajectory for this tid (last
+    // legitimate set + recent op history) — same dumper VALIDATOR-BAD-TREF
+    // uses, also direct-UART.
+    crate::sched::radix::dump_set_log_for_tid(tid);
+
+    // Phys event ring for the bad pointer's chunk: if `got` is a
+    // PHYS_DIRECT_MAP VA we can recover its PA and dump the alloc/free
+    // history of that chunk.  (kstack/SLAB VAs aren't direct-map PAs, so
+    // only attempt this when `got` is in the direct map.)
+    if is_radix_backing_va(got) {
+        let pa = (got - crate::arch::x86_64::mm::PHYS_DIRECT_MAP_BASE) as usize;
+        let chunk_size = 64 * crate::mm::page::page_size();
+        crate::mm::phys::dump_evt_ring_for_chunk(pa / chunk_size);
+    }
+}
+
+/// Proactive integrity scan — called from `tick()` on every CPU.  Cheap:
+/// 2 atomic loads for the L0 check + 1 radix get for the current thread,
+/// plus a bounded full scan once every 256 ticks.  All read-only; reports
+/// the first corruption once via `radix_integrity_report`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn radix_integrity_scan(cpu: u32, tick_count: u64) {
+    if !RADIX_INTEGRITY_SCAN {
+        return;
+    }
+    // Fast exit once we've already caught + reported the first event.
+    if RADIX_INTEGRITY_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // (1) Radix L0 page + L0[0] entry sanity.  raw_l0_slots() returns
+    // (l0_page_addr, L0[0], *(L0[0]+0x20)) all via volatile reads.
+    let (l0, l0_0, _l1_4) = THREAD_TABLE.raw_l0_slots();
+    // L0 page must be a non-null radix backing VA (direct map).  Before
+    // init() runs l0 is 0 — treat null as "not yet initialized", not a
+    // corruption (the scan only fires once threads exist anyway).
+    if l0 != 0 && !is_radix_backing_va(l0) {
+        radix_integrity_report(b"L0-page", 0, l0, l0, l0_0, cpu, tick_count);
+        return;
+    }
+    // L0[0] holds the L1-page pointer for tids 0..fanout-1 — it must point
+    // into the radix backing region.  Null means the L1 page for the first
+    // fanout block hasn't been allocated yet (legitimate very early), so
+    // only flag a NON-null L0[0] that's out of the backing region.
+    if l0 != 0 && l0_0 != 0 && !is_radix_backing_va(l0_0) {
+        radix_integrity_report(b"L0[0]", 0, l0_0, l0, l0_0, cpu, tick_count);
+        return;
+    }
+
+    // (2) Current thread's THREAD_TABLE.get(tid) must be a valid Thread*.
+    // Skip idle tids (< ncpus): their Thread structs come from the boot
+    // stack region and predate SLAB_THREAD (mirrors thread_ref's policy).
+    // Skip null (tid not yet wired into the table).
+    let ncpus = smp::num_cpus() as u32;
+    let cur = smp::current().current_thread.load(Ordering::Relaxed);
+    if cur >= ncpus {
+        let p = THREAD_TABLE.get(cur) as u64;
+        if p != 0 && !is_thread_struct_va(p) {
+            radix_integrity_report(b"current", cur, p, l0, l0_0, cpu, tick_count);
+            return;
+        }
+    }
+
+    // (3) Bounded full scan once every 256 ticks (BSP only to avoid N-CPU
+    // duplication): check live low tids' Thread* land in SLAB_REGION.
+    // Cheap — 256 radix gets — and catches a corrupted tid even when it
+    // isn't the one currently running on any CPU.
+    if cpu == 0 && (tick_count & 0xff) == 0 {
+        for tid in ncpus..256u32 {
+            let p = THREAD_TABLE.get(tid) as u64;
+            if p != 0 && !is_thread_struct_va(p) {
+                radix_integrity_report(b"fullscan", tid, p, l0, l0_0, cpu, tick_count);
+                return;
+            }
+        }
+    }
+}
+
 pub fn tick(current_sp: u64) -> u64 {
     // Record per-CPU last-tick timestamp + update max-gap.  Diagnostic
     // for wake-latency tail: if a CPU's tick stops firing for seconds,
@@ -5888,6 +6072,21 @@ pub fn tick(current_sp: u64) -> u64 {
                     }
                 }
             }
+        }
+    }
+
+    // #208 / #233 proactive radix / THREAD_TABLE integrity scan.  Runs on
+    // every tick on every CPU; one-shot latched + read-only (see
+    // radix_integrity_scan).  Per-CPU tick counter drives the periodic
+    // full-scan cadence without contending a shared counter.
+    #[cfg(target_arch = "x86_64")]
+    {
+        static SCAN_TICKS: [core::sync::atomic::AtomicU64; smp::MAX_CPUS] =
+            [const { core::sync::atomic::AtomicU64::new(0) }; smp::MAX_CPUS];
+        let cpu = smp::cpu_id();
+        if (cpu as usize) < smp::MAX_CPUS {
+            let n = SCAN_TICKS[cpu as usize].fetch_add(1, Ordering::Relaxed);
+            radix_integrity_scan(cpu, n);
         }
     }
 
