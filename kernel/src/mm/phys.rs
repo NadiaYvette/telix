@@ -95,6 +95,91 @@ pub fn dump_evt_ring_for_chunk(target_chunk: usize) {
     );
 }
 
+// ── #228 double-issue detector ───────────────────────────────────────
+//
+// An INDEPENDENT global shadow bitmap that records which physical pages
+// are currently handed out to a caller.  It is deliberately separate
+// from the allocator's own per-chunk state: the whole point is to catch
+// the allocator's accounting being wrong (handing out a page it still
+// believes is owned by a previous caller).
+//
+// Marked only at the public alloc/free boundary so that internal
+// per-CPU reservation churn (claiming/releasing whole chunks, bitmap
+// materialization) does NOT touch the shadow — only actual caller
+// handout (alloc_page/alloc_pages return) and return (free_page/
+// free_pages entry) flip a bit here.
+//
+// Sized for up to 8 GiB of RAM at 4 KiB pages.  256 KiB of static .bss.
+
+/// Master switch — set false to compile the detector out to no-ops.
+/// Default OFF: the 2026-06-16 A/B (0 fires / 11 boots incl. heavy host-desched
+/// stress) ruled out the single-page double-issue as the #208 Phase-5 wild-RIP
+/// cause.  Kept as an opt-in regression guard; flip true to re-arm.
+const DOUBLE_ISSUE_DETECT: bool = false;
+
+/// Shadow covers up to this many pages (8 GiB / 4 KiB).
+const DI_SHADOW_PAGES: usize = 1 << 21; // 2,097,152
+static DI_SHADOW: [AtomicU64; DI_SHADOW_PAGES / 64] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; DI_SHADOW_PAGES / 64]
+};
+
+/// Page index into the shadow bitmap for a physical address, or None if
+/// the PA is below RAM start or beyond the shadow's coverage (skip safely).
+#[inline]
+fn di_page_index(pa: usize) -> Option<usize> {
+    let base = ALLOC.base;
+    if pa < base {
+        return None;
+    }
+    let idx = (pa - base) >> page::page_shift();
+    if idx >= DI_SHADOW_PAGES {
+        return None;
+    }
+    Some(idx)
+}
+
+/// Mark one page as handed-out.  If the bit was already set, the
+/// allocator just gave the same page to two callers — a double-issue.
+#[inline]
+fn di_mark_alloc(pa: usize) {
+    if !DOUBLE_ISSUE_DETECT {
+        return;
+    }
+    let idx = match di_page_index(pa) {
+        Some(i) => i,
+        None => return,
+    };
+    let word = idx >> 6;
+    let mask = 1u64 << (idx & 63);
+    let prev = DI_SHADOW[word].fetch_or(mask, Ordering::Relaxed);
+    if prev & mask != 0 {
+        crate::println!(
+            "PHYS-DOUBLE-ISSUE: pa={:#x} idx={} cpu={} — page handed out while still owned",
+            pa,
+            idx,
+            smp::cpu_id(),
+        );
+        dump_evt_ring_for_chunk(idx / CHUNK_PAGES);
+    }
+}
+
+/// Mark one page as returned (no longer handed-out).  The allocator
+/// already logs double-frees, so a clear-of-already-clear is silent here.
+#[inline]
+fn di_mark_free(pa: usize) {
+    if !DOUBLE_ISSUE_DETECT {
+        return;
+    }
+    let idx = match di_page_index(pa) {
+        Some(i) => i,
+        None => return,
+    };
+    let word = idx >> 6;
+    let mask = 1u64 << (idx & 63);
+    DI_SHADOW[word].fetch_and(!mask, Ordering::Relaxed);
+}
+
 /// Pages per chunk — matches one u64 bitmap.
 const CHUNK_PAGES: usize = 64;
 const CHUNK_SHIFT: usize = 6;
@@ -1046,6 +1131,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
     let r = alloc_page_inner();
     if let Some(ref pa) = r {
         check_pa_not_reserved(pa.as_usize(), "alloc_page");
+        di_mark_alloc(pa.as_usize());
     }
     r
 }
@@ -1267,6 +1353,9 @@ pub fn free_page(addr: PhysAddr) {
     if ci >= ALLOC.total_chunks {
         return;
     }
+    // #228: page is being returned to the allocator — clear its shadow
+    // bit at the public boundary, before internal accounting runs.
+    di_mark_free(pa);
     record_evt(EVT_FREE1, ci, pi);
     chunk_free_one(ci, pi);
 }
@@ -1280,6 +1369,16 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
     let r = alloc_pages_inner(order);
     if let Some(ref pa) = r {
         check_pa_not_reserved(pa.as_usize(), "alloc_pages");
+        // order==0 delegates to alloc_page(), which already marked the
+        // single page — marking again here would self-trigger a false
+        // double-issue.  Only mark the multi-page block here.
+        if order > 0 {
+            let ps = page::page_size();
+            let base = pa.as_usize();
+            for k in 0..(1usize << order) {
+                di_mark_alloc(base + k * ps);
+            }
+        }
     }
     r
 }
