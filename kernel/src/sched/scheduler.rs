@@ -356,6 +356,19 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
     let ksize = kstack_size();
     kstack_pa_audit(pa.as_usize(), ksize, 1, "alloc");
     kstack_pa_register(pa.as_usize() as u64);
+    // #208 KSTACK_LIVENESS_GUARD: the realloc side of the premature-free
+    // race.  The allocator just handed us this phys; no thread has claimed
+    // it as a kstack yet (the caller wires stack_phys_base AFTER this
+    // returns).  So if ANY live thread already reports stack_phys_base ==
+    // new_pa, the page was freed out from under it and re-issued here —
+    // the two will alias the same kstack phys.  Detection-only: we still
+    // return the page so boot behavior is unchanged.
+    #[cfg(target_arch = "x86_64")]
+    if KSTACK_LIVENESS_GUARD {
+        if let Some((tid, state)) = live_thread_owning_kstack_phys(pa.as_usize(), u32::MAX) {
+            report_kstack_phys_realias(pa.as_usize(), tid, state);
+        }
+    }
     // #208 KSTACK_WRITE_RING tag: action=1, alloc_kstack_zeroed
     // write_bytes(0) of the entire kstack via identity-map PA.  If the
     // phys allocator double-issued this PA (use-after-free), the zero
@@ -2846,6 +2859,147 @@ fn deferred_kill() -> &'static [AtomicUsize] {
     unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
 }
 
+/// #208 source-side liveness guard for the kstack premature-free /
+/// phys-realias hypothesis.  The Phase-5 wild-RIP corruption is a write
+/// through a kstack VA into another LIVE thread's iretq frame.  Phys
+/// double-issue, frame-layout shift, and DM-alias writes are all ruled
+/// out; the leading remaining cause is a deferred kstack freed while its
+/// owner thread is still LIVE (state != Dead / still queued / current on
+/// another CPU), then realloc'd to a new thread — the two then alias the
+/// same kstack phys and the new thread's spawn-frame write scribbles the
+/// live thread's frame.  The allocator's own double-issue detector is
+/// blind to this (a legit free DID happen between the two allocs).
+///
+/// This guard is DETECTION-ONLY: it scans THREAD_TABLE at each kstack
+/// free / alloc and reports any LIVE thread still claiming that phys base,
+/// but never changes free/alloc behavior — we want to OBSERVE the race,
+/// not mask it.
+// Default OFF: 2026-06-16 A/B (7 boots incl. stress) found 0 premature-frees /
+// 0 realias while #208 still fired — ruled out the deferred-free race. Kept as
+// an opt-in assertion of the (previously comment-only) "freed kstack's owner is
+// Dead" invariant; flip true to re-arm.
+#[allow(dead_code)]
+const KSTACK_LIVENESS_GUARD: bool = false;
+
+/// Find a LIVE thread (state in Running/Ready/Blocked — NOT Dead) whose
+/// `stack_phys_base == pa`, excluding `skip_tid` and the per-CPU idle
+/// threads.  Returns `(tid, state as u8)` of the first such owner, or
+/// None.  Read-only + defensive: the corruption itself can make a
+/// `THREAD_TABLE.get(tid)` return a wild pointer, so we bounds-check the
+/// pointer is a valid Thread VA in SLAB_THREAD_REGION before dereferencing
+/// it (skip out-of-region entries rather than #PF).  Only clearly-live
+/// states are flagged — a thread mid-exit that is already `Dead` (its
+/// stack legitimately about to be reclaimed) must NOT trip the guard.
+///
+/// State encoding (matches `ThreadState` discriminants): 0=Ready,
+/// 1=Running, 2=Blocked, 3=Dead (we never return Dead).
+#[cfg(target_arch = "x86_64")]
+fn live_thread_owning_kstack_phys(pa: usize, skip_tid: u32) -> Option<(u32, u8)> {
+    if pa == 0 {
+        return None;
+    }
+    let ncpus = smp::num_cpus() as u32;
+    // Scan live low tids (mirrors the proactive integrity scan's bounded
+    // range; the corruption family is server/thread churn well under 256).
+    for tid in ncpus..256u32 {
+        if tid == skip_tid {
+            continue;
+        }
+        // Exclude per-CPU idle threads (their kstacks come from boot/AP
+        // stack regions, not the kstack window) — same policy as
+        // log_saved_sp_out_of_range / thread_ref.
+        let mut is_idle = false;
+        for cpu in 0..ncpus {
+            if smp::get(cpu).idle_thread_id.load(Ordering::Relaxed) == tid {
+                is_idle = true;
+                break;
+            }
+        }
+        if is_idle {
+            continue;
+        }
+        let p = THREAD_TABLE.get(tid) as u64;
+        // DEFENSIVE: skip null (tid not wired) and any pointer that isn't a
+        // valid Thread-struct VA — a corrupted table entry must not cause a
+        // #PF inside the guard.
+        if p == 0 || !is_thread_struct_va(p) {
+            continue;
+        }
+        let t = unsafe { &*(p as *const Thread) };
+        if t.stack_phys_base != pa {
+            continue;
+        }
+        let st = t.state;
+        // Only flag CLEARLY-LIVE owners.  A thread already in `Dead` is in
+        // the legitimate-free window — that's the expected case at a free
+        // site and must produce ZERO reports (false-positive bar).
+        let code = match st {
+            ThreadState::Ready => 0u8,
+            ThreadState::Running => 1u8,
+            ThreadState::Blocked => 2u8,
+            ThreadState::Dead => continue,
+        };
+        return Some((tid, code));
+    }
+    None
+}
+
+/// Emit the corruption-safe, rate-limited KSTACK-PREMATURE-FREE report.
+/// `tid`/`state` are the LIVE owner caught still claiming `pa`; `dead_tid`
+/// is the tid this free site believed it was reclaiming (u32::MAX if not
+/// yet known).  Uses only the direct-UART `put_*` path (no fmt, no heap)
+/// so the line survives a scribbled formatter scratch.
+#[cfg(target_arch = "x86_64")]
+#[cold]
+fn report_kstack_premature_free(tid: u32, state: u8, pa: usize, freeing_cpu: u32, dead_tid: u32) {
+    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    use crate::arch::x86_64::serial::{handler_write_bytes, put_bytes, put_dec_u64, put_hex_u64};
+    let mut buf = [0u8; 160];
+    let mut k = 0;
+    put_bytes(&mut buf, &mut k, b"KSTACK-PREMATURE-FREE: live_owner_tid=");
+    put_dec_u64(&mut buf, &mut k, tid as u64);
+    put_bytes(&mut buf, &mut k, b" state=");
+    put_dec_u64(&mut buf, &mut k, state as u64);
+    put_bytes(&mut buf, &mut k, b" phys=");
+    put_hex_u64(&mut buf, &mut k, pa as u64);
+    put_bytes(&mut buf, &mut k, b" freeing_cpu=");
+    put_dec_u64(&mut buf, &mut k, freeing_cpu as u64);
+    put_bytes(&mut buf, &mut k, b" dead_tid_expected=");
+    if dead_tid == u32::MAX {
+        put_bytes(&mut buf, &mut k, b"none");
+    } else {
+        put_dec_u64(&mut buf, &mut k, dead_tid as u64);
+    }
+    put_bytes(&mut buf, &mut k, b"\n");
+    handler_write_bytes(&buf[..k.min(buf.len())]);
+}
+
+/// Emit the corruption-safe, rate-limited KSTACK-PHYS-REALIAS report — the
+/// realloc side of the same race: the phys allocator just handed back a
+/// page that a still-LIVE thread claims as its kstack base.
+#[cfg(target_arch = "x86_64")]
+#[cold]
+fn report_kstack_phys_realias(new_pa: usize, tid: u32, state: u8) {
+    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    use crate::arch::x86_64::serial::{handler_write_bytes, put_bytes, put_dec_u64, put_hex_u64};
+    let mut buf = [0u8; 128];
+    let mut k = 0;
+    put_bytes(&mut buf, &mut k, b"KSTACK-PHYS-REALIAS: new_pa=");
+    put_hex_u64(&mut buf, &mut k, new_pa as u64);
+    put_bytes(&mut buf, &mut k, b" still_owned_by_live_tid=");
+    put_dec_u64(&mut buf, &mut k, tid as u64);
+    put_bytes(&mut buf, &mut k, b" state=");
+    put_dec_u64(&mut buf, &mut k, state as u64);
+    put_bytes(&mut buf, &mut k, b"\n");
+    handler_write_bytes(&buf[..k.min(buf.len())]);
+}
+
 /// Phase-5 kstack-leak fix: drain a prior pending deferred kstack BEFORE a
 /// store site overwrites the single per-CPU `deferred_kstack()[cpu]` slot.
 ///
@@ -2884,6 +3038,26 @@ fn drain_prior_deferred_kstack(cpu: usize, exclude_pa: usize) {
     }
     kstack_pa_audit(prior, kstack_size(), -1, "free-prior");
     kstack_pa_unregister(prior as u64);
+    // #208 KSTACK_LIVENESS_GUARD: detection-only — before we free this
+    // deferred kstack phys, verify NO still-LIVE thread claims it as its
+    // stack base.  The dead tid we believe we're reclaiming is in
+    // deferred_thread()[cpu]; peek it as skip_tid + the expected-dead id.
+    // If a LIVE owner is found the deferred-free race is the root cause:
+    // the page is about to be returned to the allocator while a running/
+    // ready/blocked thread still uses it.  We still free (behavior
+    // unchanged) so the boot trajectory is identical.
+    #[cfg(target_arch = "x86_64")]
+    if KSTACK_LIVENESS_GUARD {
+        let expected_dead = deferred_thread()[cpu].load(Ordering::Acquire) as u32;
+        let skip = if (expected_dead as usize) < RadixTable::capacity() {
+            expected_dead
+        } else {
+            u32::MAX
+        };
+        if let Some((tid, state)) = live_thread_owning_kstack_phys(prior, skip) {
+            report_kstack_premature_free(tid, state, prior, smp::cpu_id(), skip);
+        }
+    }
     crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(prior), KSTACK_ORDER);
     let dead_tid = deferred_thread()[cpu].swap(usize::MAX, Ordering::AcqRel);
     if dead_tid < RadixTable::capacity() {
@@ -6981,6 +7155,24 @@ fn try_switch(current_sp: u64) -> u64 {
             deferred_kstack()[cpu as usize].store(0, Ordering::Release);
             kstack_pa_audit(deferred, kstack_size(), -1, "free");
             kstack_pa_unregister(deferred as u64);
+            // #208 KSTACK_LIVENESS_GUARD: detection-only liveness check at
+            // the try_switch death-path free (the second of two kstack free
+            // sites).  Same guard as drain_prior_deferred_kstack: catch a
+            // still-LIVE owner of this phys before it returns to the
+            // allocator.  Behavior unchanged — we still free.
+            #[cfg(target_arch = "x86_64")]
+            if KSTACK_LIVENESS_GUARD {
+                let expected_dead =
+                    deferred_thread()[cpu as usize].load(Ordering::Acquire) as u32;
+                let skip = if (expected_dead as usize) < RadixTable::capacity() {
+                    expected_dead
+                } else {
+                    u32::MAX
+                };
+                if let Some((tid, state)) = live_thread_owning_kstack_phys(deferred, skip) {
+                    report_kstack_premature_free(tid, state, deferred, cpu, skip);
+                }
+            }
             crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
             let dead_tid = deferred_thread()[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
             if dead_tid < RadixTable::capacity() {
