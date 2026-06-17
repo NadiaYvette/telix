@@ -135,6 +135,41 @@ __isr_common:
     pop     rcx
     pop     rax
 
+    // #208 B2: bulletproof TSS.RSP0 refresh on user-mode iretq returns.
+    // RSP now points at the iretq frame: [rsp]=RIP [rsp+8]=CS ...
+    // We derive RSP0 entirely from the kstack VA we are physically
+    // returning on (2 MiB-window-aligned top), never from current_thread,
+    // so no corrupted current_thread / missed set_current_thread pairing /
+    // in-place wake bypass can leave TSS.RSP0 pointing at another thread's
+    // kstack (the #208 stale-RSP0 writer class).  IRQ are disabled here; the
+    // TSS write lands before the iretq that lets userspace run, and the
+    // hardware reads TSS.RSP0 on the *next* ring3->0 entry.
+    // RSP at the frame is 8-mod-16; 9 caller-saved pushes (72B) make it
+    // 16-aligned for the System V `call`.  Kernel returns (CS RPL 0) skip.
+    test    byte ptr [rsp + 8], 3
+    jz      .Lrsp0_refresh_done
+    push    rax
+    push    rcx
+    push    rdx
+    push    rdi
+    push    rsi
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    lea     rdi, [rsp + 72]
+    call    rsp0_refresh_user_return
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rsi
+    pop     rdi
+    pop     rdx
+    pop     rcx
+    pop     rax
+.Lrsp0_refresh_done:
+
     iretq
 
 // ==== ISR stub macros ====

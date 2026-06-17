@@ -1145,6 +1145,61 @@ pub unsafe extern "C" fn pre_iretq_dump(frame: *const u64) {
     handler_log_iretq("PRE-IRETQ-SUSPECT", cpu, tid, &slots, frame as u64);
 }
 
+/// #208 B2 (bulletproof stale-RSP0 closer): times this refresh CORRECTED a
+/// stale TSS.RSP0 at a user-mode return (new != old) — i.e. caught a window
+/// the per-path fixes missed.  RSP0_REFRESH_SKIP counts user-returns from a
+/// non-kstack (IST) stack, which are intentionally left untouched.
+pub static RSP0_REFRESH_FIXED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static RSP0_REFRESH_SKIP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static RSP0_REFRESH_TOTAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// #208 B2: refresh TSS.RSP0 on EVERY user-mode iretq return, derived purely
+/// from the kstack VA we are physically returning on.  Called from the iretq
+/// epilogue in vectors.S (interrupts disabled; runs immediately before the
+/// `iretq` that lets userspace run) with `frame_ptr` -> the hardware iretq
+/// frame `[RIP, CS, RFLAGS, RSP, SS]`.
+///
+/// WHY this is bulletproof: the RSP0 value is `align_up(frame_ptr,
+/// KSTACK_WINDOW_SIZE)` = the 2 MiB-aligned top of the kstack window we are
+/// on = exactly `stack_base + kstack_size()` for THIS thread (map_kstack_window
+/// maps the stack into the top of its window).  It never consults
+/// current_thread or any per-thread field, so a corrupted current_thread, a
+/// missed set_current_thread/update_kernel_stack pairing, or an in-place wake
+/// bypass (block_current, future ones) can NOT leave RSP0 pointing at another
+/// thread's kstack.  The hardware reads TSS.RSP0 on the next ring3→0 entry, so
+/// fixing it here — the single return-to-user chokepoint — closes the entire
+/// stale-RSP0 #208 writer class.
+///
+/// IST stacks are static kernel .bss (high-half), NOT in KSTACK_REGION, so an
+/// IST handler (e.g. user #PF on IST 4) returning to user is skipped: RSP0 was
+/// already set correctly by the preceding kstack return / dispatch, and IST
+/// entry never modifies TSS.RSP0.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsp0_refresh_user_return(frame_ptr: u64) {
+    use core::sync::atomic::Ordering;
+    RSP0_REFRESH_TOTAL.fetch_add(1, Ordering::Relaxed);
+    // Defensive (asm already gated on CS RPL == 3): CS at frame_ptr+8.
+    let cs = unsafe { core::ptr::read((frame_ptr + 8) as *const u64) };
+    if cs & 3 != 3 {
+        return;
+    }
+    let base = crate::arch::x86_64::mm::KSTACK_REGION_BASE;
+    let end = base.wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE);
+    if frame_ptr < base || frame_ptr >= end {
+        RSP0_REFRESH_SKIP.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let win = crate::arch::x86_64::mm::KSTACK_WINDOW_SIZE;
+    let rsp0 = (frame_ptr & !(win - 1)).wrapping_add(win);
+    let old = crate::arch::x86_64::gdt::swap_rsp0_raw(rsp0);
+    if old != rsp0 {
+        RSP0_REFRESH_FIXED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// #233 (1) Dr1Guard: clears DR1 at handler exit so the watchpoint
 /// only fires DURING the handler.  Without this, the watchpoint would
 /// continue firing on legitimate iretq frame writes after the handler.

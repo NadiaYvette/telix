@@ -6996,6 +6996,32 @@ pub fn tick(current_sp: u64) -> u64 {
                         frt, cfb, sar, isr, apf, hpd, hps,
                     );
                 }
+                // #208 B2 RSP0-refresh visibility: total = user-return iretqs
+                // that ran the refresher; fixed = those where it CORRECTED a
+                // stale RSP0 (proves it closes a window other paths missed);
+                // skip = IST/non-kstack returns intentionally left untouched.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                    let rt = crate::arch::x86_64::exception::RSP0_REFRESH_TOTAL
+                        .load(Ordering::Relaxed);
+                    let rf = crate::arch::x86_64::exception::RSP0_REFRESH_FIXED
+                        .load(Ordering::Relaxed);
+                    let rs = crate::arch::x86_64::exception::RSP0_REFRESH_SKIP
+                        .load(Ordering::Relaxed);
+                    if rt | rf | rs != 0 {
+                        let mut buf = [0u8; 96];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"RSP0-DIAG: total=");
+                        put_dec_u64(&mut buf, &mut k, rt);
+                        put_bytes(&mut buf, &mut k, b" fixed=");
+                        put_dec_u64(&mut buf, &mut k, rf);
+                        put_bytes(&mut buf, &mut k, b" skip_ist=");
+                        put_dec_u64(&mut buf, &mut k, rs);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
+                }
                 // #173 Phase 5: gate-split rescue + claim-helper counters.
                 // Emit unconditionally so A/B comparison runs (gate OFF vs ON)
                 // both produce a baseline trail for the same time interval.

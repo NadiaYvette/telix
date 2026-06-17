@@ -342,6 +342,22 @@ pub fn get_rsp0() -> u64 {
     unsafe { (*tss_for(cpu)).rsp0 }
 }
 
+/// #208 B2 hot-path RSP0 refresh: set this CPU's TSS RSP0 and return the
+/// prior value, WITHOUT the diagnostic ring record (set_rsp0's
+/// record_rsp0_update writes two atomics — too heavy for the per-user-return
+/// iretq chokepoint).  Called from `rsp0_refresh_user_return` on every
+/// ring3 iretq so RSP0 can never be stale at the next user→kernel entry.
+#[inline]
+pub fn swap_rsp0_raw(rsp0: u64) -> u64 {
+    let cpu = smp::cpu_id() as usize;
+    unsafe {
+        let t = tss_for(cpu);
+        let old = (*t).rsp0;
+        (*t).rsp0 = rsp0;
+        old
+    }
+}
+
 /// #230: read a specific CPU's TSS RSP0 (sweep-time cross-CPU audit).
 pub fn tss_rsp0_for(cpu: usize) -> u64 {
     unsafe { (*tss_for(cpu)).rsp0 }
