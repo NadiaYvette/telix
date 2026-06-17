@@ -1009,6 +1009,14 @@ fn log_saved_sp_out_of_range(tid: u32, new_value: u64, kbase: u64, ksize: u64) {
     }
 }
 
+// #208/#233 x86_64 fp-chain scribble scanner gate.  When true, every
+// write_saved_sp walks the current rbp chain and flags the first
+// return-address slot holding a small constant / non-canonical value
+// (the wild-RIP scribble signature).  Whole-kstack coverage: catches the
+// scribble wherever it lands in a deep kernel call chain.
+#[cfg(target_arch = "x86_64")]
+const FP_CHAIN_SCAN_X86: bool = true;
+
 // #228 caller-frame probe: marked #[inline(never)] so write_saved_sp
 // has its own kstack frame and we can read the caller's frame at a
 // known SP offset above ours.  The 36-boot HW-WP hunt + 12-boot
@@ -1133,6 +1141,92 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
             // Caller's fp must be strictly above (higher addr) ours;
             // stack grows down so each frame's fp is at a higher
             // address than the callee's.  Break on regression.
+            if saved_fp <= fp {
+                break;
+            }
+            fp = saved_fp;
+        }
+    }
+    // #208/#233 x86_64 fp-chain walk.  With `-C force-frame-pointers=yes`
+    // every Rust prologue is `push rbp; mov rbp, rsp`, so rbp points AT the
+    // saved-caller-rbp slot:
+    //   [rbp + 0] = saved caller rbp (= caller's frame pointer)
+    //   [rbp + 8] = THIS frame's return address (what a later `ret` loads)
+    // (differs from rv64, whose s0 points 16 bytes higher.)  Walk the chain
+    // and validate each saved-ra: a kernel return address must live in
+    // [KERNEL_BASE, kernel_end_vma).  The observed #208 corruption plants a
+    // SMALL value (0x0 / 0x20 / 0x202) where a kernel-text address belongs;
+    // a later ret/iretq consumes it and jumps wild.  Flag the FIRST bogus
+    // ra (rate-limited) — this localizes the corruption to a specific call
+    // depth/frame without needing to know the fixed slot in advance.
+    #[cfg(target_arch = "x86_64")]
+    if FP_CHAIN_SCAN_X86 {
+        let kbase = crate::arch::x86_64::boot::KERNEL_BASE_VMA;
+        let kend = crate::arch::x86_64::boot::kernel_end_vma() as u64;
+        let mut fp: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, rbp",
+                out(reg) fp,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let mut logged_this_call = false;
+        for depth in 0..16u32 {
+            // Valid rbp while walking: low identity OR kstack region OR
+            // high-half boot/AP/IST stacks.  Mirrors the exception.rs #PF
+            // backtrace bounds.  Frame pointers are 8-byte aligned on x86.
+            let fp_ok_low = fp >= 0x1000 && fp < 0x8000_0000;
+            let fp_ok_kstack = fp >= 0xfffffe0000000000
+                && fp < 0xffffffff80000000;
+            let fp_ok_high = fp >= 0xffffffff80000000;
+            if !(fp_ok_low || fp_ok_kstack || fp_ok_high) || (fp & 7) != 0 {
+                break;
+            }
+            let saved_fp = unsafe { (fp as *const u64).read_volatile() };
+            let saved_ra =
+                unsafe { (fp.wrapping_add(8) as *const u64).read_volatile() };
+            // Natural chain bottom: both slots zero (page was zero-filled at
+            // spawn and we walked off the top).  Stop; not corruption.
+            if saved_ra == 0 && saved_fp == 0 {
+                break;
+            }
+            // SCRIBBLE signature (precise, low-false-positive): a small
+            // constant where a kernel-text address belongs (matches the
+            // observed 0x0/0x20/0x202) OR a non-canonical address.  Do NOT
+            // flag legit kernel-text addresses (ra in [kbase, kend)).
+            let non_canonical = {
+                // canonical: top 17 bits all equal sign bit (bit 47).
+                let hi = saved_ra >> 47;
+                hi != 0 && hi != 0x1FFFF
+            };
+            let ra_is_bogus =
+                (saved_ra != 0 && saved_ra < 0x10000) || non_canonical;
+            // Also worth flagging a value that is neither a small scribble
+            // nor inside kernel text, but only if it's clearly not a
+            // userspace/other-mapping return path; keep it conservative and
+            // restrict to the scribble signature above to avoid false fires.
+            let _ = (kbase, kend);
+            if ra_is_bogus && !logged_this_call {
+                logged_this_call = true;
+                static FP_CHAIN_LOG_X86: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = FP_CHAIN_LOG_X86.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    crate::println!(
+                        "KSTACK-FP-CHAIN-BAD-RA-X86: depth={} fp={:#x} saved_ra={:#x} saved_fp={:#x} tid={} new_sp={:#x}",
+                        depth,
+                        fp,
+                        saved_ra,
+                        saved_fp,
+                        thread.id,
+                        new_value,
+                    );
+                }
+            }
+            // Caller's fp must be strictly above (higher addr) ours; stack
+            // grows down so each frame's fp is higher than the callee's.
+            // Break on regression.
             if saved_fp <= fp {
                 break;
             }

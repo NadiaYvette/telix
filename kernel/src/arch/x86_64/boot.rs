@@ -29,6 +29,17 @@ pub fn kernel_end_addr() -> usize {
     unsafe { (&__kernel_end as *const u8 as usize) - KERNEL_VIRT_OFFSET }
 }
 
+/// High-half VMA past the end of the kernel image (the `__kernel_end` symbol
+/// address directly, NOT the PA).  Used as the upper bound of the legitimate
+/// kernel-text return-address range for the #208/#233 fp-chain scribble
+/// detector (see `write_saved_sp`).
+pub fn kernel_end_vma() -> usize {
+    unsafe { &__kernel_end as *const u8 as usize }
+}
+
+/// High-half base VMA of the kernel image (linker `KERNEL_BASE`).
+pub const KERNEL_BASE_VMA: u64 = 0xFFFFFFFF80100000;
+
 /// Rust entry point called from assembly (Multiboot) or EFI stub.
 #[unsafe(no_mangle)]
 pub extern "C" fn _rust_entry(boot_info: usize) -> ! {

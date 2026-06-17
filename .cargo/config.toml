@@ -17,7 +17,10 @@ rustflags = [
 
 [target.x86_64-unknown-none]
 runner = "tools/run-qemu-x86.sh"
-rustflags = ["-C", "link-arg=-Tkernel/src/arch/x86_64/linker.ld", "-C", "code-model=kernel", "-C", "relocation-model=static"]
+# #208/#233 debug: force frame pointers so write_saved_sp can walk the
+# kstack call chain via the rbp chain and validate every saved-ra slot,
+# and so the #PF RBP backtrace (exception.rs) produces real chains.
+rustflags = ["-C", "link-arg=-Tkernel/src/arch/x86_64/linker.ld", "-C", "code-model=kernel", "-C", "relocation-model=static", "-C", "force-frame-pointers=yes"]
 
 [target.loongarch64-unknown-none]
 runner = "tools/run-qemu-loongarch64.sh"

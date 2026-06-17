@@ -3010,6 +3010,17 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
                     put_hex_u64(&mut buf, &mut k, saved_rbp);
                     put_bytes(&mut buf, &mut k, b" caller_rip=");
                     put_hex_u64(&mut buf, &mut k, saved_rip);
+                    // #208/#233: flag a kernel return-address slot holding the
+                    // wild-RIP scribble signature (small constant where a
+                    // kernel-text addr belongs, e.g. 0x0/0x20/0x202, or a
+                    // non-canonical value).  Pinpoints the scribbled frame.
+                    let ra_non_canon = {
+                        let hi = saved_rip >> 47;
+                        hi != 0 && hi != 0x1FFFF
+                    };
+                    if (saved_rip != 0 && saved_rip < 0x10000) || ra_non_canon {
+                        put_bytes(&mut buf, &mut k, b" BAD-RA-SLOT");
+                    }
                     put_byte(&mut buf, &mut k, b'\n');
                     crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
                 }
