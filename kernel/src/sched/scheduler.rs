@@ -8384,6 +8384,31 @@ pub fn block_current(_reason: BlockReason) {
     // is a spin-wait — the thread never goes through try_switch on wake-up,
     // so FSBASE would otherwise stay stale until a context switch.
     crate::arch::cpu::set_tls(tref.tls_base);
+    // #208 root-cause fix: block_current bypasses try_switch on wake-up (see
+    // the FSBASE note above) — so TSS.RSP0 is ALSO left stale.  While we were
+    // parked, a timer-driven try_switch ran another thread on this CPU and set
+    // TSS.RSP0 to THAT thread's kstack top.  We resume here without going
+    // through set_current_thread, so RSP0 keeps pointing at the other thread's
+    // kstack.  block_current returns up to the syscall handler → iretq back to
+    // userspace; this thread's NEXT user→kernel transition (int 0x80) would
+    // then push its entire iret frame (vector 0x80, RFLAGS 0x202, user CS/SS/
+    // RSP/RIP) onto the WRONG thread's live kstack, scribbling a return-address
+    // or spilled-register slot → the Phase-5 wild-RIP / corrupted-tid (#208)
+    // family.  This is the missing twin of the FSBASE re-apply: re-establish
+    // TSS.RSP0 for THIS thread before returning.  (Caught by TSS-RSP0-AUDIT
+    // pointing at a peer's kstack; DEFENSIVE-RSP0-FIX never fired because that
+    // re-check lives only in finalize_release_after_stack_switch, which the
+    // block_current wake path skips.)
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kbase = tref.stack_base;
+        if kbase != 0 {
+            crate::arch::trapframe::update_kernel_stack(
+                tid as u32,
+                kbase + kstack_size(),
+            );
+        }
+    }
     // #136 saved_sp re-sync: while we were spinning, timer-driven
     // try_switch (line 3046) may have overwritten saved_sp with a deep
     // kernel SP from the timer trap entry.  After wake-up the caller
