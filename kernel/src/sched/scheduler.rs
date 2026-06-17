@@ -1015,7 +1015,7 @@ fn log_saved_sp_out_of_range(tid: u32, new_value: u64, kbase: u64, ksize: u64) {
 // (the wild-RIP scribble signature).  Whole-kstack coverage: catches the
 // scribble wherever it lands in a deep kernel call chain.
 #[cfg(target_arch = "x86_64")]
-const FP_CHAIN_SCAN_X86: bool = true;
+const FP_CHAIN_SCAN_X86: bool = false;
 
 // #228 caller-frame probe: marked #[inline(never)] so write_saved_sp
 // has its own kstack frame and we can read the caller's frame at a
