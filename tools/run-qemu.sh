@@ -43,6 +43,20 @@ QEMU_ARGS=(
     -smp "$SMP"
 )
 
+# Optional: deterministic TCG virtual time via -icount.  Under plain (MTTCG)
+# TCG the guest's notion of time tracks host wall-clock, so a slow/contended
+# host delivers the programmed one-shot timer late or coalesced — the "TCG
+# timer jitter" that makes non-x86 boots vary 10x run-to-run and intermittently
+# wedge.  -icount derives the guest clock (and thus CNTPCT + timer delivery)
+# from the executed-instruction stream instead, making timing reproducible
+# relative to guest execution.  It requires single-threaded TCG, so force
+# thread=single when enabled.  TELIX_ICOUNT=auto (QEMU adapts ratio toward
+# realtime) or a fixed shift N (2^N ns per instruction, fully deterministic).
+if [ -n "${TELIX_ICOUNT:-}" ]; then
+    QEMU_ARGS+=(-icount "shift=${TELIX_ICOUNT}")
+    QEMU_ARGS+=(-accel tcg,thread=single)
+fi
+
 # Add virtio-blk disk if test.img exists.
 DISK_ARGS=()
 if [ -f "$DISK_IMG" ]; then
