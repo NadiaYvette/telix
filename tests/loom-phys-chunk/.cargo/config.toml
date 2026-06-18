@@ -1,0 +1,18 @@
+# Hard-wire `--cfg loom` + the host triple so `cargo test` enables loom's
+# instrumented atomics (the crate is `#![cfg(loom)]`-gated, so WITHOUT this
+# every test silently compiles to nothing — "running 0 tests") and overrides
+# the parent kernel config's no_std cross target.  Mirrors tests/loom-block-park.
+#
+# NOTE: in-tree `cargo test` still fails (the repo-root .cargo/config
+# `build-std=["core"]` MERGES with the `build-std=[]` below — cargo unions
+# config arrays — yielding "duplicate lang item `sized`").  Run from a copy
+# OUTSIDE the repo:  cp -r tests/loom-phys-chunk /tmp/ && cd /tmp/loom-phys-chunk
+#                    && cargo test --release            # default (fast) tests
+#                    && cargo test --release -- --ignored buggy_apg_vs_cao_race
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []
+build-std-features = []

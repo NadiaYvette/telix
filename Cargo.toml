@@ -12,4 +12,5 @@ exclude = [
     "tests/loom-clone-thread-iretq",
     "tests/loom-claim-helper",
     "tests/loom-block-park",
+    "tests/loom-phys-chunk",
 ]

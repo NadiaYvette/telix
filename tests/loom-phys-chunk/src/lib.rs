@@ -804,3 +804,211 @@ mod mode_switch_tests {
         });
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// #228 / #263 — alloc_pages_inner fc==64 vs chunk_alloc_one race model
+// ─────────────────────────────────────────────────────────────────────
+//
+// The mode_switch_tests above model TWO chunk_alloc_one callers racing the
+// fc==64 transition, BOTH choosing the SAME bitmap page (bmp_pg = 0/1).  That
+// catches the "stale bitmap CONTENT clobbers a cas_bitmap modification" shape
+// fixed by 93be952.
+//
+// The companion fix 77cde8e closed a DIFFERENT shape, and it is the one this
+// model adds: `alloc_pages_inner` (a multi-page allocation, under BULK_LOCK)
+// racing a lock-free single-page `chunk_alloc_one` on the SAME all-free chunk,
+// where the two transition paths choose DIFFERENT bitmap pages:
+//   * chunk_alloc_one fc==64 (phys.rs ~1035) picks bmp_pg = 1 (page 0 handed
+//     to the caller, page 1 reserved for the bitmap).
+//   * alloc_pages_inner fc==64 (phys.rs:1431) picks bmp_pg = `need` (pages
+//     0..need-1 handed out as the contiguous block, page `need` reserved).
+//
+// THE BUG (pre-77cde8e): each writer did `write_bitmap(its_bmp_pg)` BEFORE the
+// state CAS.  The CAS loser's stale write lands AFTER the winner publishes a
+// state naming the winner's DIFFERENT bmp_pg.  Now the loser's page is, per the
+// published state, an ordinary FREE DATA page — but it physically holds bitmap
+// bytes.  A future allocator hands that page to a consumer; the consumer's data
+// and the stale bitmap bytes alias → silent corruption (the #228 kstack-PA /
+// cafe-fault family).  The invariant the existing model checks (bitmap
+// count_ones == fc) does NOT catch this — both layouts are internally
+// consistent; the damage is a data page carrying metadata bytes.
+//
+// We model it directly: track, per page, whether bitmap-metadata bytes were
+// written into it (`meta_written`).  The invariant is sharper than the
+// existing one:
+//
+//     at quiescence, the set of pages carrying metadata bytes == { the bmp_pg
+//     named in the published state }.
+//
+// Any page with metadata bytes that the state calls a data page is a clobbered
+// data page → assertion fires.  THE FIX (TRANSITIONING bit) makes the loser
+// observe the in-progress transition and skip writing, so only the winner's
+// bmp_pg ever carries metadata.
+
+struct ChunkApg {
+    state: AtomicU64,
+    // Bit p set = bitmap-metadata bytes were physically written into page p.
+    // (We only care about the two candidate bitmap pages, 1 and `need`.)
+    meta_written: AtomicU64,
+}
+
+impl ChunkApg {
+    fn new_all_free() -> Self {
+        Self {
+            state: AtomicU64::new(make_state_ms(64, false, 0)),
+            meta_written: AtomicU64::new(0),
+        }
+    }
+    fn published_bmp_pg(&self) -> Option<u32> {
+        let s = self.state.load(Ordering::Acquire);
+        if state_has_bitmap(s) {
+            Some(((s >> STATE_BMP_PG_SHIFT) & 0x3f) as u32)
+        } else {
+            None
+        }
+    }
+}
+
+/// BUGGY fc==64 transition: `write_bitmap(my_bmp_pg)` BEFORE the state CAS, not
+/// undone on CAS-loss.  `my_bmp_pg` differs between the two callers (the
+/// alloc_pages_inner-vs-chunk_alloc_one distinction).
+fn apg_transition_buggy(c: &ChunkApg, my_bmp_pg: u32) {
+    loop {
+        let s = c.state.load(Ordering::Acquire);
+        if state_fc(s) != 64 {
+            // Transition already done by the other caller — nothing to do.
+            return;
+        }
+        // THE RACY WRITE: deposit metadata bytes into our chosen page first.
+        c.meta_written
+            .fetch_or(1u64 << my_bmp_pg, Ordering::Release);
+        let new_s = make_state_ms(62, true, my_bmp_pg);
+        if c
+            .state
+            .compare_exchange(s, new_s, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return; // winner
+        }
+        // Lost the CAS.  The stale metadata bytes we wrote are NOT undone —
+        // and our bmp_pg may differ from the winner's.  Retry sees fc!=64.
+    }
+}
+
+/// FIXED fc==64 transition: TRANSITIONING-bit lock (mirrors phys.rs:1467).
+/// CAS into TRANSITIONING first; only the winner writes metadata; the loser
+/// observes TRANSITIONING (or the published bitmap) and never writes.
+fn apg_transition_fixed(c: &ChunkApg, my_bmp_pg: u32) {
+    loop {
+        let s = c.state.load(Ordering::Acquire);
+        if s & STATE_TRANSITIONING_BIT != 0 {
+            // Another caller is mid-transition — skip (the real slow-path scan
+            // moves on; the next observation sees has_bitmap and allocates).
+            return;
+        }
+        if state_fc(s) != 64 {
+            return; // already transitioned
+        }
+        let trans_s = s | STATE_TRANSITIONING_BIT;
+        if c
+            .state
+            .compare_exchange(s, trans_s, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        // Winner: exclusive until the final CAS.  Write metadata, then publish.
+        c.meta_written
+            .fetch_or(1u64 << my_bmp_pg, Ordering::Release);
+        let final_s = make_state_ms(62, true, my_bmp_pg);
+        let r = c
+            .state
+            .compare_exchange(trans_s, final_s, Ordering::AcqRel, Ordering::Acquire);
+        assert!(r.is_ok(), "transitioning->final CAS unexpectedly lost");
+        return;
+    }
+}
+
+#[cfg(test)]
+mod alloc_pages_mode_switch_tests {
+    use super::*;
+
+    // alloc_pages_inner(order=1) wants a 2-page block → bmp_pg = need = 2.
+    const APG_BMP_PG: u32 = 2;
+    // chunk_alloc_one fc==64 → bmp_pg = 1.
+    const CAO_BMP_PG: u32 = 1;
+
+    /// The sharper invariant: every page carrying metadata bytes must be THE
+    /// page the published state names as the bitmap page.  A metadata-carrying
+    /// page that the state calls a data page is a clobbered data page.
+    fn assert_no_clobbered_data_page(c: &ChunkApg) {
+        let meta = c.meta_written.load(Ordering::Acquire);
+        let published = c
+            .published_bmp_pg()
+            .expect("a transition must have published a bitmap");
+        let expected = 1u64 << published;
+        assert_eq!(
+            meta, expected,
+            "clobbered data page: metadata bytes in pages {:#b} but state's \
+             bmp_pg={} (expected only {:#b}) — a CAS-loser wrote bitmap bytes \
+             into a page the winner published as free data",
+            meta, published, expected
+        );
+    }
+
+    /// BUGGY: alloc_pages_inner (bmp_pg=2) races chunk_alloc_one (bmp_pg=1) on
+    /// the same all-free chunk.  Loom finds the interleaving where the loser's
+    /// stale write leaves metadata in a page the winner calls data.
+    #[test]
+    #[ignore = "loom exploration of the apg-vs-cao different-bmp_pg race; minutes"]
+    fn buggy_apg_vs_cao_race() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let c = Arc::new(ChunkApg::new_all_free());
+            let ca = c.clone();
+            let cb = c.clone();
+            let ta = thread::spawn(move || apg_transition_buggy(&ca, APG_BMP_PG));
+            let tb = thread::spawn(move || apg_transition_buggy(&cb, CAO_BMP_PG));
+            ta.join().unwrap();
+            tb.join().unwrap();
+            assert_no_clobbered_data_page(&c);
+        });
+    }
+
+    /// FIXED: same race under the TRANSITIONING-bit lock.  Loom explores all
+    /// interleavings without finding a clobbered data page.
+    #[test]
+    #[ignore = "loom exploration of the fixed apg-vs-cao path; minutes"]
+    fn fixed_apg_vs_cao_race() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let c = Arc::new(ChunkApg::new_all_free());
+            let ca = c.clone();
+            let cb = c.clone();
+            let ta = thread::spawn(move || apg_transition_fixed(&ca, APG_BMP_PG));
+            let tb = thread::spawn(move || apg_transition_fixed(&cb, CAO_BMP_PG));
+            ta.join().unwrap();
+            tb.join().unwrap();
+            assert_no_clobbered_data_page(&c);
+        });
+    }
+
+    /// Cheap 2-thread smoke (no #[ignore]) so the module is always exercised
+    /// in a default `cargo test` run.  Same actors, default loom exploration.
+    /// With the FIXED transition the invariant must always hold.
+    #[test]
+    fn fixed_apg_vs_cao_smoke() {
+        loom::model(|| {
+            let c = Arc::new(ChunkApg::new_all_free());
+            let ca = c.clone();
+            let cb = c.clone();
+            let ta = thread::spawn(move || apg_transition_fixed(&ca, APG_BMP_PG));
+            let tb = thread::spawn(move || apg_transition_fixed(&cb, CAO_BMP_PG));
+            ta.join().unwrap();
+            tb.join().unwrap();
+            assert_no_clobbered_data_page(&c);
+        });
+    }
+}
