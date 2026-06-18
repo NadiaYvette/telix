@@ -245,6 +245,30 @@ static mut IST_STACKS_NMI: [IstStack; MAX_IST_CPUS] = {
     [EMPTY; MAX_IST_CPUS]
 };
 
+/// IST slot 5 — used for #GP (General Protection, vector 13).  Diagnostics
+/// backstop for the #208 corruption family: a wild-RIP / control-flow
+/// corruption typically surfaces as a #GP, and if the kstack is itself
+/// trashed (the thing #208 corrupts) the handler needs a guaranteed-good
+/// stack to run + dump on.  #GP routes through `exception_fault` (the same
+/// diverging `-> !` handler #DF/#SS already use on IST 1/2), which never
+/// iretqs back through the IST frame and never pins an SP — so reuse /
+/// re-entrancy concerns that apply to #PF (IST 4, has a park path) do NOT
+/// apply here.  Interrupt gate ⇒ IRQs off during handling ⇒ no timer
+/// try_switch can save an IST-stack SP as a thread's saved_sp.
+static mut IST_STACKS_GP: [IstStack; MAX_IST_CPUS] = {
+    const EMPTY: IstStack = IstStack { data: [0; IST_STACK_SIZE] };
+    [EMPTY; MAX_IST_CPUS]
+};
+
+/// IST slot 6 — used for #UD (Invalid Opcode, vector 6).  Same rationale as
+/// IST 5 (#GP): the #208 family also surfaces as #UD at wild RIPs, and the
+/// #UD arm ends in the same `exception_fault` divergence.  Dedicated stack so
+/// a #UD on a corrupted/overflowed kstack still produces a clean post-mortem.
+static mut IST_STACKS_UD: [IstStack; MAX_IST_CPUS] = {
+    const EMPTY: IstStack = IstStack { data: [0; IST_STACK_SIZE] };
+    [EMPTY; MAX_IST_CPUS]
+};
+
 /// #237 IST detection: check whether `rsp` falls inside any per-CPU IST
 /// stack's range.  Called from `x86_exception_handler` at entry to set
 /// the is_on_ist flag that probes can use to skip kstack-bound checks.
@@ -278,6 +302,14 @@ pub fn is_on_ist(rsp: u64) -> Option<(u8, u8)> {
             if rsp >= base && rsp < base + stack_size {
                 return Some((4, slot as u8));
             }
+            let base = IST_STACKS_GP[slot].data.as_ptr() as u64;
+            if rsp >= base && rsp < base + stack_size {
+                return Some((5, slot as u8));
+            }
+            let base = IST_STACKS_UD[slot].data.as_ptr() as u64;
+            if rsp >= base && rsp < base + stack_size {
+                return Some((6, slot as u8));
+            }
         }
         None
     }
@@ -296,6 +328,8 @@ pub fn ist_stack_va_range() -> (u64, u64) {
             IST_STACKS_SS[0].data.as_ptr() as u64,
             IST_STACKS_NMI[0].data.as_ptr() as u64,
             IST_STACKS_PF[0].data.as_ptr() as u64,
+            IST_STACKS_GP[0].data.as_ptr() as u64,
+            IST_STACKS_UD[0].data.as_ptr() as u64,
         ];
         let mut min_va = u64::MAX;
         let mut max_va = 0u64;
@@ -672,6 +706,12 @@ pub fn init() {
         // IST[3] → dedicated #PF stack (#216 Phase 3).
         (*tss_for(0)).ist[3] =
             IST_STACKS_PF[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+        // IST[4] → dedicated #GP stack (diagnostics backstop, vector 13).
+        (*tss_for(0)).ist[4] =
+            IST_STACKS_GP[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+        // IST[5] → dedicated #UD stack (diagnostics backstop, vector 6).
+        (*tss_for(0)).ist[5] =
+            IST_STACKS_UD[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
     }
 
     load_gdt_for_cpu(0);
@@ -699,6 +739,12 @@ pub fn init_ap(cpu: u32) {
             // IST[3] → dedicated #PF stack (#216 Phase 3).
             (*tss_for(cpu)).ist[3] =
                 IST_STACKS_PF[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+            // IST[4] → dedicated #GP stack (diagnostics backstop, vector 13).
+            (*tss_for(cpu)).ist[4] =
+                IST_STACKS_GP[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+            // IST[5] → dedicated #UD stack (diagnostics backstop, vector 6).
+            (*tss_for(cpu)).ist[5] =
+                IST_STACKS_UD[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
         }
     }
 
