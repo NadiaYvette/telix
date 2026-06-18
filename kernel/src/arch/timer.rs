@@ -152,14 +152,21 @@ static PER_CPU_SYNTHETIC_STEAL_NS: [core::sync::atomic::AtomicU64; SS_MAX_CPUS] 
     [Z; SS_MAX_CPUS]
 };
 
-/// Gate, default OFF.  When on: `program_oneshot_ns` records deadlines,
-/// `note_tick_fired` accumulates synthetic steal, and `vcpu_runtime_ns`'s
-/// fallback subtracts it.  x86_64-with-pvclock is unaffected (it returns from
-/// the pvclock−real-steal branch above, never reaching the fallback).
-/// A/B-toggle to validate (cf. tools/run-qemu.sh TELIX_ICOUNT for clean
-/// non-x86 measurement).
+/// Gate.  When on: `program_oneshot_ns` records deadlines, `note_tick_fired`
+/// accumulates synthetic steal, and `vcpu_runtime_ns`'s fallback subtracts it.
+///
+/// Default ON for aarch64 only — validated 2026-06-18 by an oversubscribed
+/// MTTCG efficacy A/B (N=8/arm): clamp ON caps the spurious-rescue tail
+/// (RESCUE-STUCK-PENDING max 19→7, storms ≥10 1→0, total −33%) while server
+/// bringup progress is identical (19–20 spawns/boot → no masking of real
+/// starvation), 0 faults.  x86_64 OFF: it has real PV steal-time (pvclock −
+/// MSR_KVM_STEAL_TIME) and never reaches the clamped fallback, so the clamp is
+/// redundant there.  riscv64/loong/mips OFF pending their own per-arch smoke
+/// (the mechanism is arch-neutral + safe-by-construction, so flipping them on
+/// after a smoke is low-risk).  A/B-toggle this literal to re-measure (cf.
+/// tools/run-qemu.sh TELIX_ICOUNT for clean deterministic measurement).
 pub static SYNTHETIC_STEAL_CLAMP: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+    core::sync::atomic::AtomicBool::new(cfg!(target_arch = "aarch64"));
 
 /// Tick lateness beyond this is treated as a stall (filters normal scheduling
 /// jitter, which under TCG can be a few ms).
