@@ -8369,12 +8369,23 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 /// load-bearing constraints this implements.  A/B-toggle to validate.
 // Default ON for x86_64 (validated 2026-06-18: 6+ pthread-storm boots, 0
 // double-dispatch / 0 wild-RIP vs a 32-DD/1231-spawn gate-OFF baseline, two
-// boots reaching Phase 145e past the chronic Phase-5 wall).  Default OFF on
-// aarch64/riscv64/loongarch64 until per-arch validated — those arches call
-// finalize_release_after_stack_switch from their own trap handlers and have
-// not been A/B'd with the real-park path yet.  Flip per-arch after boots.
+// boots reaching Phase 145e past the chronic Phase-5 wall).  Now also ON for
+// aarch64 (2026-06-18): enabling real-park exposed an SMP page-table-teardown
+// use-after-free in aspace::destroy (free_page_table_tree zeroes the shared
+// L1[3] SLAB_THREAD link + frees the per-aspace L0/L1 pages while a peer CPU
+// still holds that TTBR0 — timer IRQ in check_sleep_timers — → EL1 level-1
+// translation fault on a Thread VA).  Fixed by RCU-deferring all PT-tree
+// reclamation to a grace period.  Validated: a THRASH-to-completion stress
+// boot ran 1120 task teardowns / 36 real-parks / 0 EL1 Data Aborts.  x86_64 was
+// always immune (kernel + Thread mappings in shared higher-half PML4 entries
+// teardown never touches).  riscv64/loongarch64 stay OFF until per-arch
+// validated — they call finalize_release_after_stack_switch from their own trap
+// handlers and have not been A/B'd with the real-park path yet.
 pub static BLOCK_REAL_PARK: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(cfg!(target_arch = "x86_64"));
+    core::sync::atomic::AtomicBool::new(cfg!(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64"
+    )));
 
 /// Block the current thread with the given reason.
 /// The thread will be preempted on the next timer tick and will not

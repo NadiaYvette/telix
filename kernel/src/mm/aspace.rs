@@ -519,10 +519,6 @@ pub fn destroy(id: ASpaceId) {
     // Step 2: Lock entry and clean up.
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
 
-    let pt_root = guard.page_table_root;
-    let fg = guard.fork_group;
-    guard.fork_group = core::ptr::null_mut();
-
     // Destroy backing objects for all VMAs.
     {
         let mut it = guard.vmas.iter();
@@ -533,29 +529,52 @@ pub fn destroy(id: ASpaceId) {
         }
     }
     guard.vmas.clear();
-    // Mark as dead so concurrent lock_aspace() sees id=0.
+    // Mark as dead so concurrent lock_aspace() sees id=0.  page_table_root and
+    // fork_group are deliberately RETAINED in the (now-dead) entry so the RCU
+    // callback can tear the page-table tree down after a grace period — see
+    // rcu_free_aspace_callback and the #261/#267 note below.
     guard.id = 0;
-    guard.page_table_root = 0;
     drop(guard);
 
-    // Step 3: Free page table tree (uses ForkGroup for shared markers).
-    if pt_root != 0 {
-        free_page_table_tree(pt_root, fg);
-    }
-
-    // Step 4: Release ForkGroup reference.
-    ForkGroup::release(fg);
-
-    // Step 5: Destroy the port (removes from PORT_ART, wakes waiters).
+    // Step 3: Destroy the port (removes from PORT_ART, wakes waiters).
     crate::ipc::port::destroy(id);
 
-    // Step 6: Defer-free the slab entry after RCU grace period.
+    // Step 4: Defer ALL reclamation — page-table tree, fork group, and the
+    // slab entry — to an RCU grace period.
+    //
+    // #261/#267: free_page_table_tree() zeroes L1[3] (the globally-shared
+    // SLAB_THREAD_REGION L2 link) and frees the per-aspace L0/L1 table pages.
+    // On SMP another CPU may STILL hold this aspace in TTBR0 — e.g. a timer IRQ
+    // running check_sleep_timers() on a thread of the exiting task — and its
+    // in-flight table walk for a Thread VA (0xC000_0000+) would then take an
+    // EL1 level-1 translation fault: the L1[3] it needs has just been zeroed,
+    // or the L1 page freed and reused.  x86_64 is immune because its kernel +
+    // Thread mappings live in shared higher-half PML4 entries that teardown
+    // never touches; aarch64 packs kernel-identity + L1[3] into a per-aspace
+    // L1 table that teardown zeroes and frees.  After a grace period every CPU
+    // has context-switched (reloading TTBR0) at least once, so none can still
+    // be walking this tree.
     crate::sync::rcu::rcu_defer_free(entry_ptr as usize, rcu_free_aspace_callback);
 }
 
-/// RCU callback to free a slab-allocated ASpaceEntry.
+/// RCU callback: reclaim a destroyed address space after a grace period.
+/// By now no CPU can still hold this aspace's TTBR0 (every CPU has passed a
+/// quiescent state, reloading TTBR0), so it is finally safe to zero L1[3] and
+/// free the page-table tree.  Then release the fork-group reference and free
+/// the slab-allocated ASpaceEntry.
 fn rcu_free_aspace_callback(ptr: usize) {
-    free_entry(ptr as *mut ASpaceEntry);
+    let entry_ptr = ptr as *mut ASpaceEntry;
+    // The entry is dead (id=0) and the grace period has elapsed, so we are the
+    // sole accessor; the lock is uncontended.
+    let (pt_root, fg) = {
+        let guard = unsafe { (*entry_ptr).inner.lock() };
+        (guard.page_table_root, guard.fork_group)
+    };
+    if pt_root != 0 {
+        free_page_table_tree(pt_root, fg);
+    }
+    ForkGroup::release(fg);
+    free_entry(entry_ptr);
 }
 
 /// Reset an address space for execve: destroy all VMAs and backing objects,
