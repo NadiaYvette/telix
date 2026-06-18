@@ -8378,13 +8378,19 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 // reclamation to a grace period.  Validated: a THRASH-to-completion stress
 // boot ran 1120 task teardowns / 36 real-parks / 0 EL1 Data Aborts.  x86_64 was
 // always immune (kernel + Thread mappings in shared higher-half PML4 entries
-// teardown never touches).  riscv64/loongarch64 stay OFF until per-arch
-// validated — they call finalize_release_after_stack_switch from their own trap
-// handlers and have not been A/B'd with the real-park path yet.
+// teardown never touches).  Now also ON for loongarch64 (2026-06-18): an A/B
+// (2 ON vs 2 OFF boots) confirmed real-park eliminates the #208 double-dispatch
+// on loong too (TORN-BLOCK 9-10 → 0, park engaged).  It exposes a separate
+// downstream loong userspace Address Error (era=0x100000c6c) which is a
+// pre-existing user-fault-handling gap, NOT a real-park regression.  riscv64 +
+// mips64 stay OFF until per-arch validated — they call finalize_release_after_
+// stack_switch from their own trap handlers but have not been A/B'd yet
+// (mips64's hook was wired in 9bcfe48; riscv64 also carries open #251).
 pub static BLOCK_REAL_PARK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(cfg!(any(
         target_arch = "x86_64",
-        target_arch = "aarch64"
+        target_arch = "aarch64",
+        target_arch = "loongarch64"
     )));
 
 /// Block the current thread with the given reason.
