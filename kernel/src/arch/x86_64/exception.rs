@@ -1491,12 +1491,17 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     // the previous handler's `mov rsp,rax` has already moved us off
     // prev's kstack.
     crate::sched::scheduler::finalize_release_after_stack_switch();
-    // #233 (1) Dynamic DR1: arm the watchpoint to THIS handler's outer
-    // ret-addr slot.  Catches any local-CPU writer that scribbles the
-    // slot during this handler's execution.  Disarmed at handler exit
-    // via the Drop guard `_dr1_guard` below so we don't trigger on
-    // legitimate iretq frame writes from later code.
-    crate::arch::x86_64::gdt::dr1_set_watch_write_qword(frame_sp - 8);
+    // #208 DR0-on-victim probe (2026-06-17): repoint the per-handler DR1
+    // arm at the DETERMINISTIC recurring victim slot SLOT_WATCH_VA
+    // (0xfffffe00049ff608) instead of this handler's frame_sp-8.  Every CPU
+    // arms DR1 on the victim during handler execution, so the cross-thread
+    // wild WRITE (which happens in kernel context = inside some handler)
+    // traps via #DB and the b1 branch below logs the writer's RIP + cpu +
+    // tid + the value being written.  Disarmed at handler exit by Dr1Guard
+    // (re-armed next entry) to bound recursion risk.  Revert the target to
+    // `frame_sp - 8` to restore the #233 ret-slot watch.
+    crate::arch::x86_64::gdt::dr1_set_watch_write_qword(
+        crate::arch::x86_64::gdt::SLOT_WATCH_VA);
     let _dr1_guard = Dr1Guard;
     // #233 (4) NMI-in-handler probe: mark this CPU as "in handler".
     // NMI vector checks this and logs if it fires while we're here.
@@ -1808,13 +1813,27 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                 } else {
                     (3u32, crate::arch::x86_64::gdt::SLOT_WATCH_VA_3)
                 };
-                {
+                // #208 probe: the qword just written to the watched slot
+                // (#DB on a data write is a trap → fires after the store, so
+                // this reads the value the writer deposited).  A wild value
+                // (0x0, a stack VA, 0x20/0x202) vs a kernel-text return addr
+                // is the discriminator that separates the corruption writer
+                // from the victim thread's own legitimate stack writes.
+                let slot_val = unsafe { core::ptr::read_volatile(va as *const u64) };
+                // Noise filter: the watched slot 0x...128 is a return-address
+                // slot, written by the legit `call` with a kernel-text retaddr
+                // (0xffffffff8...) on every spawn (~1000/boot).  Only the WILD
+                // write deposits a non-kernel-text value (kstack 0xfffffe00...,
+                // user 0x1...., 0x0, or small).  Log only those; always re-arm.
+                if slot_val < 0xffffffff_80000000u64 {
                     let mut buf = [0u8; 192];
                     let mut k = 0;
                     put_bytes(&mut buf, &mut k, b"DR-HIT-SLOT: dr=");
                     put_dec_u64(&mut buf, &mut k, which as u64);
                     put_bytes(&mut buf, &mut k, b" va=");
                     put_hex_u64(&mut buf, &mut k, va);
+                    put_bytes(&mut buf, &mut k, b" val=");
+                    put_hex_u64(&mut buf, &mut k, slot_val);
                     put_bytes(&mut buf, &mut k, b" rip=");
                     put_hex_u64(&mut buf, &mut k, rip);
                     put_bytes(&mut buf, &mut k, b" cpu=");

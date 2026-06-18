@@ -484,12 +484,17 @@ pub fn dr0_ensure_watching(addr: u64) {
     dr0_set_watch_write_qword(addr);
 }
 
-/// #233 user-RIP-scribble investigation: arm DR1 on the recurring
-/// scribbled slot (0xfffffe00049ff608) so any write on this CPU
-/// triggers #DB with the writer's RIP.  Static target chosen because
-/// boots 2600/2623/2627/2640 all hit THIS exact VA — strongly
-/// deterministic via the kstack VA bump allocator.
-pub const SLOT_WATCH_VA: u64 = 0xfffffe00049ff608;
+/// #208 writer-catch (2026-06-17): watch the WRITTEN slot, not the jump
+/// target.  Boots fault with RIP=CR2=0xfffffe00049ff608 (NX instr-fetch) —
+/// that's the *target* a `ret` jumped to.  The full #PF dump shows the
+/// corrupted RETURN-ADDRESS slot is at rsp-8 = 0xfffffe00049ff128, which
+/// holds the wild value 0xfffffe00049ff608 (a stack pointer).  So arm DR1
+/// on 0x...128 for writes: the legit `call` into create_thread_in_task
+/// writes a kernel-text retaddr there, then the corruption overwrites it
+/// with 0x...608 — that second write (val=0xfffffe00049ff608) is the wild
+/// writer, and its frame.rip() names the culprit.  Deterministic across
+/// boots (rsp=0x...049ff130 at fault in drh1/drh4 + earlier).
+pub const SLOT_WATCH_VA: u64 = 0xfffffe00049ff128;
 static DR1_WATCH_ADDR: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
