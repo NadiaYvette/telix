@@ -1,0 +1,10 @@
+# Hard-wire `--cfg loom` + the host triple so `cargo test` enables loom's
+# instrumented atomics (the crate is `#![cfg(loom)]`-gated) and overrides the
+# parent kernel config's no_std cross target.  Mirrors tests/loom-park-state.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []
+build-std-features = []

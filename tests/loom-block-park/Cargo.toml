@@ -1,0 +1,28 @@
+[package]
+name = "loom-block-park"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) — see tests/loom-park-state
+# for the rationale (loom needs std; the kernel is no_std).
+#
+# This model proves the SINGLE-KSTACK-OWNER invariant for block_current's
+# new real-park path (#208 double-dispatch fix): a blocked thread is never
+# executing on two CPUs at once.  loom-park-state proves the complementary
+# property (the PARK_* handshake is wake-correct) but explicitly does NOT
+# model which CPU runs the woken thread — that gap is exactly this bug.
+
+[lib]
+# The crate doc comment contains an indented invariant line that rustdoc
+# would try to compile as a doctest; there are no real doctests here.
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
