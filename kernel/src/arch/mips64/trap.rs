@@ -159,6 +159,16 @@ pub fn program_oneshot(deadline_ns: u64) {
 /// Note: MIPS64 calling convention returns in $v0 ($2), so we return u64.
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(frame_sp: u64) -> u64 {
+    // #246 Fix D drain + #267 real-park wiring — mirror riscv64/trap.rs and
+    // loongarch64/trap.rs (themselves mirroring x86_64/exception.rs:1438).
+    // Every trap entry drains the per-CPU release slot so threads moved to
+    // ON_CPU_RELEASING by try_switch are CAS'd to ON_CPU_PENDING and become
+    // dispatchable on peer CPUs, and completes the real-park PARK_WOKEN
+    // arbitration on the parking CPU.  These are no-ops while BLOCK_REAL_PARK
+    // is off for mips64; wiring them here is the prerequisite for enabling
+    // real-park on mips64 once it can be boot-validated.
+    crate::sched::scheduler::finalize_release_after_stack_switch();
+    crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     let frame = unsafe { &mut *(frame_sp as *mut TrapFrame) };
     let cause = frame.cause;
     let exccode = (cause >> 2) & 0x1F;
