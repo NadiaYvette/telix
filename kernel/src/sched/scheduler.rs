@@ -6384,6 +6384,9 @@ pub fn tick(current_sp: u64) -> u64 {
         let cpu = smp::cpu_id() as usize;
         if cpu < smp::MAX_CPUS {
             let now = get_monotonic_ns();
+            // #nonx86 timer robustness (b): credit synthetic steal for a tick
+            // that fired late vs its programmed deadline (gated; no-op when off).
+            crate::arch::timer::note_tick_fired(cpu, now);
             let prev = PER_CPU_LAST_TICK_NS[cpu].swap(now, Ordering::Relaxed);
             // Companion vcpu_runtime stamp for paravirt-aware heuristics
             // (see PER_CPU_LAST_TICK_VCPU_NS docstring).  Updated in lockstep
