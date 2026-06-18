@@ -660,6 +660,54 @@ pub extern "C" fn finalize_release_after_stack_switch() {
             core::sync::atomic::Ordering::Release,
             core::sync::atomic::Ordering::Relaxed,
         );
+        // #208 real-park clear-role (gated; constraints 2 & 3 of the loom model
+        // `tests/loom-block-park`).  finalize runs at the next exception entry
+        // on this CPU, by which point the previous handler's `mov rsp, rax` has
+        // already moved us off `tid`'s kstack — so this is a safe off-kstack
+        // point for a block_current real-park thread.  Mirror clear_pending_switch
+        // (the IPC/sleep analog): clear stack_switch_pending, SeqCst-fence, then
+        // arbitrate PARK_WOKEN→PARK_NONE.  The clear MUST follow the off-kstack
+        // hand-off (it does — `mov rsp` already happened), and the fence between
+        // the store and the CAS pairs with wake_parked_thread's fence so a
+        // weak-memory waker can't both read a stale ssp=true (defer) AND lose the
+        // CAS (→ lost wakeup).  Fires ONLY for block_current threads: sleep/IPC
+        // parks never populate RELEASE_SLOT_TID and preempted Ready threads have
+        // stack_switch_pending=false, so the guard skips them.
+        if BLOCK_REAL_PARK.load(Ordering::Relaxed) {
+            let tref = thread_ref(tid);
+            if tref.stack_switch_pending.load(Ordering::Acquire) {
+                // Off the kstack now → disarm the gate so future wakes enqueue
+                // directly (their fast path will see ssp=false).
+                tref.stack_switch_pending.store(false, Ordering::Release);
+                core::sync::atomic::fence(Ordering::SeqCst);
+                // If a wake landed during the switch-off→here gap it advanced us
+                // to PARK_WOKEN and deferred its enqueue to us.  Claim it and
+                // enqueue locally (we are off the kstack, so this can't
+                // double-dispatch).  Otherwise PARK_COMMITTED (still parked, a
+                // later wake's fast path enqueues) or PARK_NONE (already drained).
+                if tref
+                    .park_state
+                    .compare_exchange(
+                        PARK_WOKEN,
+                        PARK_NONE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let prio = tref.prio.load(Ordering::Acquire);
+                    tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                    unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+                    record_trans(tid, 11, ThreadState::Ready, ON_CPU_PENDING);
+                    trace_sched(tid, 16); // 16 = blocked/ipc wake (deferred enqueue)
+                    set_enq_tag(8); // 8 = clear-role deferred enqueue
+                    percpu_enqueue(cpu as u32, prio, tid);
+                    smp::get(cpu as u32)
+                        .need_resched
+                        .store(true, Ordering::Release);
+                }
+            }
+        }
     }
     // #208 defensive TSS.RSP0 sync (Path C).  We just landed on next's
     // kstack.  If any earlier code path changed current_thread without
@@ -795,6 +843,57 @@ pub fn set_current_thread(pcpu: &smp::PerCpuData, tid: ThreadId) {
     }
     pcpu.current_thread.store(tid, Ordering::Release);
     record_current_thread_change(cpu, tid as u32);
+    // #208 double-dispatch detector: a non-idle thread must be `current` on at
+    // most ONE CPU at a time — its kstack is single-owner.  Scan peers; if
+    // another CPU already holds this tid as current_thread, two CPUs are
+    // executing the SAME kstack concurrently = the phantom-pending /
+    // dispatch-race window (#173, gated-OFF claim helper) in which the peer's
+    // frame writes scribble this thread's return-address slot with a stack
+    // pointer (the #208 wild-RIP family: ret-slot 0x...128 ← 0x...608).  Log
+    // it (thin-hex, rate-limited) to confirm the hypothesis + correlate with
+    // the wild-RIP #PF by tid/cpu.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let idle_here = pcpu.idle_thread_id.load(Ordering::Relaxed) as ThreadId;
+        if tid != idle_here && tid != 0 {
+            let ncpu = smp::num_cpus() as usize;
+            let mut c = 0usize;
+            while c < ncpu {
+                if c != cpu as usize
+                    && smp::get(c as u32).current_thread.load(Ordering::Acquire)
+                        as ThreadId
+                        == tid
+                {
+                    static DD_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = DD_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        use crate::arch::x86_64::serial::{
+                            put_byte, put_bytes, put_dec_u64, put_hex_u64,
+                        };
+                        let oc = thread_ref(tid).on_cpu.load(Ordering::Relaxed);
+                        let mut buf = [0u8; 128];
+                        let mut k = 0;
+                        put_bytes(&mut buf, &mut k, b"DOUBLE-DISPATCH: tid=");
+                        put_dec_u64(&mut buf, &mut k, tid as u64);
+                        put_bytes(&mut buf, &mut k, b" this_cpu=");
+                        put_dec_u64(&mut buf, &mut k, cpu as u64);
+                        put_bytes(&mut buf, &mut k, b" other_cpu=");
+                        put_dec_u64(&mut buf, &mut k, c as u64);
+                        put_bytes(&mut buf, &mut k, b" on_cpu=");
+                        put_hex_u64(&mut buf, &mut k, oc as u64);
+                        put_bytes(&mut buf, &mut k, b" n=");
+                        put_dec_u64(&mut buf, &mut k, n as u64);
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(
+                            &buf[..k.min(buf.len())],
+                        );
+                    }
+                }
+                c += 1;
+            }
+        }
+    }
 }
 
 /// #135 record one transition into the per-thread `trans_ring`.  Each
@@ -8253,6 +8352,27 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
     thread_ref(tid).wakeup.store(false, Ordering::Release);
 }
 
+/// #208 real-park gate (default OFF).  When true, `block_current` uses the
+/// loom-proven real-park path (`tests/loom-block-park`) instead of the legacy
+/// spin-wait.  The legacy spin-wait keeps a Blocked thread executing a WFI loop
+/// ON ITS OWN KSTACK; `wake_thread`'s unconditional Ready+enqueue then lets a
+/// peer CPU claim+dispatch it while it still spins → two CPUs scribble one
+/// kstack (the #208 wild-RIP / DOUBLE-DISPATCH corruption, also the #135/#198
+/// torn-wakeup wedge).  The real-park path arms `stack_switch_pending` before
+/// the thread is wakeable, gates the wake-side enqueue on the thread being OFF
+/// its kstack, and performs the off-kstack clear-role + PARK_WOKEN→PARK_NONE
+/// arbitration in `finalize_release_after_stack_switch` (the asm post-`mov rsp`
+/// callback = the true off-kstack point).  See the loom model for the three
+/// load-bearing constraints this implements.  A/B-toggle to validate.
+// Default ON for x86_64 (validated 2026-06-18: 6+ pthread-storm boots, 0
+// double-dispatch / 0 wild-RIP vs a 32-DD/1231-spawn gate-OFF baseline, two
+// boots reaching Phase 145e past the chronic Phase-5 wall).  Default OFF on
+// aarch64/riscv64/loongarch64 until per-arch validated — those arches call
+// finalize_release_after_stack_switch from their own trap handlers and have
+// not been A/B'd with the real-park path yet.  Flip per-arch after boots.
+pub static BLOCK_REAL_PARK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(cfg!(target_arch = "x86_64"));
+
 /// Block the current thread with the given reason.
 /// The thread will be preempted on the next timer tick and will not
 /// be re-enqueued until `wake_thread()` is called.
@@ -8261,6 +8381,8 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 /// the relevant lock, BEFORE adding itself as a waiter and dropping the lock.
 pub fn block_current(_reason: BlockReason) {
     let tid = current_thread_id();
+    // #208 real-park: select the loom-proven path (see BLOCK_REAL_PARK).
+    let real_park = BLOCK_REAL_PARK.load(Ordering::Relaxed);
     // #135 deadlock probe: rate-limited per-tid log of who's blocking and why.
     {
         static BC_LOG_COUNT: [core::sync::atomic::AtomicU32; 16] = {
@@ -8334,6 +8456,19 @@ pub fn block_current(_reason: BlockReason) {
     // With dynamic tick, the timer might be programmed far in the future.
     // Reprogram it to fire within one tick so we get preempted promptly.
     crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
+    // #208 real-park (constraint 1): arm stack_switch_pending=true BEFORE the
+    // thread becomes wakeable (before IRQs are enabled and before the loop sets
+    // state=Blocked).  Order is load-bearing: ssp=true (Release) THEN
+    // park_state=COMMITTED (Release) THEN state=Blocked — so a waker that wins
+    // the COMMITTED→WOKEN CAS (Acquire) + SeqCst fence is guaranteed to observe
+    // ssp=true and defer its enqueue while we still spin on our kstack.  We
+    // commit directly (no PARK_ENQUEUED phase): block_current is committed to
+    // parking the moment it enters the loop, and the early-wake case is handled
+    // by the `wakeup` flag (in-place exit), not by park_state.
+    if real_park {
+        tref.stack_switch_pending.store(true, Ordering::Release);
+        tref.park_state.store(PARK_COMMITTED, Ordering::Release);
+    }
     // Enable interrupts so the timer can preempt us.
     let saved = crate::arch::irq::save_and_enable();
     // #208 zero_daemon corruption-family fix: force at least one WFI
@@ -8382,11 +8517,45 @@ pub fn block_current(_reason: BlockReason) {
         }
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Blocked;
         record_trans(tid as u32, 13, ThreadState::Blocked, tref.on_cpu.load(Ordering::Relaxed));
-        if tref.killed.load(Ordering::Acquire) {
-            break;
-        }
-        if yielded && tref.wakeup.load(Ordering::Acquire) {
-            break;
+        if real_park {
+            // #208 real-park exit discipline.  Make the exit decision AND the
+            // Blocked→Running transition + park-machine drain atomic w.r.t. the
+            // LOCAL timer (IRQs off), so there is no window in which we have
+            // logically resumed yet are still state=Blocked (which a timer
+            // try_switch would switch off as a parked thread → orphan).
+            //
+            // During the spin (and the few-instruction window between the
+            // state=Blocked store above and this disable) ssp stayed TRUE, so if
+            // a timer switched us off there, finalize_release_after_stack_switch
+            // already ran the clear-role (re-enqueue if a wake had advanced us to
+            // PARK_WOKEN, else leave us parked at PARK_COMMITTED).  We therefore
+            // only ever reach the drain below while genuinely running again.
+            let igate = crate::arch::irq::disable();
+            if tref.killed.load(Ordering::Acquire)
+                || (yielded && tref.wakeup.load(Ordering::Acquire))
+            {
+                // Drain park_state → NONE from whatever the arbitration left it
+                // at: PARK_COMMITTED (woken in place / never switched off),
+                // PARK_WOKEN (a waker advanced us but deferred its enqueue), or
+                // already PARK_NONE (we were switched off then re-dispatched, the
+                // arbitration consumed it).  Disarm ssp last.
+                let _ = tref.park_state.compare_exchange(
+                    PARK_COMMITTED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire);
+                let _ = tref.park_state.compare_exchange(
+                    PARK_WOKEN, PARK_NONE, Ordering::AcqRel, Ordering::Acquire);
+                tref.stack_switch_pending.store(false, Ordering::Release);
+                unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+                crate::arch::irq::restore(igate);
+                break;
+            }
+            crate::arch::irq::restore(igate);
+        } else {
+            if tref.killed.load(Ordering::Acquire) {
+                break;
+            }
+            if yielded && tref.wakeup.load(Ordering::Acquire) {
+                break;
+            }
         }
         // Reprogram the timer to fire within one tick so try_switch runs
         // and picks another thread (we're state=Blocked, so the deferred-
@@ -8656,6 +8825,32 @@ pub fn wake_thread(tid: ThreadId) {
     {
         let state = thread_ref(tid).state;
         if state == ThreadState::Blocked {
+            // #208 real-park wake side.  When block_current used the real-park
+            // path the thread may still be spinning ON ITS KSTACK, so the legacy
+            // unconditional Ready+enqueue below is exactly the double-dispatch we
+            // are fixing (a peer would claim+dispatch it mid-spin).  Route the
+            // wake through the proven park_state arbitration instead:
+            // wake_parked_thread does COMMITTED→WOKEN + a SeqCst fence and only
+            // enqueues if stack_switch_pending is already false (thread off its
+            // kstack), else defers to finalize_release_after_stack_switch's
+            // clear-role.  wakeup=true (set above) makes a still-spinning parker
+            // exit in place; the IPI wake_parked_thread sends wakes its WFI.
+            if BLOCK_REAL_PARK.load(Ordering::Relaxed) {
+                if tref.park_state.load(Ordering::Acquire) != PARK_NONE {
+                    wake_parked_thread(tid);
+                } else {
+                    // Already resumed/running (park machine drained): the wakeup
+                    // flag set above suffices; nudge the CPU it last ran on so a
+                    // still-spinning parker exits its WFI promptly.
+                    let old_cpu = tref.last_cpu.load(Ordering::Relaxed);
+                    if old_cpu != smp::cpu_id()
+                        && (old_cpu as usize) < crate::sched::smp::num_cpus()
+                    {
+                        crate::arch::irq::send_reschedule_ipi(old_cpu);
+                    }
+                }
+                return;
+            }
             // Boot 551 #192 fix: if the thread is parked on a turnstile
             // (`ts_blocked_on != 0`), remove it from that list and clear
             // `ts_blocked_on` BEFORE transitioning to Ready.  Without
