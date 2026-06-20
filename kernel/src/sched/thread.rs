@@ -162,6 +162,18 @@ pub struct Thread {
     /// Debug: set true when thread is in a run queue, false when dequeued.
     /// Detects double-enqueue (thread added to queue while already queued).
     pub in_queue: core::sync::atomic::AtomicBool,
+    /// #228 Bug A'' publish gate: store(true, Release) as the LAST step of
+    /// spawn-finalize, AFTER stack_base / stack_phys_base / saved_sp / state are
+    /// wired; reset store(false, Relaxed) at the START of each (re)spawn.  A
+    /// dispatcher does load(Acquire) at the try_switch choke BEFORE reading
+    /// stack_base — that acquire synchronizes-with this release, guaranteeing a
+    /// non-zero stack_base is visible whenever `published` reads true.  Plain
+    /// `state`/`stack_base` fields lack this edge on weak-memory arches (rv64),
+    /// letting a dispatcher see state=Ready with stack_base=0 → 0-based kstack
+    /// range → spurious kill.  Dedicated location (not on_cpu) so the
+    /// release/acquire pairing is unambiguous (no release-sequence reasoning
+    /// through on_cpu's ~51 RMW/store sites).  Loom-proven in tests/loom-spawn-publish.
+    pub published: core::sync::atomic::AtomicBool,
     /// Debug tag: 1=try_switch, 2=vol_resched, 3=park_ipc, 4=handoff.
     pub on_cpu_set_by: core::sync::atomic::AtomicU8,
     pub affinity_mask: super::cpumask::AtomicCpuMask,
@@ -367,6 +379,7 @@ impl Thread {
             last_cpu: core::sync::atomic::AtomicU32::new(0),
             on_cpu: core::sync::atomic::AtomicU32::new(u32::MAX),
             in_queue: core::sync::atomic::AtomicBool::new(false),
+            published: core::sync::atomic::AtomicBool::new(false),
             on_cpu_set_by: core::sync::atomic::AtomicU8::new(0),
             affinity_mask: super::cpumask::AtomicCpuMask::new_all(),
             turnstile: core::sync::atomic::AtomicUsize::new(0),

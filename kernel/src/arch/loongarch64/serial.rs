@@ -167,7 +167,8 @@ pub fn getc() -> Option<u8> {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    Uart16550.write_fmt(args).unwrap();
+    // #228 hardening: never panic from a debug print (see riscv64/serial.rs).
+    let _ = Uart16550.write_fmt(args);
 }
 
 #[macro_export]

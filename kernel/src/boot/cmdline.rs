@@ -68,6 +68,17 @@ pub struct BootConfig {
     /// to that slot traps Breakpoint and logs the offending PC.
     pub wp_savedsp: AtomicU8,
 
+    /// #228 NR_CPUS watchpoint enable.  Like `wp_savedsp` but arms the WP on
+    /// the `NR_CPUS` static (`smp::nr_cpus_addr()`) on every hart instead of a
+    /// thread `saved_sp` slot — to catch the wild-write that scribbles
+    /// `num_cpus` (the `scheduler.rs:7157` OOB).  Requires Sdtrig QEMU.
+    pub wp_nrcpus: AtomicU8,
+
+    /// #228 kstack-free liveness guard toggle: 1 = PREVENTIVE (skip freeing a
+    /// kstack a live thread still owns — the fix); 0 = detect+count but free
+    /// anyway (control, reproduces the bug).  Default 1.  One binary A/Bs the fix.
+    pub kstack_free_guard: AtomicU8,
+
     /// Whether command line was successfully parsed.
     pub parsed: AtomicU8,
 }
@@ -81,6 +92,8 @@ pub static BOOT_CONFIG: BootConfig = BootConfig {
     alloc_hammer: AtomicU8::new(0),
     alloc_hammer_persist: AtomicU8::new(0),
     wp_savedsp: AtomicU8::new(0),
+    wp_nrcpus: AtomicU8::new(0),
+    kstack_free_guard: AtomicU8::new(1),
     parsed: AtomicU8::new(0),
 };
 
@@ -191,6 +204,28 @@ fn handle_param(key: &[u8], val: &[u8]) {
             // with Sdtrig extension; default rv64 cpu does not.
             if let Some(n) = parse_u64(val) {
                 BOOT_CONFIG.wp_savedsp.store(n.min(255) as u8, Ordering::Relaxed);
+            }
+        }
+        b"wp_nrcpus" => {
+            // #228 NR_CPUS wild-write watchpoint.  Same Sdtrig requirement.
+            if let Some(n) = parse_u64(val) {
+                BOOT_CONFIG.wp_nrcpus.store(n.min(255) as u8, Ordering::Relaxed);
+            }
+        }
+        b"kstack_free_guard" => {
+            // #228 fix toggle: 1=preventive (fix, default), 0=detect-only (control).
+            if let Some(n) = parse_u64(val) {
+                BOOT_CONFIG.kstack_free_guard.store(n.min(255) as u8, Ordering::Relaxed);
+            }
+        }
+        b"real_park" => {
+            // #228 CLASS-2 A/B: runtime override of BLOCK_REAL_PARK (real-park
+            // path).  1=ON, 0=OFF.  Parsed before scheduler threads block, so the
+            // first block_current sees the override.  Lets one binary A/B whether
+            // the residual wild-PC (sepc=0x200000020) is real-park-specific.
+            if let Some(n) = parse_u64(val) {
+                crate::sched::scheduler::BLOCK_REAL_PARK
+                    .store(n != 0, core::sync::atomic::Ordering::Relaxed);
             }
         }
         _ => {

@@ -363,10 +363,23 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
     // new_pa, the page was freed out from under it and re-issued here —
     // the two will alias the same kstack phys.  Detection-only: we still
     // return the page so boot behavior is unchanged.
-    #[cfg(target_arch = "x86_64")]
+    // #228 ALLOC-SIDE REALIAS DETECTION (all-arch, 2026-06-20 — was x86-only +
+    // gated off behind KSTACK_LIVENESS_GUARD; rv64's prior "0 realias" verdict
+    // never actually ran this on rv64).  This fires at the EXACT corruption
+    // moment: the allocator just handed us `pa`, no thread has claimed it as a
+    // kstack yet (caller wires stack_phys_base AFTER this returns), so if ANY
+    // still-LIVE thread already reports stack_phys_base == pa, the page was freed
+    // out from under it and re-issued here — and the sentinel fill below (~L400)
+    // is about to overwrite that live thread's stack canary (the observed
+    // STACK-CANARY-FAIL got=0xcafebabe.. family).  Detection-only: we still
+    // return the page (boot behavior unchanged), but now we name the victim tid.
+    // 2026-06-20: A/B'd (/tmp/h14/realias) = 0/32 fires on rv64 (state-scan blind
+    // to the parked victim); re-gated behind KSTACK_LIVENESS_GUARD (const false)
+    // so it compiles out by default — opt-in (flip the const) to re-arm.
     if KSTACK_LIVENESS_GUARD {
-        if let Some((tid, state)) = live_thread_owning_kstack_phys(pa.as_usize(), u32::MAX) {
-            report_kstack_phys_realias(pa.as_usize(), tid, state);
+        if let Some((vtid, vstate)) = live_thread_owning_kstack_phys(pa.as_usize(), u32::MAX) {
+            KSTACK_REALIAS_HITS.fetch_add(1, Ordering::Relaxed);
+            report_kstack_phys_realias(pa.as_usize(), vtid, vstate);
         }
     }
     // #208 KSTACK_WRITE_RING tag: action=1, alloc_kstack_zeroed
@@ -1496,9 +1509,13 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
             core::sync::atomic::AtomicBool::new(false),
             core::sync::atomic::AtomicBool::new(false),
         ];
-        let enabled = crate::boot::cmdline::BOOT_CONFIG
-            .wp_savedsp
+        let nrcpus_wp = crate::boot::cmdline::BOOT_CONFIG
+            .wp_nrcpus
             .load(Ordering::Relaxed) != 0;
+        let enabled = nrcpus_wp
+            || crate::boot::cmdline::BOOT_CONFIG
+                .wp_savedsp
+                .load(Ordering::Relaxed) != 0;
         if enabled {
             let cpu = smp::cpu_id() as usize;
             // First CPU to touch tid=4 publishes the address in
@@ -1507,7 +1524,14 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
             // of which tid they're switching — they don't need to
             // wait for tid=4 to be scheduled on them, which may never
             // happen during boot if zero_daemon stays on CPU 0.
-            let candidate_addr: Option<u64> = if thread.id == 4 {
+            let candidate_addr: Option<u64> = if nrcpus_wp {
+                // #228: trigger 0 watches the PROVEN victim DEFERRED_KILL_PTR
+                // (per-CPU deferred-kill array base ptr; write-once by
+                // init_dynamic_percpu then RO) — the wild-write scribbled it to
+                // ~null → tick() amoswap.d fault. First HIT's sepc = the writer.
+                // NR_CPUS goes on the aux trigger below (the other observed victim).
+                Some(&DEFERRED_KILL_PTR as *const _ as u64)
+            } else if thread.id == 4 {
                 Some(&thread.saved_sp as *const u64 as u64)
             } else {
                 #[cfg(target_arch = "riscv64")]
@@ -1526,6 +1550,18 @@ pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
                     crate::arch::riscv64::watchpoint::arm(addr);
                     #[cfg(target_arch = "aarch64")]
                     crate::arch::aarch64::watchpoint::arm(addr);
+                    if nrcpus_wp {
+                        // Confirm the arm fired per-CPU so a hit-less hunt can be
+                        // trusted (not a silent no-arm). t0=DEFERRED_KILL_PTR (addr);
+                        // aux t1=NR_CPUS — double coverage of the per-CPU control
+                        // region (both are observed wild-write victims).
+                        #[cfg(target_arch = "riscv64")]
+                        crate::arch::riscv64::watchpoint::arm_aux(smp::nr_cpus_addr());
+                        crate::println!(
+                            "[#228 WP] cpu={} armed t0=DEFKILL@{:#x} t1=NRCPUS@{:#x}",
+                            cpu, addr, smp::nr_cpus_addr()
+                        );
+                    }
                     // Aux trigger on the LOCAL CPU's current_thread
                     // slot — wp_savedsp >= 4 only.  current_thread
                     // updates on every context switch; the legit-PC
@@ -3074,6 +3110,76 @@ fn deferred_kill() -> &'static [AtomicUsize] {
 #[allow(dead_code)]
 const KSTACK_LIVENESS_GUARD: bool = false;
 
+/// #228 Bug A'' publish-visibility re-defer machinery.  When try_switch picks a
+/// thread whose `published` gate is still false AND `stack_base==0` (the spawn
+/// hasn't become visible to this CPU on a weak-memory arch), we re-enqueue it and
+/// run idle this round instead of killing it — it dispatches correctly once the
+/// publish Release lands.  Bounded per-tid so a thread that is genuinely never
+/// published (stack_base==0 forever — a different bug) can't wedge: after CAP
+/// re-defers it falls through to the legacy kill path.  Counter cleared on the
+/// thread's next successful dispatch.  PUBLISH_REDEFERS dumped in DISPATCH-DIAG.
+const PUBLISH_REDEFER_CAP: u32 = 8;
+static PUBLISH_REDEFER_CNT: [core::sync::atomic::AtomicU32; 256] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 256];
+static PUBLISH_REDEFERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[inline]
+fn publish_redefer_bump(tid: u32) -> u32 {
+    PUBLISH_REDEFERS.fetch_add(1, Ordering::Relaxed);
+    if (tid as usize) < 256 {
+        PUBLISH_REDEFER_CNT[tid as usize].fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        u32::MAX // unknown tid → don't re-defer (treat as cap-exceeded)
+    }
+}
+#[inline]
+fn publish_redefer_clear(tid: u32) {
+    if (tid as usize) < 256 {
+        // Relaxed: only read on the (rare) re-defer path; exactness not required.
+        if PUBLISH_REDEFER_CNT[tid as usize].load(Ordering::Relaxed) != 0 {
+            PUBLISH_REDEFER_CNT[tid as usize].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// #228 fix instrumentation: count of times the kstack-free liveness check found
+/// a LIVE owner of a to-be-freed kstack (the premature-free condition).  Bumped
+/// at BOTH free sites regardless of the `kstack_free_guard` toggle, so a control
+/// run (guard=0) shows how often the condition occurs even while still freeing.
+/// Dumped in the periodic DISPATCH-DIAG line (survives serial-storm log loss) —
+/// resolves "PREVENTED=0": >0 means the premature-free really happens.
+static KSTACK_GUARD_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// #228 alloc-side companion to KSTACK_GUARD_HITS: count of times
+/// `alloc_kstack_zeroed` was handed a phys page that a still-LIVE thread already
+/// claims as its kstack base (a realias / double-issue caught at the EXACT
+/// corruption moment, right before the sentinel fill scribbles the victim's
+/// stack).  All-arch now (was x86-only + gated off).  Dumped in DISPATCH-DIAG.
+static KSTACK_REALIAS_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// #228 Bug A (2026-06-20): count of times the deferred-kstack drain was about to
+/// zero `thread_ref(dead_tid).stack_base` but the slot no longer held a DEAD
+/// thread — i.e. `dead_tid` was REUSED by a freshly-spawned LIVE thread (tid
+/// churn).  Zeroing that live thread's stack_base makes try_switch compute a
+/// 0-based kstack range → `saved_sp OUTSIDE kstack 0x0..0x100000` → wild stack →
+/// crash (the THREAD-CANARY-FAIL stack_base=0 family).  >0 = the fix prevented a
+/// real corruption.  Dumped in DISPATCH-DIAG (survives serial-storm loss).
+static STACK_BASE_ZERO_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Rate-limited report for the Bug A guard: the deferred-drain found `dead_tid`'s
+/// slot reused by a non-Dead (live) thread, so it SKIPPED the stack_base reclaim
+/// to avoid corrupting a live thread.
+#[cold]
+fn report_stack_base_zero_skip(dead_tid: u32, state: u8, freed_pa: usize, cur_phys: usize) {
+    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    crate::println!(
+        "STACK-BASE-ZERO-SKIP(prevented): dead_tid={} now_state={} freed_pa={:#x} thread_stack_phys={:#x} — slot reused by live thread, NOT zeroing its stack_base",
+        dead_tid, state, freed_pa, cur_phys
+    );
+}
+
 /// Find a LIVE thread (state in Running/Ready/Blocked — NOT Dead) whose
 /// `stack_phys_base == pa`, excluding `skip_tid` and the per-CPU idle
 /// threads.  Returns `(tid, state as u8)` of the first such owner, or
@@ -3086,7 +3192,7 @@ const KSTACK_LIVENESS_GUARD: bool = false;
 ///
 /// State encoding (matches `ThreadState` discriminants): 0=Ready,
 /// 1=Running, 2=Blocked, 3=Dead (we never return Dead).
-#[cfg(target_arch = "x86_64")]
+/// #228 fix: all-arch now (was x86-only) — drives the preventive kstack-free guard.
 fn live_thread_owning_kstack_phys(pa: usize, skip_tid: u32) -> Option<(u32, u8)> {
     if pa == 0 {
         return None;
@@ -3114,14 +3220,27 @@ fn live_thread_owning_kstack_phys(pa: usize, skip_tid: u32) -> Option<(u32, u8)>
         let p = THREAD_TABLE.get(tid) as u64;
         // DEFENSIVE: skip null (tid not wired) and any pointer that isn't a
         // valid Thread-struct VA — a corrupted table entry must not cause a
-        // #PF inside the guard.
-        if p == 0 || !is_thread_struct_va(p) {
+        // #PF inside the guard.  #228 fix: x86 has the SLAB_THREAD_REGION VA
+        // check; other arches use a basic alignment sanity (no separate window).
+        #[cfg(target_arch = "x86_64")]
+        let plausible = is_thread_struct_va(p);
+        #[cfg(not(target_arch = "x86_64"))]
+        let plausible = (p & 7) == 0;
+        if p == 0 || !plausible {
             continue;
         }
         let t = unsafe { &*(p as *const Thread) };
         if t.stack_phys_base != pa {
             continue;
         }
+        // #228 Bug B note (2026-06-20): a park_state-aware extension here (flag
+        // park_state != PARK_NONE owners) was tried + A/B'd (/tmp/h14/bugB) and
+        // gave NO benefit — guard_cond=0/32 both arms, bugB unchanged.  The freed
+        // PA never matches any owner's stack_phys_base, state OR park.  So
+        // PARK-EXT-DELTA is NOT a detectable premature-free; affected boots reach
+        // tid=53/54 and resume fine ⇒ the probe is benign (un-refreshed snapshot
+        // vs legitimate wake/re-run).  Reverted; kept state-only.  See
+        // project_228_allocator_double_issue.
         let st = t.state;
         // Only flag CLEARLY-LIVE owners.  A thread already in `Dead` is in
         // the legitimate-free window — that's the expected case at a free
@@ -3142,55 +3261,36 @@ fn live_thread_owning_kstack_phys(pa: usize, skip_tid: u32) -> Option<(u32, u8)>
 /// is the tid this free site believed it was reclaiming (u32::MAX if not
 /// yet known).  Uses only the direct-UART `put_*` path (no fmt, no heap)
 /// so the line survives a scribbled formatter scratch.
-#[cfg(target_arch = "x86_64")]
+// #228 fix: all-arch now (was x86-only, used the x86 serial path).  The
+// scheduler already prints freely via crate::println! on this path, so this is
+// safe + portable.  Rate-limited.  Logs each PREVENTED premature free.
 #[cold]
 fn report_kstack_premature_free(tid: u32, state: u8, pa: usize, freeing_cpu: u32, dead_tid: u32) {
     static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) >= 16 {
+    if N.fetch_add(1, Ordering::Relaxed) >= 32 {
         return;
     }
-    use crate::arch::x86_64::serial::{handler_write_bytes, put_bytes, put_dec_u64, put_hex_u64};
-    let mut buf = [0u8; 160];
-    let mut k = 0;
-    put_bytes(&mut buf, &mut k, b"KSTACK-PREMATURE-FREE: live_owner_tid=");
-    put_dec_u64(&mut buf, &mut k, tid as u64);
-    put_bytes(&mut buf, &mut k, b" state=");
-    put_dec_u64(&mut buf, &mut k, state as u64);
-    put_bytes(&mut buf, &mut k, b" phys=");
-    put_hex_u64(&mut buf, &mut k, pa as u64);
-    put_bytes(&mut buf, &mut k, b" freeing_cpu=");
-    put_dec_u64(&mut buf, &mut k, freeing_cpu as u64);
-    put_bytes(&mut buf, &mut k, b" dead_tid_expected=");
-    if dead_tid == u32::MAX {
-        put_bytes(&mut buf, &mut k, b"none");
-    } else {
-        put_dec_u64(&mut buf, &mut k, dead_tid as u64);
-    }
-    put_bytes(&mut buf, &mut k, b"\n");
-    handler_write_bytes(&buf[..k.min(buf.len())]);
+    crate::println!(
+        "KSTACK-PREMATURE-FREE(prevented): live_owner_tid={} state={} phys={:#x} freeing_cpu={} dead_tid_expected={}",
+        tid, state, pa, freeing_cpu, dead_tid as i64
+    );
 }
 
 /// Emit the corruption-safe, rate-limited KSTACK-PHYS-REALIAS report — the
 /// realloc side of the same race: the phys allocator just handed back a
 /// page that a still-LIVE thread claims as its kstack base.
-#[cfg(target_arch = "x86_64")]
+// #228 fix: all-arch now (was x86-only + used the x86 serial path).  rv64 is the
+// repro arch; the scheduler prints freely via crate::println! on this path.
 #[cold]
 fn report_kstack_phys_realias(new_pa: usize, tid: u32, state: u8) {
     static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) >= 16 {
+    if N.fetch_add(1, Ordering::Relaxed) >= 32 {
         return;
     }
-    use crate::arch::x86_64::serial::{handler_write_bytes, put_bytes, put_dec_u64, put_hex_u64};
-    let mut buf = [0u8; 128];
-    let mut k = 0;
-    put_bytes(&mut buf, &mut k, b"KSTACK-PHYS-REALIAS: new_pa=");
-    put_hex_u64(&mut buf, &mut k, new_pa as u64);
-    put_bytes(&mut buf, &mut k, b" still_owned_by_live_tid=");
-    put_dec_u64(&mut buf, &mut k, tid as u64);
-    put_bytes(&mut buf, &mut k, b" state=");
-    put_dec_u64(&mut buf, &mut k, state as u64);
-    put_bytes(&mut buf, &mut k, b"\n");
-    handler_write_bytes(&buf[..k.min(buf.len())]);
+    crate::println!(
+        "KSTACK-PHYS-REALIAS: new_pa={:#x} ksize={:#x} still_owned_by_live_tid={} state={} freeing_cpu={} — sentinel fill about to scribble its live stack canary",
+        new_pa, kstack_size(), tid, state, smp::cpu_id()
+    );
 }
 
 /// Phase-5 kstack-leak fix: drain a prior pending deferred kstack BEFORE a
@@ -3231,33 +3331,59 @@ fn drain_prior_deferred_kstack(cpu: usize, exclude_pa: usize) {
     }
     kstack_pa_audit(prior, kstack_size(), -1, "free-prior");
     kstack_pa_unregister(prior as u64);
-    // #208 KSTACK_LIVENESS_GUARD: detection-only — before we free this
-    // deferred kstack phys, verify NO still-LIVE thread claims it as its
-    // stack base.  The dead tid we believe we're reclaiming is in
-    // deferred_thread()[cpu]; peek it as skip_tid + the expected-dead id.
-    // If a LIVE owner is found the deferred-free race is the root cause:
-    // the page is about to be returned to the allocator while a running/
-    // ready/blocked thread still uses it.  We still free (behavior
-    // unchanged) so the boot trajectory is identical.
-    #[cfg(target_arch = "x86_64")]
-    if KSTACK_LIVENESS_GUARD {
+    // #228/#208 ROOT-CAUSE FIX (all-arch, PREVENTIVE — was x86-only + gated off):
+    // before returning this deferred kstack phys to the allocator, verify NO
+    // still-LIVE thread claims it.  A real-parked thread (rv64 real-park) keeps
+    // its saved frame live on a non-current kstack; freeing + realloc'ing it
+    // (sentinel-fill) corrupts the parked frame → wild jump on unpark.  Proven
+    // 2026-06-19 (project_228_rootcause_parked_kstack_free).  If a live owner is
+    // found, SKIP the free: the owner re-defers this PA when it truly dies
+    // (stack_base left intact), so the leak is bounded/temporary, NOT corruption.
+    {
         let expected_dead = deferred_thread()[cpu].load(Ordering::Acquire) as u32;
         let skip = if (expected_dead as usize) < RadixTable::capacity() {
             expected_dead
         } else {
             u32::MAX
         };
-        if let Some((tid, state)) = live_thread_owning_kstack_phys(prior, skip) {
+        // #228 v2: do NOT exclude expected_dead — the bug is freeing a thread's
+        // OWN kstack while it's still Blocked/real-parked on it (a genuinely-Dead
+        // thread is skipped by the state check, so checking it is safe).  skip is
+        // still passed to the report for context.
+        if let Some((tid, state)) = live_thread_owning_kstack_phys(prior, u32::MAX) {
+            KSTACK_GUARD_HITS.fetch_add(1, Ordering::Relaxed);
             report_kstack_premature_free(tid, state, prior, smp::cpu_id(), skip);
+            if crate::boot::cmdline::BOOT_CONFIG.kstack_free_guard.load(Ordering::Relaxed) != 0 {
+                return; // FIX (guard=1): live owner still uses this kstack — do NOT free.
+            }
+            // guard=0 (control): fall through and free anyway, reproducing the bug.
         }
     }
     crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(prior), KSTACK_ORDER);
     let dead_tid = deferred_thread()[cpu].swap(usize::MAX, Ordering::AcqRel);
     if dead_tid < RadixTable::capacity() {
-        // Safety: dead thread is Dead, not on any queue or CPU.
         let t = unsafe { thread_mut_from_ref(dead_tid as ThreadId) };
-        t.stack_base = 0;
-        bump_kstack_epoch(t); // #208
+        // #228 Bug A FIX (2026-06-20): the old code unconditionally zeroed
+        // `t.stack_base`, trusting "dead_tid is Dead".  Under tid REUSE that slot
+        // may now be a freshly-spawned LIVE thread (the churning tid=15/31
+        // family); zeroing its stack_base → try_switch sees kstack 0x0..0x100000
+        // → wild stack → crash (THREAD-CANARY-FAIL stack_base=0 + saved_sp
+        // OUTSIDE).  Only reclaim if the slot STILL holds a Dead thread.
+        // A/B via kstack_free_guard: 1 (default,FIX)=skip if reused-live;
+        // 0 (control)=old unconditional zero (reproduces the crash).  The skip
+        // COUNTER bumps in BOTH arms (= the bug-condition rate) so the A/B shows
+        // equal condition frequency but divergent corruption.
+        if t.state == ThreadState::Dead {
+            t.stack_base = 0;
+            bump_kstack_epoch(t); // #208
+        } else {
+            STACK_BASE_ZERO_SKIPS.fetch_add(1, Ordering::Relaxed);
+            report_stack_base_zero_skip(dead_tid as u32, t.state as u8, prior, t.stack_phys_base);
+            if crate::boot::cmdline::BOOT_CONFIG.kstack_free_guard.load(Ordering::Relaxed) == 0 {
+                t.stack_base = 0; // control: corrupt a live thread's stack_base anyway
+                bump_kstack_epoch(t);
+            }
+        }
     }
 }
 
@@ -4597,10 +4723,14 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
     // NEW_INV: on_cpu = ON_CPU_PENDING for any thread about to enter Ready.
     thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    // #228 Bug A'': clear the publish gate at (re)spawn start so a reused slot's
+    // stale `published=true` can't let a dispatcher trust this incarnation's
+    // not-yet-written stack_base. Re-armed (Release) as the LAST finalize step.
+    thread.published.store(false, Ordering::Relaxed);
     thread.in_queue.store(false, Ordering::Release);
 
     thread.id = id;
-    thread.state = ThreadState::Ready;
+    // #228 Bug A' fix: state=Ready published LATER (after stack_base/saved_sp).
     thread.task_id = 0;
     thread.base_priority = priority;
     thread.effective_priority = priority;
@@ -4621,6 +4751,16 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
+    // #228 Bug A' (publish-before-init) FIX: publish Ready only after dispatch
+    // fields are wired; Release fence orders the writes before the Ready store.
+    core::sync::atomic::fence(Ordering::Release);
+    thread.state = ThreadState::Ready;
+    // #228 Bug A'' carrier: publish gate, store-Release AFTER all dispatch fields
+    // (stack_base/stack_phys_base/saved_sp/state). A dispatcher's Acquire-load of
+    // `published` at the try_switch choke synchronizes-with this, guaranteeing a
+    // non-zero stack_base is visible whenever published reads true (closes the
+    // rv64 weak-memory publish-visibility race). Subsumes the fence above.
+    thread.published.store(true, Ordering::Release);
     if id < 100 {
         #[cfg(target_arch = "x86_64")]
         {
@@ -4967,6 +5107,10 @@ fn finalize_spawn(
     // NEW_INV: a freshly-spawned thread enters Ready, so on_cpu must be
     // ON_CPU_PENDING (overrides any stale value from a recycled tid).
     thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    // #228 Bug A'': clear the publish gate at (re)spawn start so a reused slot's
+    // stale `published=true` can't let a dispatcher trust this incarnation's
+    // not-yet-written stack_base. Re-armed (Release) as the LAST finalize step.
+    thread.published.store(false, Ordering::Relaxed);
     thread.in_queue.store(false, Ordering::Release);
     // #135 reset diagnostic fields on thread reuse.  Without this,
     // enqueue_count / picked_count / trans_ring carry forward from
@@ -4980,7 +5124,8 @@ fn finalize_spawn(
     }
 
     thread.id = thread_id;
-    thread.state = ThreadState::Ready;
+    // #228 Bug A' fix: state=Ready is published LATER (after stack_base /
+    // stack_phys_base / saved_sp are wired) — see the Release-fenced store below.
     thread.task_id = task_id;
     thread.port_id = thread_port;
     thread.base_priority = priority;
@@ -5000,6 +5145,20 @@ fn finalize_spawn(
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, frame_sp);
     record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
+    // #228 Bug A' (publish-before-init) FIX: ONLY NOW — with stack_base,
+    // stack_phys_base and saved_sp all wired — publish the thread as dispatchable.
+    // Previously state=Ready was set ~18 lines earlier, leaving a window where a
+    // concurrent try_switch on another CPU could pick a churning-tid spawn whose
+    // stack_base was still 0 → kstack range 0x0..0x100000 → wild stack → crash
+    // (the residual THREAD-CANARY-FAIL stack_base=0 the drain-side fix missed).
+    core::sync::atomic::fence(Ordering::Release);
+    thread.state = ThreadState::Ready;
+    // #228 Bug A'' carrier: publish gate, store-Release AFTER all dispatch fields
+    // (stack_base/stack_phys_base/saved_sp/state). A dispatcher's Acquire-load of
+    // `published` at the try_switch choke synchronizes-with this, guaranteeing a
+    // non-zero stack_base is visible whenever published reads true (closes the
+    // rv64 weak-memory publish-visibility race). Subsumes the fence above.
+    thread.published.store(true, Ordering::Release);
     if thread_id < 100 {
         #[cfg(target_arch = "x86_64")]
         log_kuser_spawn(thread_id, task_id, b"spawn_user", None, priority, quantum);
@@ -5081,9 +5240,14 @@ fn create_thread_in_task(
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
     // NEW_INV: thread enters Ready, so on_cpu = ON_CPU_PENDING.
     thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    // #228 Bug A'': clear the publish gate at (re)spawn start so a reused slot's
+    // stale `published=true` can't let a dispatcher trust this incarnation's
+    // not-yet-written stack_base. Re-armed (Release) as the LAST finalize step.
+    thread.published.store(false, Ordering::Relaxed);
 
     thread.id = id;
-    thread.state = ThreadState::Ready;
+    // #228 Bug A' fix: state=Ready published LATER (after stack_base / saved_sp
+    // are wired) — see the Release-fenced store below.
     thread.task_id = task_id;
     thread.port_id = thread_port;
     thread.base_priority = priority;
@@ -5102,6 +5266,16 @@ fn create_thread_in_task(
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
+    // #228 Bug A' (publish-before-init) FIX: publish Ready only after dispatch
+    // fields are wired; Release fence orders those writes before the Ready store.
+    core::sync::atomic::fence(Ordering::Release);
+    thread.state = ThreadState::Ready;
+    // #228 Bug A'' carrier: publish gate, store-Release AFTER all dispatch fields
+    // (stack_base/stack_phys_base/saved_sp/state). A dispatcher's Acquire-load of
+    // `published` at the try_switch choke synchronizes-with this, guaranteeing a
+    // non-zero stack_base is visible whenever published reads true (closes the
+    // rv64 weak-memory publish-visibility race). Subsumes the fence above.
+    thread.published.store(true, Ordering::Release);
     if id < 100 {
         #[cfg(target_arch = "x86_64")]
         log_kuser_spawn(id, task_id, b"", Some(entry as u64), priority, quantum);
@@ -7135,9 +7309,13 @@ pub fn tick(current_sp: u64) -> u64 {
                 let stale_reclaim = DISPATCH_CLAIM_STALE_RECLAIM.load(Ordering::Relaxed);
                 let torn_block = TORN_BLOCK_FIRES.load(Ordering::Relaxed);
                 crate::println!(
-                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={} stale_reclaim={} torn_block={}",
+                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={} stale_reclaim={} torn_block={} kstack_guard_hits={} kstack_realias_hits={} stack_base_zero_skips={} publish_redefers={}",
                     if gate_on { "ON" } else { "OFF" },
                     stuck_on, stuck_off, claim_fail, claim_self_pick, stale_reclaim, torn_block,
+                    KSTACK_GUARD_HITS.load(Ordering::Relaxed),
+                    KSTACK_REALIAS_HITS.load(Ordering::Relaxed),
+                    STACK_BASE_ZERO_SKIPS.load(Ordering::Relaxed),
+                    PUBLISH_REDEFERS.load(Ordering::Relaxed),
                 );
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
             }
@@ -7377,13 +7555,12 @@ fn try_switch(current_sp: u64) -> u64 {
             deferred_kstack()[cpu as usize].store(0, Ordering::Release);
             kstack_pa_audit(deferred, kstack_size(), -1, "free");
             kstack_pa_unregister(deferred as u64);
-            // #208 KSTACK_LIVENESS_GUARD: detection-only liveness check at
-            // the try_switch death-path free (the second of two kstack free
-            // sites).  Same guard as drain_prior_deferred_kstack: catch a
-            // still-LIVE owner of this phys before it returns to the
-            // allocator.  Behavior unchanged — we still free.
-            #[cfg(target_arch = "x86_64")]
-            if KSTACK_LIVENESS_GUARD {
+            // #228/#208 ROOT-CAUSE FIX (all-arch, PREVENTIVE — twin of
+            // drain_prior_deferred_kstack): skip the free if a still-LIVE thread
+            // owns this kstack phys (a real-parked thread's frame is still live
+            // on it).  See project_228_rootcause_parked_kstack_free.
+            let mut live_owner = false;
+            {
                 let expected_dead =
                     deferred_thread()[cpu as usize].load(Ordering::Acquire) as u32;
                 let skip = if (expected_dead as usize) < RadixTable::capacity() {
@@ -7391,17 +7568,39 @@ fn try_switch(current_sp: u64) -> u64 {
                 } else {
                     u32::MAX
                 };
-                if let Some((tid, state)) = live_thread_owning_kstack_phys(deferred, skip) {
+                // #228 v2: do NOT exclude expected_dead (see twin site) — catch a
+                // thread still Blocked/real-parked on the kstack being freed.
+                if let Some((tid, state)) = live_thread_owning_kstack_phys(deferred, u32::MAX) {
+                    KSTACK_GUARD_HITS.fetch_add(1, Ordering::Relaxed);
                     report_kstack_premature_free(tid, state, deferred, cpu, skip);
+                    if crate::boot::cmdline::BOOT_CONFIG.kstack_free_guard.load(Ordering::Relaxed) != 0 {
+                        live_owner = true; // FIX (guard=1): skip free — owner re-defers on real death.
+                    }
+                    // guard=0 (control): live_owner stays false → free anyway.
                 }
             }
-            crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
-            let dead_tid = deferred_thread()[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
-            if dead_tid < RadixTable::capacity() {
-                // Safety: dead thread is Dead, not on any queue or CPU.
-                let t = unsafe { thread_mut_from_ref(dead_tid as ThreadId) };
-                t.stack_base = 0;
-                bump_kstack_epoch(t); // #208
+            if !live_owner {
+                crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
+                let dead_tid = deferred_thread()[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
+                if dead_tid < RadixTable::capacity() {
+                    let t = unsafe { thread_mut_from_ref(dead_tid as ThreadId) };
+                    // #228 Bug A FIX (2026-06-20, twin of drain_prior_deferred_kstack):
+                    // only reclaim stack_base if the slot STILL holds a Dead thread.
+                    // Under tid reuse it may be a live thread; zeroing its stack_base
+                    // → try_switch wild stack → crash (stack_base=0 family).  A/B on
+                    // kstack_free_guard (0=control reproduces; counter bumps both arms).
+                    if t.state == ThreadState::Dead {
+                        t.stack_base = 0;
+                        bump_kstack_epoch(t); // #208
+                    } else {
+                        STACK_BASE_ZERO_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        report_stack_base_zero_skip(dead_tid as u32, t.state as u8, deferred, t.stack_phys_base);
+                        if crate::boot::cmdline::BOOT_CONFIG.kstack_free_guard.load(Ordering::Relaxed) == 0 {
+                            t.stack_base = 0; // control: corrupt a live thread's stack_base anyway
+                            bump_kstack_epoch(t);
+                        }
+                    }
+                }
             }
         }
     }
@@ -7925,10 +8124,22 @@ fn try_switch(current_sp: u64) -> u64 {
     // Sanity check: saved_sp must be within the thread's kstack, and the
     // CS/RIP fields in the exception frame must be valid.
     {
+        let is_idle = next_id == idle_id;
+        // #228 Bug A'' carrier: Acquire-load the publish gate BEFORE reading
+        // saved_sp / stack_base, so this acquire synchronizes-with the spawn
+        // finalize's Release store of `published`.  When pub_ok is true the
+        // dispatch fields (stack_base / saved_sp) are guaranteed visible &
+        // non-zero on weak-memory arches (rv64).  Idle threads bypass
+        // spawn-finalize (they run on boot/AP stacks) → exempt.
+        let pub_ok = is_idle || next_t.published.load(Ordering::Acquire);
+        // Reset the per-tid re-defer budget once the thread is properly published
+        // (cheap Relaxed load; stores only in the rare post-race case).
+        if pub_ok && !is_idle {
+            publish_redefer_clear(next_id);
+        }
         let sp = next_t.saved_sp;
         let kbase = next_t.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
-        let is_idle = next_id == idle_id;
         // #204 probe: validate next_t at switch-in.  Fires CONCURRENTLY
         // with the BUG: try_switch check below — its job is to confirm
         // whether the corruption is isolated to saved_sp/stack_base
@@ -7987,6 +8198,26 @@ fn try_switch(current_sp: u64) -> u64 {
         // Idle threads run on boot stacks (ring 0), not their allocated kstack.
         // Their saved_sp is legitimately outside the kstack range — skip the check.
         if !is_idle && (sp < kbase as u64 || sp >= kend) {
+            // #228 Bug A'' publish-visibility race vs genuine corruption.  If the
+            // thread isn't published yet (pub_ok=false) AND its stack_base reads 0,
+            // its spawn-finalize hasn't become visible to this CPU — this is the
+            // transient race, NOT corruption.  Re-enqueue + run idle this round so
+            // it dispatches correctly once the publish Release lands, instead of
+            // spuriously killing a freshly-spawned thread.  Bounded per-tid:
+            // PUBLISH_REDEFER_CAP re-defers then fall through to the legacy kill
+            // path (so a never-published stack_base==0 thread can't wedge).
+            if !pub_ok && kbase == 0 {
+                let n = publish_redefer_bump(next_id);
+                if n <= PUBLISH_REDEFER_CAP {
+                    percpu_enqueue(cpu as u32, next_t.effective_priority, next_id);
+                    let idle_sp = thread_ref(idle_id).saved_sp;
+                    unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+                    set_current_thread(pcpu, idle_id);
+                    transition_release_to_pending(prev_id);
+                    return idle_sp;
+                }
+                // cap exceeded → fall through to the kill path (defensive).
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 use crate::arch::x86_64::serial::{put_bytes, put_hex_u64, put_dec_u64};
@@ -8391,6 +8622,10 @@ pub static BLOCK_REAL_PARK: core::sync::atomic::AtomicBool =
         target_arch = "x86_64",
         target_arch = "aarch64",
         target_arch = "loongarch64"
+        // rv64/mips64 keep real-park OFF until per-arch validated.  The #228
+        // publish-gate fix is arch-general and does NOT require real-park on; rv64
+        // real-park can be toggled at runtime for testing via `real_park=1`
+        // (cmdline.rs → BLOCK_REAL_PARK).
     )));
 
 /// Block the current thread with the given reason.
@@ -10149,10 +10384,14 @@ pub fn fork_current() -> u64 {
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
     // NEW_INV: child enters Ready, so on_cpu = ON_CPU_PENDING.
     thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    // #228 Bug A'': clear the publish gate at (re)spawn start so a reused slot's
+    // stale `published=true` can't let a dispatcher trust this incarnation's
+    // not-yet-written stack_base. Re-armed (Release) as the LAST finalize step.
+    thread.published.store(false, Ordering::Relaxed);
     thread.in_queue.store(false, Ordering::Release);
 
     thread.id = child_tid;
-    thread.state = ThreadState::Ready;
+    // #228 Bug A' fix: state=Ready published LATER (after stack_base/saved_sp).
     thread.task_id = child_task_id;
     thread.port_id = child_thread_port;
     thread.base_priority = parent_priority;
@@ -10171,6 +10410,16 @@ pub fn fork_current() -> u64 {
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
+    // #228 Bug A' (publish-before-init) FIX: publish Ready only after dispatch
+    // fields are wired; Release fence orders the writes before the Ready store.
+    core::sync::atomic::fence(Ordering::Release);
+    thread.state = ThreadState::Ready;
+    // #228 Bug A'' carrier: publish gate, store-Release AFTER all dispatch fields
+    // (stack_base/stack_phys_base/saved_sp/state). A dispatcher's Acquire-load of
+    // `published` at the try_switch choke synchronizes-with this, guaranteeing a
+    // non-zero stack_base is visible whenever published reads true (closes the
+    // rv64 weak-memory publish-visibility race). Subsumes the fence above.
+    thread.published.store(true, Ordering::Release);
     if child_tid < 100 {
         #[cfg(target_arch = "x86_64")]
         log_kuser_spawn(child_tid, child_task_id, b"fork", None, parent_priority, parent_quantum);
@@ -10405,10 +10654,14 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
     // NEW_INV: child enters Ready, so on_cpu = ON_CPU_PENDING.
     thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    // #228 Bug A'': clear the publish gate at (re)spawn start so a reused slot's
+    // stale `published=true` can't let a dispatcher trust this incarnation's
+    // not-yet-written stack_base. Re-armed (Release) as the LAST finalize step.
+    thread.published.store(false, Ordering::Relaxed);
     thread.in_queue.store(false, Ordering::Release);
 
     thread.id = child_tid;
-    thread.state = ThreadState::Ready;
+    // #228 Bug A' fix: state=Ready published LATER (after stack_base/saved_sp).
     thread.task_id = child_task_id;
     thread.port_id = child_thread_port;
     thread.base_priority = parent_priority;
@@ -10427,6 +10680,16 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
+    // #228 Bug A' (publish-before-init) FIX: publish Ready only after dispatch
+    // fields are wired; Release fence orders the writes before the Ready store.
+    core::sync::atomic::fence(Ordering::Release);
+    thread.state = ThreadState::Ready;
+    // #228 Bug A'' carrier: publish gate, store-Release AFTER all dispatch fields
+    // (stack_base/stack_phys_base/saved_sp/state). A dispatcher's Acquire-load of
+    // `published` at the try_switch choke synchronizes-with this, guaranteeing a
+    // non-zero stack_base is visible whenever published reads true (closes the
+    // rv64 weak-memory publish-visibility race). Subsumes the fence above.
+    thread.published.store(true, Ordering::Release);
     if child_tid < 100 {
         #[cfg(target_arch = "x86_64")]
         log_kuser_spawn(child_tid, child_task_id, b"clone", None, parent_priority, parent_quantum);
@@ -10538,10 +10801,14 @@ pub fn clone_thread_in_task(
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
     // NEW_INV: child enters Ready, so on_cpu = ON_CPU_PENDING.
     thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    // #228 Bug A'': clear the publish gate at (re)spawn start so a reused slot's
+    // stale `published=true` can't let a dispatcher trust this incarnation's
+    // not-yet-written stack_base. Re-armed (Release) as the LAST finalize step.
+    thread.published.store(false, Ordering::Relaxed);
     thread.in_queue.store(false, Ordering::Release);
 
     thread.id = child_tid;
-    thread.state = ThreadState::Ready;
+    // #228 Bug A' fix: state=Ready published LATER (after stack_base/saved_sp).
     thread.task_id = task_id;
     thread.port_id = child_thread_port;
     thread.base_priority = parent_priority;
@@ -10560,6 +10827,16 @@ pub fn clone_thread_in_task(
     bump_kstack_epoch(thread); // #208
     write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
+    // #228 Bug A' (publish-before-init) FIX: publish Ready only after dispatch
+    // fields are wired; Release fence orders the writes before the Ready store.
+    core::sync::atomic::fence(Ordering::Release);
+    thread.state = ThreadState::Ready;
+    // #228 Bug A'' carrier: publish gate, store-Release AFTER all dispatch fields
+    // (stack_base/stack_phys_base/saved_sp/state). A dispatcher's Acquire-load of
+    // `published` at the try_switch choke synchronizes-with this, guaranteeing a
+    // non-zero stack_base is visible whenever published reads true (closes the
+    // rv64 weak-memory publish-visibility race). Subsumes the fence above.
+    thread.published.store(true, Ordering::Release);
     if child_tid < 100 {
         #[cfg(target_arch = "x86_64")]
         log_kuser_spawn(child_tid, task_id, b"clone3", None, parent_priority, parent_quantum);

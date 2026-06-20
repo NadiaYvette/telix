@@ -48,6 +48,15 @@ pub fn num_cpus() -> usize {
     NR_CPUS.load(Ordering::Relaxed)
 }
 
+/// Address of the `NR_CPUS` static, for arming a #228 hardware watchpoint on
+/// it.  `NR_CPUS` is written once by `detect_cpu_count()` then read-only, so
+/// any later store is the wild-write that scribbles `num_cpus` (surfacing as
+/// the `scheduler.rs:7157` index-out-of-bounds OOB under rv64 real-park).
+#[allow(dead_code)]
+pub fn nr_cpus_addr() -> u64 {
+    &NR_CPUS as *const _ as u64
+}
+
 /// Discover the real CPU count from firmware and apply the optional
 /// `nr_cpus=N` cmdline cap. Call once from the BSP between
 /// `parse_firmware()` and `phys::init()`. Returns the resolved count.

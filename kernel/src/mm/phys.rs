@@ -115,6 +115,14 @@ pub fn dump_evt_ring_for_chunk(target_chunk: usize) {
 /// Default OFF: the 2026-06-16 A/B (0 fires / 11 boots incl. heavy host-desched
 /// stress) ruled out the single-page double-issue as the #208 Phase-5 wild-RIP
 /// cause.  Kept as an opt-in regression guard; flip true to re-arm.
+// #228 2026-06-20 VERDICT: phys allocator EXONERATED.  Re-armed on rv64 under
+// heavy load (32 boots, /tmp/h14/di): 0/32 PHYS-DOUBLE-ISSUE.  Decisive because
+// Thread-struct pages are NEVER freed (free_thread_entry no-op) ⇒ their shadow
+// bit is set-once/never-cleared, so any reissue would trip this with ZERO
+// masking — it never tripped.  So the #228 corruption is NOT a page double-issue;
+// it is a logical bug (Bug A: deferred-kstack drain zeroes a tid-reused LIVE
+// thread's stack_base; Bug B: masked kstack premature-free-realloc).  See
+// project_228_allocator_double_issue.  Back OFF (no per-alloc cost); flip true to re-verify.
 const DOUBLE_ISSUE_DETECT: bool = false;
 
 /// Shadow covers up to this many pages (8 GiB / 4 KiB).

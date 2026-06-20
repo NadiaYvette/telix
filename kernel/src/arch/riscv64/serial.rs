@@ -181,7 +181,12 @@ pub fn putc(c: u8) {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    Uart16550.write_fmt(args).unwrap();
+    // #228 hardening: never panic from a debug print.  write_str is infallible
+    // here, so the old `.unwrap()` was dead in the normal path — but it turned any
+    // panic-during-panic (the panic handler printing a corrupted message) into a
+    // confusing serial.rs double-panic that masked the real fault.  Drop the
+    // result instead so the real panic message survives + a print can't crash us.
+    let _ = Uart16550.write_fmt(args);
 }
 
 #[macro_export]
