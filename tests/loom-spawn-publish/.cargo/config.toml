@@ -1,0 +1,10 @@
+# Hard-wire --cfg loom so cargo test enables loom shims.  Override the
+# parent .cargo/config.toml's aarch64-unknown-none target (kernel) and
+# its build-std settings, both of which break host loom tests.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []
+build-std-features = []

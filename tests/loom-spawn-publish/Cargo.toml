@@ -1,0 +1,32 @@
+[package]
+name = "loom-spawn-publish"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the #228 Bug A'' publish-visibility race (2026-06-20).
+#
+# Kernel context (kernel/src/sched/scheduler.rs spawn-finalize + try_switch):
+# a freshly-spawned thread is made dispatchable by storing `state = Ready`.
+# Its `stack_base` (the kstack VA used to bound saved_sp at dispatch) is
+# written just before.  Both are PLAIN (non-atomic) Thread fields.  A
+# dispatcher on another CPU (try_switch via run-queue pop / rescue scan /
+# steal) reads `state`, sees Ready, then reads `stack_base`.  On rv64's weak
+# memory model a plain `state` read has no acquire barrier paired with the
+# spawner's release, so the dispatcher can observe Ready while stack_base is
+# still 0 -> kstack range 0x0..ksize -> saved_sp "OUTSIDE" -> spurious kill
+# (THREAD-CANARY-FAIL stack_base=0x0).  Empirically ~0.5% post-Bug-A/A'.
+#
+# This model proves: (1) Relaxed publish CAN expose Ready+stack_base==0
+# (the #[should_panic] test), (2) Release/Acquire publish CANNOT (the fix).
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]
