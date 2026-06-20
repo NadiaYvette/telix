@@ -352,7 +352,10 @@ pub fn enable_device_irq(irq: u32) {
     }
     #[cfg(target_arch = "loongarch64")]
     {
-        let _ = irq; // TODO: EIOINTC enable
+        // EXTIOI + PCH-PIC: ensure the controller is up, then route+enable this
+        // PCI IRQ to core 0 / HWI0.  See arch/loongarch64/eiointc.rs.
+        crate::arch::loongarch64::eiointc::init();
+        crate::arch::loongarch64::eiointc::enable_irq(irq);
     }
     #[cfg(target_arch = "mips64")]
     {
@@ -402,7 +405,9 @@ pub const fn valid_irq_range() -> (u32, u32) {
     }
     #[cfg(target_arch = "loongarch64")]
     {
-        (1, 15) // TODO: EIOINTC IRQ range
+        // PCI INTx land on PCH-PIC inputs 16..19 (pci.rs PCI_IRQ_BASE=16);
+        // allow the PCH-PIC input range.  EXTIOI delivery wired in eiointc.rs.
+        (16, 63)
     }
     #[cfg(target_arch = "mips64")]
     {

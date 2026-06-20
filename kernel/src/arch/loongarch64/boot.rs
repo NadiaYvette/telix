@@ -264,13 +264,18 @@ pub fn parse_firmware() {
     // `-m`.
     let _memmap_ok = read_fwcfg_memmap();
 
-    // LoongArch64 QEMU virt: PCI ECAM at hardcoded 0x2000_0000.
+    // LoongArch64 QEMU virt: PCI ECAM at 0x2000_0000.  QEMU's virt machine
+    // (hw/loongarch/virt.c, VIRT_PCI_CFG) maps a 128 MiB ECAM aperture = 128
+    // buses (1 MiB of config space per bus).  The previous 256-bus / 256 MiB
+    // values OVERRAN the aperture: pci_srv scanned to bus 255 and took an ADEM
+    // reading bus 128 at base+128 MiB, just past the real aperture (the parked
+    // loongarch64 "Unhandled exception ecode=0x8" on task=1).  Match QEMU.
     crate::firmware::set_pci_ecam(crate::firmware::PciEcamInfo {
         base: 0x2000_0000,
-        size: 256 * 32 * 8 * 4096, // 256 buses
+        size: 128 * 32 * 8 * 4096, // 128 buses = 0x800_0000 (QEMU VIRT_PCI_CFG_SIZE)
         segment: 0,
         bus_start: 0,
-        bus_end: 255,
+        bus_end: 127,
         _pad: 0,
     });
 

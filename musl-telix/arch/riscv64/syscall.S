@@ -113,3 +113,38 @@ __telix_recv_msg:
     addi sp, sp, 16
     ret
     .size __telix_recv_msg, . - __telix_recv_msg
+
+/* uint64_t __telix_call_msg(uint32_t port, uint64_t tag,
+ *                           uint64_t d0, uint64_t d1,
+ *                           uint64_t d2, uint64_t d3,
+ *                           struct telix_msg *out)
+ *
+ * SYS_CALL (118): send (tag,d0..d3) to port, block until reply, write reply
+ * into *out.  Faithful mirror of __telix_recv_msg (same reply capture); on
+ * riscv64 the C-arg regs a0-a5 already equal the syscall args
+ * (port,tag,d0,d1,d2,d3), and the 7th C arg (out) is in a6.
+ * Kernel returns: a0=status, a1=tag, a2..a7=data[0..5].
+ */
+    .global __telix_call_msg
+    .type __telix_call_msg, @function
+__telix_call_msg:
+    addi sp, sp, -16
+    sd s0, 0(sp)
+    sd ra, 8(sp)
+    mv s0, a6                /* save out pointer (7th C arg) */
+    li a7, 118               /* SYS_CALL = 118 */
+    /* a0-a5 already = port,tag,d0,d1,d2,d3 */
+    ecall
+    sd a1, 0(s0)             /* out->tag */
+    sd a2, 8(s0)             /* out->data[0] */
+    sd a3, 16(s0)            /* out->data[1] */
+    sd a4, 24(s0)            /* out->data[2] */
+    sd a5, 32(s0)            /* out->data[3] */
+    sd a6, 40(s0)            /* out->data[4] */
+    sd a7, 48(s0)            /* out->data[5] */
+    /* a0 still has status */
+    ld s0, 0(sp)
+    ld ra, 8(sp)
+    addi sp, sp, 16
+    ret
+    .size __telix_call_msg, . - __telix_call_msg

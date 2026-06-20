@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod eiointc;
 pub mod hypervisor;
 pub mod mm;
 pub mod pci;

@@ -322,7 +322,31 @@ pub(crate) fn push_acpi_table(desc: AcpiTableDesc) {
 }
 
 #[allow(dead_code)]
-pub(crate) fn set_pci_ecam(info: PciEcamInfo) {
+pub(crate) fn set_pci_ecam(mut info: PciEcamInfo) {
+    // ECAM holds exactly 1 MiB of config space per bus (256 dev × 8 fn × 4 KiB).
+    // A firmware/DTB/MCFG `bus-range` that exceeds what `size` can address makes
+    // an enumerator read past the mapped ECAM region — the loongarch64 ADE
+    // (pci_srv scanned buses 0..255 against a 128 MiB / 128-bus region → fault
+    // at base+128 MiB) and the riscv64 #249 family.  Clamp bus_end to the region
+    // size so the advertised bus range can never overrun the mapping.
+    if info.size != 0 {
+        let max_buses = info.size / 0x10_0000; // 1 MiB per bus
+        if max_buses != 0 {
+            let max_bus_end = (info.bus_start as u64)
+                .saturating_add(max_buses - 1)
+                .min(255) as u8;
+            if info.bus_end > max_bus_end {
+                crate::println!(
+                    "  PCI ECAM: clamping bus_end {}->{} to fit size {:#x} ({} buses)",
+                    info.bus_end,
+                    max_bus_end,
+                    info.size,
+                    max_buses
+                );
+                info.bus_end = max_bus_end;
+            }
+        }
+    }
     unsafe {
         *PCI_ECAM.0.get() = info;
     }

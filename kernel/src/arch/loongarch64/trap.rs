@@ -368,10 +368,14 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 handle_ipi_irq();
                 crate::sched::tick(frame_sp)
             } else if is & (1 << 2) != 0 {
-                // HWI0 — external device interrupt.
-                // TODO: proper interrupt controller dispatch.
-                crate::println!("LoongArch64: HWI0 interrupt");
-                frame_sp
+                // HWI0 — external device interrupt.  EXTIOI routes PCI IRQs to
+                // CPU HWI0; drain this core's EXTIOI pending bits, dispatch each
+                // to its registered IRQ port (W1C-acked in claim_and_dispatch),
+                // then run the scheduler so a woken server thread can preempt.
+                crate::arch::loongarch64::eiointc::claim_and_dispatch(|irq| {
+                    crate::io::irq_dispatch::handle_irq(irq);
+                });
+                crate::sched::tick(frame_sp)
             } else {
                 crate::println!("LoongArch64: unhandled interrupt IS={:#x}", is);
                 frame_sp
@@ -505,8 +509,22 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 put_bytes(&mut buf, &mut k, b"\n");
                 handler_write_bytes(&buf[..k.min(buf.len())]);
             }
-            loop {
-                core::hint::spin_loop();
+            // User-mode unhandled exceptions (ADE/ALE/...) must TERMINATE the
+            // faulting thread with a signal — NOT spin-loop this CPU forever
+            // (which wedges the core and hangs every client of a faulting
+            // server).  Mirrors the PIL-Failed (-11) and INE (-4) arms above.
+            // A kernel-mode unhandled exception is a genuine kernel bug → keep
+            // the spin so the state is preserved for inspection.
+            if (frame.prmd & 0x3) == 3 {
+                let sig = match ecode {
+                    ECODE_ALE => -7,  // SIGBUS (alignment error)
+                    _ => -11,         // SIGSEGV (address error / other)
+                };
+                crate::sched::scheduler::exit_current_thread(sig)
+            } else {
+                loop {
+                    core::hint::spin_loop();
+                }
             }
         }
     }

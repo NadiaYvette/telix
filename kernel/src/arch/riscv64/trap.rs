@@ -589,6 +589,16 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 put_hex_u64(&mut buf, &mut k, read_stval() as u64);
                 put_bytes(&mut buf, &mut k, b"\n");
                 handler_write_bytes(&buf[..k.min(buf.len())]);
+                // User-mode unhandled exception (illegal instr / misaligned /
+                // etc.) → SIGSEGV the faulting thread instead of wedging this
+                // CPU forever (which also hangs every client of a faulting
+                // server).  sstatus.SPP (bit 8) == 0 means the trap came from
+                // U-mode.  Mirrors the page-fault Failed arm (-11) above;
+                // kernel-mode (SPP=1) is a genuine kernel bug → spin to preserve
+                // state for inspection.  (Same class as the loongarch64 ADE fix.)
+                if (frame.sstatus >> 8) & 1 == 0 {
+                    crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
+                }
                 loop {
                     core::hint::spin_loop();
                 }

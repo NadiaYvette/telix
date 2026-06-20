@@ -302,13 +302,22 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
         }
 
         _ => {
+            let ksu = (frame.status >> 3) & 0x3;
             crate::println!(
-                "Unhandled exception: exccode={:#x} cause={:#x} epc={:#x} badvaddr={:#x}",
+                "Unhandled exception: exccode={:#x} cause={:#x} epc={:#x} badvaddr={:#x} ksu={}",
                 exccode,
                 cause,
                 frame.epc,
-                frame.badvaddr
+                frame.badvaddr,
+                ksu
             );
+            // User-mode (ksu==2) unhandled exception → SIGSEGV the faulting
+            // thread instead of wedging this CPU forever.  Mirrors the page-
+            // fault Failed arm (-11) above; kernel-mode is a genuine kernel bug
+            // → spin to preserve state.  (Same class as the loongarch64 ADE fix.)
+            if ksu == 2 {
+                return crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
+            }
             loop {
                 core::hint::spin_loop();
             }

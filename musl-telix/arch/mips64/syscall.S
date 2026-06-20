@@ -151,3 +151,39 @@ __telix_recv_msg:
     nop
     .end    __telix_recv_msg
     .size   __telix_recv_msg, . - __telix_recv_msg
+
+/* uint64_t __telix_call_msg(uint32_t port, uint64_t tag,
+ *                           uint64_t d0, uint64_t d1, uint64_t d2,
+ *                           uint64_t d3, struct telix_msg *out)
+ *
+ * SYS_CALL (118): send + block-for-reply, reply written to *out.  Faithful
+ * mirror of __telix_recv_msg; n64 C-arg regs $4-$9 already equal the syscall
+ * args (port,tag,d0,d1,d2,d3); 7th C arg (out) is in $10 ($a6).
+ * Kernel returns: $v0=status, $5=tag, $6..$11=data[0..5].
+ */
+    .global __telix_call_msg
+    .type   __telix_call_msg, @function
+    .ent    __telix_call_msg
+__telix_call_msg:
+    daddiu  $sp, $sp, -16
+    sd      $s0, 0($sp)
+    sd      $ra, 8($sp)
+    move    $s0, $10            /* save out pointer (7th C arg, $a6) */
+    dli     $v0, 118            /* SYS_CALL = 118 */
+    /* $4-$9 already = port,tag,d0,d1,d2,d3 */
+    syscall
+    sd      $5, 0($s0)          /* out->tag */
+    sd      $6, 8($s0)          /* out->data[0] */
+    sd      $7, 16($s0)         /* out->data[1] */
+    sd      $8, 24($s0)         /* out->data[2] */
+    sd      $9, 32($s0)         /* out->data[3] */
+    sd      $10, 40($s0)        /* out->data[4] */
+    sd      $11, 48($s0)        /* out->data[5] */
+    /* $v0 still has status. */
+    ld      $s0, 0($sp)
+    ld      $ra, 8($sp)
+    daddiu  $sp, $sp, 16
+    jr      $ra
+    nop
+    .end    __telix_call_msg
+    .size   __telix_call_msg, . - __telix_call_msg
