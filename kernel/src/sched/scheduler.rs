@@ -11095,6 +11095,12 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
                     }
                     wake_parked_thread(caller_tid);
                 }
+                crate::ipc::call_reply::FulfillResult::DeliverToCompletion { task, user_data } => {
+                    // OP_CALL issuer awaiting a reply on its completion ring:
+                    // deliver a SERVER_DIED reply-CQE to its CQ so it does not
+                    // wait forever for a reply the dead server will never send.
+                    crate::ipc::completion::deliver_reply_cqe(task, user_data, &died);
+                }
                 _ => {}
             }
             // free() revokes any grant leases on the cap and returns the

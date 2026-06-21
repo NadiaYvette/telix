@@ -118,8 +118,15 @@ pub struct ReplyCap {
     pub generation: AtomicU32,
     /// Current lifecycle state (CAP_* constants above).
     pub state: AtomicU32,
-    /// Thread ID of the parked caller (set on alloc).
+    /// Thread ID of the parked caller (set on alloc). 0 for a completion cap
+    /// (OP_CALL) — there is no parked thread to wake.
     pub caller_tid: AtomicU32,
+    /// Completion destination (OP_CALL): if non-zero, fulfilling this cap
+    /// delivers a reply-CQE to this task's completion queue instead of waking
+    /// a parked sync caller. Set by `alloc_completion`.
+    pub completion_task: AtomicU32,
+    /// Correlation token echoed in the reply CQE's `user_data` (OP_CALL).
+    pub completion_user_data: AtomicU64,
     /// Reply message: tag. Written by sys_reply before state transition.
     pub reply_tag: AtomicU64,
     /// Reply message: data[0..6].
@@ -146,6 +153,8 @@ impl ReplyCap {
             generation: AtomicU32::new(0),
             state: AtomicU32::new(CAP_FREE),
             caller_tid: AtomicU32::new(0),
+            completion_task: AtomicU32::new(0),
+            completion_user_data: AtomicU64::new(0),
             reply_tag: AtomicU64::new(0),
             reply_data: [
                 AtomicU64::new(0),
@@ -248,6 +257,9 @@ pub fn alloc(caller_tid: u32) -> Option<CapHandle> {
             // Bump generation before publishing the handle.
             let g = cap.generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
             cap.caller_tid.store(caller_tid, Ordering::Relaxed);
+            // Default to a sync (non-completion) cap; alloc_completion overrides.
+            cap.completion_task.store(0, Ordering::Relaxed);
+            cap.completion_user_data.store(0, Ordering::Relaxed);
             // Clear stale reply fields.
             cap.reply_tag.store(0, Ordering::Relaxed);
             for i in 0..6 {
@@ -265,6 +277,21 @@ pub fn alloc(caller_tid: u32) -> Option<CapHandle> {
         }
     }
     None
+}
+
+/// Allocate a reply-cap whose fulfillment delivers a reply-CQE to
+/// `issuer_task`'s completion queue (tagged `user_data`) rather than waking a
+/// parked sync caller. Used by the completion ABI's `OP_CALL`: the issuer does
+/// not block, so `caller_tid` is left 0 — `fulfill` routes via
+/// `FulfillResult::DeliverToCompletion`. Returns the handle to ride in the
+/// outbound message's `data[5]`, or None if the slab is exhausted.
+pub fn alloc_completion(issuer_task: u32, user_data: u64) -> Option<CapHandle> {
+    let handle = alloc(0)?; // no parked caller thread
+    if let Some(cap) = lookup(handle) {
+        cap.completion_task.store(issuer_task, Ordering::Release);
+        cap.completion_user_data.store(user_data, Ordering::Release);
+    }
+    Some(handle)
 }
 
 /// Free a cap slot that has been consumed. Only called by the caller
@@ -380,6 +407,18 @@ pub fn fulfill(handle: CapHandle, reply: &Message) -> FulfillResult {
                 return FulfillResult::InvalidHandle;
             }
             cap.store_reply(reply);
+            // OP_CALL completion cap: route the reply to the issuer's CQ rather
+            // than waking a parked sync caller (there is none — caller_tid is
+            // 0). Checked before the tid logic for exactly that reason.
+            let comp_task = cap.completion_task.load(Ordering::Acquire);
+            if comp_task != 0 {
+                let ud = cap.completion_user_data.load(Ordering::Acquire);
+                crate::sched::scheduler::trace_point("call_reply.fulfill.completion", comp_task);
+                return FulfillResult::DeliverToCompletion {
+                    task: comp_task,
+                    user_data: ud,
+                };
+            }
             let tid = cap.caller_tid.load(Ordering::Acquire);
             crate::sched::scheduler::trace_point("call_reply.fulfill.cas_ok", tid);
             if tid == 0 {
@@ -407,6 +446,10 @@ pub fn fulfill(handle: CapHandle, reply: &Message) -> FulfillResult {
 pub enum FulfillResult {
     /// Caller is parked; wake the indicated TID with the stored reply.
     WakeCaller(u32),
+    /// OP_CALL issuer awaiting on a completion ring: deliver a reply-CQE to
+    /// `task`'s CQ tagged with `user_data` (no parked thread to wake). The
+    /// caller is responsible for the delivery and for `free`ing the cap.
+    DeliverToCompletion { task: u32, user_data: u64 },
     /// Caller died while waiting. Reply has been dropped; slot is free.
     Abandoned,
     /// Handle did not refer to a Pending cap (double-reply, stale, etc.).

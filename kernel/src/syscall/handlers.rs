@@ -992,6 +992,75 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
     }
 }
 
+/// Outbound send for the completion ABI's OP_SEND / OP_CALL (called from
+/// `completion::perform_sqe`). Mirrors `sys_send`'s delivery; for OP_CALL,
+/// `reply_handle` is Some and the reply-cap rides in `msg.data[5]` for the
+/// queue / completion-CQ path, while a direct hand-off to a parked *legacy*
+/// receiver installs it on the receiver's `held_reply_cap` and hides it from
+/// data[5] (exactly as sys_call does). No cap-lifetime priority donation: the
+/// OP_CALL issuer does not block, so there is no classic inversion to avoid.
+/// Returns true on delivery.
+pub(crate) fn completion_send(
+    dest_port: u64,
+    msg: &mut crate::ipc::Message,
+    reply_handle: Option<u64>,
+) -> bool {
+    use core::sync::atomic::Ordering;
+    if !check_port_cap(dest_port, crate::cap::Rights::SEND) {
+        return false;
+    }
+    let sender_tid = crate::sched::current_thread_id();
+    let sender_prio = crate::sched::thread_effective_priority(sender_tid);
+    match crate::ipc::port::send_direct(dest_port, msg) {
+        crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
+            // Parked legacy receiver: L4-style direct hand-off (mirrors sys_send).
+            crate::sched::boost_priority(receiver_tid, sender_prio);
+            let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_sender_identity(receiver_task, msg.data[4]);
+            auto_grant_reply_caps(receiver_task, msg);
+            if let Some(h) = reply_handle {
+                crate::sched::scheduler::thread_ref(receiver_tid)
+                    .held_reply_cap
+                    .store(h, Ordering::Release);
+                msg.data[5] = 0; // hide reply-cap from the injected frame's view
+            }
+            inject_recv_into_frame(receiver_tid, msg);
+            let tref = crate::sched::scheduler::thread_ref(receiver_tid);
+            if tref
+                .park_state
+                .compare_exchange(
+                    crate::sched::scheduler::PARK_COMMITTED,
+                    crate::sched::scheduler::PARK_NONE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                while tref.stack_switch_pending.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+                crate::sched::scheduler::handoff_to(receiver_tid);
+            } else {
+                let _ = tref.park_state.compare_exchange(
+                    crate::sched::scheduler::PARK_ENQUEUED,
+                    crate::sched::scheduler::PARK_NONE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            true
+        }
+        // Queued covers both the legacy queue AND a completion-server target
+        // (the deliver-hook posted the message — with data[5]'s reply-cap — to
+        // its CQ). Either way the receiver extracts the reply-cap itself.
+        crate::ipc::port::SendDirectResult::Queued => true,
+        crate::ipc::port::SendDirectResult::Full => {
+            crate::ipc::port::send(dest_port, *msg).is_ok()
+        }
+        crate::ipc::port::SendDirectResult::Error => false,
+    }
+}
+
 fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
     // Explicit cross-CPU full fence: drain the calling CPU's store buffer
     // and force a memory barrier before queuing this message.  Senders that
@@ -1416,6 +1485,24 @@ fn sys_recv_with_cap(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     }
 }
 
+/// Deliver an OP_CALL reply to the issuer's completion queue and free the cap.
+/// Shared by every reply path (sys_reply / complete_reply_to / sys_reply_to)
+/// when `fulfill` reports the cap was a completion (OP_CALL) cap rather than a
+/// parked sync caller.
+fn deliver_completion_reply(
+    handle: u64,
+    task: u32,
+    user_data: u64,
+    reply: &crate::ipc::Message,
+) -> u64 {
+    // Mirror the WakeCaller path: auto-grant any reply-cap port-ids in the
+    // reply so the issuer task can use them.
+    auto_grant_reply_caps(task, reply);
+    crate::ipc::completion::deliver_reply_cqe(task, user_data, reply);
+    crate::ipc::call_reply::free(handle);
+    0
+}
+
 fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
     use crate::ipc::call_reply;
 
@@ -1427,6 +1514,9 @@ fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
     }
     let reply = crate::ipc::Message::new(tag, data);
     match call_reply::fulfill(handle, &reply) {
+        call_reply::FulfillResult::DeliverToCompletion { task, user_data } => {
+            deliver_completion_reply(handle, task, user_data, &reply)
+        }
         call_reply::FulfillResult::WakeCaller(caller_tid) => {
             // Auto-grant SEND on any port IDs in the reply data so the
             // caller can use them (e.g. an FS server's port returned by
@@ -1456,6 +1546,9 @@ fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
 /// ABI's OP_REPLY bridge (mirrors `sys_reply`'s WakeCaller arm).
 pub(crate) fn complete_reply_to(handle: u64, reply: &crate::ipc::Message) -> u64 {
     match crate::ipc::call_reply::fulfill(handle, reply) {
+        crate::ipc::call_reply::FulfillResult::DeliverToCompletion { task, user_data } => {
+            deliver_completion_reply(handle, task, user_data, reply)
+        }
         crate::ipc::call_reply::FulfillResult::WakeCaller(caller_tid) => {
             let caller_task = crate::sched::scheduler::thread_task_id(caller_tid);
             auto_grant_reply_caps(caller_task, reply);
@@ -1537,6 +1630,9 @@ fn sys_reply_to(handle: u64, tag: u64, data: [u64; 6]) -> u64 {
     }
     let reply = crate::ipc::Message::new(tag, data);
     match call_reply::fulfill(handle, &reply) {
+        call_reply::FulfillResult::DeliverToCompletion { task, user_data } => {
+            deliver_completion_reply(handle, task, user_data, &reply)
+        }
         call_reply::FulfillResult::WakeCaller(caller_tid) => {
             // Same auto-grant rationale as sys_reply: ports returned in
             // the reply (e.g. fs_port from VFS_OPEN_OK forwarded via

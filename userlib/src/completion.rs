@@ -13,7 +13,13 @@
 //! consumer (owns `head`), for the CQ the kernel is the producer (owns `tail`).
 
 use crate::arch;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Source of OP_CALL correlation tokens (the CQE's `user_data`).
+static NEXT_CALL_TOKEN: AtomicU64 = AtomicU64::new(0);
+/// High bit set on every call token so a reply CQE (`user_data != 0`) is always
+/// distinguishable from an inbound request CQE (`user_data == 0`).
+const CALL_TOKEN_BIT: u64 = 1 << 63;
 
 const SYS_IO_SETUP: u64 = 130;
 const SYS_IO_SUBMIT: u64 = 131;
@@ -150,6 +156,43 @@ impl Rings {
     /// Pop one completion (consumer side of the CQ). Returns None if empty.
     pub fn reap(&self) -> Option<Cqe> {
         unsafe { ring_pop::<Cqe>(self.cq) }
+    }
+
+    /// Issue an `OP_CALL` to `dest_cap` and block until its reply CQE arrives.
+    /// `tag` is the wire opcode for the destination server; `args` are up to 4
+    /// payload words (delivered as the message's data[0..3]). Returns the reply
+    /// `Cqe` — its `result` is the reply tag, `inline` the reply data,
+    /// `delivered_cap` any cap the reply granted — or None if the SQE could not
+    /// be queued.
+    ///
+    /// The correlation `user_data` carries `CALL_TOKEN_BIT`, so the reply CQE
+    /// (`user_data != 0`) is always distinguishable from an inbound request CQE
+    /// (`user_data == 0`). This is the simple one-outstanding-call form; a
+    /// fan-out server multiplexing many in-flight calls drives the ring
+    /// directly and correlates by token itself.
+    pub fn call(&self, dest_cap: u64, tag: u64, args: [u64; 4]) -> Option<Cqe> {
+        let token = NEXT_CALL_TOKEN.fetch_add(1, Ordering::Relaxed) | CALL_TOKEN_BIT;
+        let sqe = Sqe {
+            opcode: OP_CALL,
+            flags: 0,
+            target_cap: dest_cap,
+            user_data: token,
+            inline: [tag, args[0], args[1], args[2], args[3]],
+        };
+        if !self.push(sqe) {
+            return None;
+        }
+        self.submit();
+        loop {
+            self.reap_wait(1);
+            while let Some(cqe) = self.reap() {
+                if cqe.user_data == token {
+                    return Some(cqe);
+                }
+                // Not our reply (e.g. an inbound request, user_data == 0, on a
+                // shared ring) — ignore it for this blocking call.
+            }
+        }
     }
 
     /// Run a classic request/reply server on the completion queue — the

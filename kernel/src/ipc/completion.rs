@@ -185,6 +185,7 @@ pub const OP_NOP: u32 = 0xFFFF_FFFF;
 /// `Cqe.result` ok / not-yet-implemented (real opcodes land in step ③).
 pub const RES_OK: i64 = 0;
 pub const RES_ENOSYS: i64 = -38; // mirrors Linux ENOSYS for familiarity
+pub const RES_EIO: i64 = -5; // mirrors Linux EIO — outbound send/alloc failed
 
 /// Phase-0 ring depth bounds (entries per ring; power of two; single-page).
 pub const MIN_DEPTH: u32 = 2;
@@ -323,8 +324,74 @@ fn perform_sqe(sqe: &Sqe) -> Option<Cqe> {
             crate::syscall::handlers::complete_reply_to(sqe.target_cap, &reply);
             None
         }
-        // OP_SEND / OP_CALL (outbound from a completion server) are a later
-        // phase; for now they complete with -ENOSYS.
+        OP_SEND => {
+            // Fire-and-forget send to target_cap (a port). The outbound
+            // message is tag = inline[0], data[0..4] = inline[1..5] (4 payload
+            // words) + sender identity in data[4]; no reply-cap. (The wire tag
+            // must stay separate from `user_data`, which is the issuer's
+            // private correlation token — hence tag = inline[0].)
+            let issuer = crate::sched::scheduler::current_task_id();
+            let mut msg = crate::ipc::Message::new(
+                sqe.inline[0],
+                [
+                    sqe.inline[1],
+                    sqe.inline[2],
+                    sqe.inline[3],
+                    sqe.inline[4],
+                    crate::sched::task_port_id(issuer),
+                    0,
+                ],
+            );
+            let ok = crate::syscall::handlers::completion_send(sqe.target_cap, &mut msg, None);
+            Some(Cqe {
+                user_data: sqe.user_data,
+                result: if ok { RES_OK } else { RES_EIO },
+                delivered_cap: 0,
+                inline: [0; 5],
+            })
+        }
+        OP_CALL => {
+            // Async call: allocate a completion reply-cap bound to this task +
+            // user_data, send the request to target_cap carrying that cap in
+            // data[5], and post NO CQE now — the reply arrives later as a CQE
+            // (matched by user_data) via fulfill -> deliver_reply_cqe.
+            let issuer = crate::sched::scheduler::current_task_id();
+            let handle = match crate::ipc::call_reply::alloc_completion(issuer, sqe.user_data) {
+                Some(h) => h,
+                None => {
+                    // Reply-cap slab exhausted — report the failure now.
+                    return Some(Cqe {
+                        user_data: sqe.user_data,
+                        result: RES_EIO,
+                        delivered_cap: 0,
+                        inline: [0; 5],
+                    });
+                }
+            };
+            let mut msg = crate::ipc::Message::new(
+                sqe.inline[0],
+                [
+                    sqe.inline[1],
+                    sqe.inline[2],
+                    sqe.inline[3],
+                    sqe.inline[4],
+                    crate::sched::task_port_id(issuer),
+                    handle,
+                ],
+            );
+            if crate::syscall::handlers::completion_send(sqe.target_cap, &mut msg, Some(handle)) {
+                None // reply CQE is delivered asynchronously on fulfill
+            } else {
+                // Send failed — free the cap and report the error now.
+                crate::ipc::call_reply::free(handle);
+                Some(Cqe {
+                    user_data: sqe.user_data,
+                    result: RES_EIO,
+                    delivered_cap: 0,
+                    inline: [0; 5],
+                })
+            }
+        }
         _ => Some(Cqe {
             user_data: sqe.user_data,
             result: RES_ENOSYS,
@@ -475,6 +542,50 @@ pub fn deliver_to_completion_cq(task_id: u32, msg: &crate::ipc::Message) -> bool
     // Wake the server if parked in io_reap_wait. The bucket lock taken here and
     // in port_enqueue_with_check's recheck serializes us against a concurrent
     // park, giving lost-wakeup safety (no-op if the server isn't parked).
+    let _ = crate::sync::turnstile::port_wake_one(task.port_id, crate::sync::turnstile::KEY_IO_REAP);
+    true
+}
+
+/// Deliver an `OP_CALL` *reply* to `task_id`'s CQ, tagged with the issuer's
+/// correlation `user_data` (vs `deliver_to_completion_cq`, which tags inbound
+/// requests with `user_data = 0`). Called from the reply paths (`fulfill` ->
+/// `DeliverToCompletion`). Wakes the issuer if parked in `io_reap_wait`.
+/// Returns false if the task has no CQ or the CQ is full.
+///
+/// Reply `Message` -> `Cqe`:
+///   user_data     = the issuer's correlation token (echoed)
+///   result        = reply.tag (the reply opcode / status)
+///   inline[0..5]  = reply.data[0..4]
+///   delivered_cap = reply.data[5] (any cap the reply granted)
+pub fn deliver_reply_cqe(task_id: u32, user_data: u64, reply: &crate::ipc::Message) -> bool {
+    let task = match crate::sched::scheduler::task_ref_opt(task_id) {
+        Some(t) => t,
+        None => return false,
+    };
+    let cq_kva = task.io_cq_kva.load(Ordering::Relaxed);
+    if cq_kva == 0 {
+        crate::println!("IOREPLY-NOCTX: task={} ud={:#x}", task_id, user_data);
+        return false;
+    }
+    let cqe = Cqe {
+        user_data,
+        result: reply.tag as i64,
+        delivered_cap: reply.data[5],
+        inline: [
+            reply.data[0],
+            reply.data[1],
+            reply.data[2],
+            reply.data[3],
+            reply.data[4],
+        ],
+    };
+    // SAFETY: the kernel is the sole CQ producer for this task; cq_kva is its
+    // live CQ ring.
+    let pushed = unsafe { cq_ring(cq_kva).push(cqe) };
+    if !pushed {
+        crate::println!("IOREPLY-FULL: task={} ud={:#x}", task_id, user_data);
+        return false;
+    }
     let _ = crate::sync::turnstile::port_wake_one(task.port_id, crate::sync::turnstile::KEY_IO_REAP);
     true
 }

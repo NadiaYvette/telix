@@ -431,6 +431,42 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5g: OP_CALL round-trip (completion ABI 2b) ---
+    // Validates the OP_CALL wiring: init opens a ring and OP_CALLs the
+    // completion-converted devfs (spawned in Phase 5f), reaping the matching
+    // reply CQE. Exercises perform_sqe OP_CALL -> completion_send -> devfs CQ
+    // -> serve OP_REPLY -> call_reply::fulfill -> DeliverToCompletion ->
+    // deliver_reply_cqe -> init's CQ. Teardown restores init's normal recv.
+    // Gated to focus to match Phase 5f's devfs spawn.
+    if STEP_H_FOCUS_H13 {
+        let devfs_port = syscall::ns_lookup_wait(b"devfs").unwrap_or(0);
+        let mut ok = devfs_port != 0;
+        if ok {
+            if let Some(rings) = userlib::completion::Rings::setup(8) {
+                let (fn0, fn1, _) = pack_name(b"null");
+                // OP_CALL FS_OPEN "null": data[0..3] = [fn0, fn1, namelen, 0].
+                match rings.call(devfs_port, 0x2000, [fn0, fn1, 4, 0]) {
+                    Some(cqe) => {
+                        if cqe.result as u64 != 0x2001 {
+                            ok = false; // expected FS_OPEN_OK
+                        }
+                    }
+                    None => ok = false,
+                }
+                // Drop the ring so the deliver hook stops routing init's normal
+                // recv IPC into the (now unreaped) CQ.
+                userlib::completion::teardown();
+            } else {
+                ok = false;
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5g OP_CALL round-trip: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5g OP_CALL round-trip: FAILED\n");
+        }
+    }
+
     // --- Phase 5f: early pipe_srv call/reply smoke test ---
     // Covers PIPE_CREATE, PIPE_WRITE (synchronous), PIPE_READ (data-available
     // path), and PIPE_CLOSE. The blocking-read path (sys_reply_take +
