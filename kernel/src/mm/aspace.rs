@@ -1079,11 +1079,17 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                 let mmu_count = vma.mmu_page_count();
                 let fg = space.fork_group;
 
-                // Break shared page table paths before modifying PTEs.
+                // Break shared page table paths before modifying PTEs.  If the
+                // COW-break OOMs we must not proceed to update_pte_flags on a
+                // still-shared path — fail the mprotect (ENOMEM) instead of
+                // silently dropping the failure.
                 if !fg.is_null() {
                     for mmu_idx in 0..mmu_count {
                         let mmu_va = vma.va_start + mmu_idx * MMUPAGE_SIZE;
-                        hat::ensure_path_unshared(pt_root, mmu_va, fg);
+                        if !hat::ensure_path_unshared(pt_root, mmu_va, fg) {
+                            crate::println!("[mprotect] COW-break OOM va={:#x} -> ENOMEM", mmu_va);
+                            return false;
+                        }
                     }
                 }
 

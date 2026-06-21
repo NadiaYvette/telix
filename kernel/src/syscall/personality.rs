@@ -878,7 +878,15 @@ pub fn personality_mmap_anon(target_port: u64, va_hint: u64, page_count: u64, pr
     let fork_group = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.fork_group);
     for mmu_idx in 0..mmu_pages {
         let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
-        crate::mm::hat::ensure_path_unshared(pt_root, mmu_va, fork_group);
+        // COW-break can OOM (cow_break_table -> alloc_page None).  Unlike the
+        // fault path (fault.rs:124) this return was silently dropped, leaving
+        // the shared marker in place so map_range below failed with a
+        // misleading "OutOfMemory" — masking the real upstream alloc failure.
+        // Fail the mmap clean (ENOMEM) and surface the true cause instead.
+        if !crate::mm::hat::ensure_path_unshared(pt_root, mmu_va, fork_group) {
+            crate::println!("[mmap_anon] COW-break OOM va={:#x} -> ENOMEM", mmu_va);
+            return u64::MAX;
+        }
     }
 
     let sw_z = crate::mm::fault::sw_zeroed_bit();
@@ -1030,7 +1038,12 @@ pub fn personality_mmap_fixed(target_port: u64, va: u64, page_count: u64, prot: 
     let fork_group = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.fork_group);
     for mmu_idx in 0..mmu_pages {
         let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
-        crate::mm::hat::ensure_path_unshared(pt_root, mmu_va, fork_group);
+        // See personality_mmap_anon: dropping the COW-break OOM masks the real
+        // alloc failure as a map_range "OutOfMemory".  Fail clean (ENOMEM).
+        if !crate::mm::hat::ensure_path_unshared(pt_root, mmu_va, fork_group) {
+            crate::println!("[mmap_fixed] COW-break OOM va={:#x} -> ENOMEM", mmu_va);
+            return u64::MAX;
+        }
     }
 
     let sw_z = crate::mm::fault::sw_zeroed_bit();
@@ -1370,10 +1383,18 @@ pub fn personality_map_shared(
         };
 
         // Ensure the target's page table path is unshared (post-fork).
-        crate::mm::hat::ensure_path_unshared(target_pt, dst_va, fork_group);
+        // A dropped OOM here would let map_single_mmupage hit the still-shared
+        // marker and silently fail; fail the call clean (ENOMEM) instead.
+        if !crate::mm::hat::ensure_path_unshared(target_pt, dst_va, fork_group) {
+            crate::println!("[map_shared] COW-break OOM dst_va={:#x} -> ENOMEM", dst_va);
+            return u64::MAX;
+        }
 
         // Map the caller's physical page into the target's page table.
-        crate::mm::hat::map_single_mmupage(target_pt, dst_va, pa, pte_flags);
+        if !crate::mm::hat::map_single_mmupage(target_pt, dst_va, pa, pte_flags) {
+            crate::println!("[map_shared] map PTE FAIL dst_va={:#x} -> ENOMEM", dst_va);
+            return u64::MAX;
+        }
     }
 
     target_va as u64

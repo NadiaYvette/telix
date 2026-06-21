@@ -1917,6 +1917,21 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     // Eagerly allocate physical pages and install PTEs.
     let pt_root = crate::sched::scheduler::current_page_table_root();
 
+    // #228 COW-PT: the native mmap path (unlike personality_mmap_anon) was
+    // missing the shared-marker break.  After a fork the page table may carry
+    // COW-shared markers at intermediate levels; walk_or_create (in
+    // map_single_mmupage) returns None on a shared marker, so map_range below
+    // fails with a misleading "OutOfMemory".  Break the markers for the whole
+    // VA range first, mirroring the personality path, and fail clean on OOM.
+    let fork_group = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.fork_group);
+    for mmu_idx in 0..mmu_pages {
+        let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
+        if !crate::mm::hat::ensure_path_unshared(pt_root, mmu_va, fork_group) {
+            crate::println!("[mmap] COW-break OOM va={:#x} -> ENOMEM", mmu_va);
+            return u64::MAX;
+        }
+    }
+
     let sw_z = crate::mm::fault::sw_zeroed_bit();
     let pte_flags = if prot == VmaProt::None {
         0
