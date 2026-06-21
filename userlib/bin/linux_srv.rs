@@ -1119,6 +1119,13 @@ static mut SYSCALL_WORKER_PORT: u64 = 0;
 static WORKERS_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// LB (linux_srv inbound -> completion CQ): when true the main loop reaps the
+/// task CQ and demuxes by source_port instead of port_set_recv, and the reply/
+/// worker thread pools are NOT spawned (their ports route to the same CQ).
+/// Default false => legacy port_set_recv + thread pools, byte-for-byte unchanged.
+static LINUX_CQ_INBOUND: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 const MAX_PENDING_ASYNC: usize = 64;
 
 #[derive(Copy, Clone)]
@@ -12847,6 +12854,70 @@ extern "C" fn syscall_worker_entry(_arg: u64) -> ! {
 /// (only LIB_CACHE chunks_cached + scratch slot bitmap + the user's
 /// mmap backing region), which keeps cross-thread state to the
 /// async-table primitives already lockless via atomic kind discriminant.
+/// Per-message body of the IRFS reply path: validate the reply tag, locate the
+/// pending-async slot by correlation, verify the scratch csum, and dispatch the
+/// matching finish_* continuation.  Shared by the legacy reply thread
+/// (reply_thread_entry) and the CQ-inbound main loop demux so behavior is
+/// identical regardless of which path delivered the message.
+fn handle_irfs_reply(msg: &syscall::Message) {
+    if msg.tag != IRFS_IO_READ_REPLY && msg.tag != FS_READ_REPLY {
+        // Not expected on this port; drop quietly so a stray
+        // sender doesn't wedge the loop.  FS_READ_REPLY shares the
+        // port (and the same payload shape: correlation, bytes_read,
+        // optional csum) so the rest of the loop handles both.
+        return;
+    }
+    let correlation = msg.data[0];
+    let bytes_read = msg.data[1];
+    let irfs_csum = msg.data[2] as u32; // 0 if irfs side didn't compute one
+    let slot = match async_find_by_correlation(correlation) {
+        Some(s) => s,
+        None => return,
+    };
+    let kind = unsafe { PENDING_ASYNC[slot].kind };
+    // Verify scratch-bytes csum matches what initramfs_srv just wrote.
+    // Diverging csums = phys-page mismatch / cache coherence shape
+    // (project_grant_pages_phys_mismatch.md).  Logged regardless of
+    // which finish_* takes the slot — happens before consumption so
+    // the dump captures the exact corruption window.
+    if irfs_csum != 0 && bytes_read > 0 {
+        let scratch_local = unsafe {
+            async_scratch_local_va(PENDING_ASYNC[slot].scratch_slot)
+        };
+        let view = unsafe {
+            core::slice::from_raw_parts(scratch_local as *const u8, bytes_read as usize)
+        };
+        let lin_csum = irfs_csum32(view);
+        if lin_csum != irfs_csum {
+            syscall::debug_puts(b"[lsrv] CSUM-MISMATCH IRFS_ASYNC corr=");
+            let mut buf = [0u8; 20]; let mut val = correlation; let mut k = 20;
+            if val == 0 { k -= 1; buf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&buf[k..20]);
+            syscall::debug_puts(b" len=");
+            let mut buf = [0u8; 12]; let mut val = bytes_read as u32; let mut k = 12;
+            if val == 0 { k -= 1; buf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&buf[k..12]);
+            syscall::debug_puts(b" irfs_csum=");
+            irfs_print_hex32(irfs_csum);
+            syscall::debug_puts(b" lin_csum=");
+            irfs_print_hex32(lin_csum);
+            syscall::debug_puts(b"\n");
+        }
+    }
+    match kind {
+        PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
+        PendingAsyncKind::IrfsReadMmap => finish_irfs_read_mmap(slot, bytes_read),
+        PendingAsyncKind::ExecRead => finish_exec_read(slot, bytes_read),
+        _ => {
+            let scratch = unsafe { PENDING_ASYNC[slot].scratch_slot };
+            async_free_slot(slot);
+            free_async_scratch_slot(scratch);
+        }
+    }
+}
+
 extern "C" fn reply_thread_entry(_arg: u64) -> ! {
     let port = unsafe { IRFS_REPLY_PORT };
     loop {
@@ -12854,62 +12925,7 @@ extern "C" fn reply_thread_entry(_arg: u64) -> ! {
             Some(m) => m,
             None => continue,
         };
-        if msg.tag != IRFS_IO_READ_REPLY && msg.tag != FS_READ_REPLY {
-            // Not expected on this port; drop quietly so a stray
-            // sender doesn't wedge the loop.  FS_READ_REPLY shares the
-            // port (and the same payload shape: correlation, bytes_read,
-            // optional csum) so the rest of the loop handles both.
-            continue;
-        }
-        let correlation = msg.data[0];
-        let bytes_read = msg.data[1];
-        let irfs_csum = msg.data[2] as u32; // 0 if irfs side didn't compute one
-        let slot = match async_find_by_correlation(correlation) {
-            Some(s) => s,
-            None => continue,
-        };
-        let kind = unsafe { PENDING_ASYNC[slot].kind };
-        // Verify scratch-bytes csum matches what initramfs_srv just wrote.
-        // Diverging csums = phys-page mismatch / cache coherence shape
-        // (project_grant_pages_phys_mismatch.md).  Logged regardless of
-        // which finish_* takes the slot — happens before consumption so
-        // the dump captures the exact corruption window.
-        if irfs_csum != 0 && bytes_read > 0 {
-            let scratch_local = unsafe {
-                async_scratch_local_va(PENDING_ASYNC[slot].scratch_slot)
-            };
-            let view = unsafe {
-                core::slice::from_raw_parts(scratch_local as *const u8, bytes_read as usize)
-            };
-            let lin_csum = irfs_csum32(view);
-            if lin_csum != irfs_csum {
-                syscall::debug_puts(b"[lsrv] CSUM-MISMATCH IRFS_ASYNC corr=");
-                let mut buf = [0u8; 20]; let mut val = correlation; let mut k = 20;
-                if val == 0 { k -= 1; buf[k] = b'0'; }
-                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
-                syscall::debug_puts(&buf[k..20]);
-                syscall::debug_puts(b" len=");
-                let mut buf = [0u8; 12]; let mut val = bytes_read as u32; let mut k = 12;
-                if val == 0 { k -= 1; buf[k] = b'0'; }
-                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
-                syscall::debug_puts(&buf[k..12]);
-                syscall::debug_puts(b" irfs_csum=");
-                irfs_print_hex32(irfs_csum);
-                syscall::debug_puts(b" lin_csum=");
-                irfs_print_hex32(lin_csum);
-                syscall::debug_puts(b"\n");
-            }
-        }
-        match kind {
-            PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
-            PendingAsyncKind::IrfsReadMmap => finish_irfs_read_mmap(slot, bytes_read),
-            PendingAsyncKind::ExecRead => finish_exec_read(slot, bytes_read),
-            _ => {
-                let scratch = unsafe { PENDING_ASYNC[slot].scratch_slot };
-                async_free_slot(slot);
-                free_async_scratch_slot(scratch);
-            }
-        }
+        handle_irfs_reply(&msg);
     }
 }
 
@@ -14573,6 +14589,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(if a2 { b"ok" } else { b"FAIL" });
     syscall::debug_puts(b"\n");
 
+    // LB-1 (inbound -> completion CQ): when the flag is set, bring up the
+    // per-task SQ/CQ rings so the kernel deliver-hook routes inbound CQEs
+    // (stamped user_data = recv_port | INBOUND_PORT_BIT) to our CQ.  In CQ
+    // mode the reply/worker thread pools are NOT spawned (their ports route
+    // to this same CQ), and the main loop reaps + demuxes by source_port.
+    // Default false => None => legacy port_set_recv + thread pools.
+    let cq_rings = if LINUX_CQ_INBOUND.load(core::sync::atomic::Ordering::Relaxed) {
+        let r = userlib::completion::Rings::setup(32);
+        syscall::debug_puts(if r.is_some() { b"[linux_srv] CQ inbound: rings up\n" } else { b"[linux_srv] CQ inbound: rings setup FAIL\n" });
+        r
+    } else {
+        None
+    };
+
     // Plan A.2b: pool of reply threads, all parked on IRFS_REPLY_PORT.
     // 8-page stacks fixed the original N=4 stack-overflow crash.
     // Empirically N=4 also works correctness-wise but introduces
@@ -14583,28 +14613,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // one pending UDS reply, and the smaller scheduling pressure
     // should keep the boot stable.  Bumping back to 4 is safe once
     // scheduler wake-latency variance is reduced.
-    const N_REPLY_THREADS: usize = 2;
-    const REPLY_STACK_PAGES: usize = 8;
-    let mut spawned = 0usize;
-    for i in 0..N_REPLY_THREADS {
-        let stk = match syscall::mmap_anon(0, REPLY_STACK_PAGES, 1) {
-            Some(v) => (v + REPLY_STACK_PAGES * syscall::page_size()) as u64,
-            None => 0,
-        };
-        if stk == 0 {
-            syscall::debug_puts(b"[linux_srv] reply-thread stack alloc FAIL\n");
-            break;
+    // LB-1: in CQ mode (cq_rings.is_some()) the reply-thread pool is NOT
+    // spawned — IRFS_REPLY_PORT traffic routes to the task CQ and the main
+    // loop demuxes it via handle_irfs_reply.  Legacy mode (None) spawns it.
+    if cq_rings.is_none() {
+        const N_REPLY_THREADS: usize = 2;
+        const REPLY_STACK_PAGES: usize = 8;
+        let mut spawned = 0usize;
+        for i in 0..N_REPLY_THREADS {
+            let stk = match syscall::mmap_anon(0, REPLY_STACK_PAGES, 1) {
+                Some(v) => (v + REPLY_STACK_PAGES * syscall::page_size()) as u64,
+                None => 0,
+            };
+            if stk == 0 {
+                syscall::debug_puts(b"[linux_srv] reply-thread stack alloc FAIL\n");
+                break;
+            }
+            let tid = syscall::thread_create(reply_thread_entry as u64, stk, i as u64);
+            if tid == u64::MAX {
+                syscall::debug_puts(b"[linux_srv] reply-thread spawn FAIL\n");
+                break;
+            }
+            spawned += 1;
         }
-        let tid = syscall::thread_create(reply_thread_entry as u64, stk, i as u64);
-        if tid == u64::MAX {
-            syscall::debug_puts(b"[linux_srv] reply-thread spawn FAIL\n");
-            break;
-        }
-        spawned += 1;
+        syscall::debug_puts(b"[linux_srv] reply-thread pool up: ");
+        print_num(spawned as u64);
+        syscall::debug_puts(b" threads\n");
     }
-    syscall::debug_puts(b"[linux_srv] reply-thread pool up: ");
-    print_num(spawned as u64);
-    syscall::debug_puts(b" threads\n");
 
     // Phase B4 (#186): spawn syscall-worker pool.  N=2 matches the
     // reply-thread pool's empirical sweet spot (boot-wallclock variance
@@ -14617,32 +14652,37 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         SYSCALL_WORKER_PORT = syscall::port_create();
         let _ = syscall::port_resize(SYSCALL_WORKER_PORT, 64);
     }
-    const N_SYSCALL_WORKERS: usize = 2;
-    const SYSCALL_WORKER_STACK_PAGES: usize = 8;
-    let mut sw_spawned = 0usize;
-    for i in 0..N_SYSCALL_WORKERS {
-        let stk = match syscall::mmap_anon(0, SYSCALL_WORKER_STACK_PAGES, 1) {
-            Some(v) => (v + SYSCALL_WORKER_STACK_PAGES * syscall::page_size()) as u64,
-            None => 0,
-        };
-        if stk == 0 {
-            syscall::debug_puts(b"[linux_srv] syscall-worker stack alloc FAIL\n");
-            break;
+    // LB-1: in CQ mode the syscall-worker pool is NOT spawned —
+    // SYSCALL_WORKER_PORT traffic would route to the task CQ.  Legacy mode
+    // (cq_rings.is_none()) spawns it; WORKERS_ENABLED still gates routing.
+    if cq_rings.is_none() {
+        const N_SYSCALL_WORKERS: usize = 2;
+        const SYSCALL_WORKER_STACK_PAGES: usize = 8;
+        let mut sw_spawned = 0usize;
+        for i in 0..N_SYSCALL_WORKERS {
+            let stk = match syscall::mmap_anon(0, SYSCALL_WORKER_STACK_PAGES, 1) {
+                Some(v) => (v + SYSCALL_WORKER_STACK_PAGES * syscall::page_size()) as u64,
+                None => 0,
+            };
+            if stk == 0 {
+                syscall::debug_puts(b"[linux_srv] syscall-worker stack alloc FAIL\n");
+                break;
+            }
+            let tid = syscall::thread_create(syscall_worker_entry as u64, stk, i as u64);
+            if tid == u64::MAX {
+                syscall::debug_puts(b"[linux_srv] syscall-worker spawn FAIL\n");
+                break;
+            }
+            sw_spawned += 1;
         }
-        let tid = syscall::thread_create(syscall_worker_entry as u64, stk, i as u64);
-        if tid == u64::MAX {
-            syscall::debug_puts(b"[linux_srv] syscall-worker spawn FAIL\n");
-            break;
-        }
-        sw_spawned += 1;
+        syscall::debug_puts(b"[linux_srv] syscall-worker pool up: ");
+        print_num(sw_spawned as u64);
+        syscall::debug_puts(b" threads (enabled=");
+        syscall::debug_puts(
+            if WORKERS_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { b"yes" } else { b"no" }
+        );
+        syscall::debug_puts(b")\n");
     }
-    syscall::debug_puts(b"[linux_srv] syscall-worker pool up: ");
-    print_num(sw_spawned as u64);
-    syscall::debug_puts(b" threads (enabled=");
-    syscall::debug_puts(
-        if WORKERS_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { b"yes" } else { b"no" }
-    );
-    syscall::debug_puts(b")\n");
 
     // Eagerly set up the long-path scratch grant to VFS so the first openat()
     // for a >16-byte path doesn't race with vfs_task ns publication.
@@ -14861,9 +14901,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
-        let (src_port, msg) = match syscall::port_set_recv(port_set) {
-            Some(x) => x,
-            None => continue,
+        let (src_port, msg) = if let Some(ref rings) = cq_rings {
+            rings.reap_wait(1);
+            match rings.reap() {
+                Some(cqe) => {
+                    let sp = cqe.user_data & !userlib::completion::INBOUND_PORT_BIT;
+                    let m = syscall::Message {
+                        tag: cqe.result as u64,
+                        data: [cqe.inline[0], cqe.inline[1], cqe.inline[2], cqe.inline[3], cqe.inline[4], cqe.delivered_cap],
+                    };
+                    (sp, m)
+                }
+                None => continue,
+            }
+        } else {
+            match syscall::port_set_recv(port_set) {
+                Some(x) => x,
+                None => continue,
+            }
         };
 
         // Backend reply for a previously-deferred syscall?  Dispatch the
@@ -14871,6 +14926,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // replies — nothing further to do here.
         if src_port == unsafe { BACKEND_REPLY_PORT } {
             let _ = handle_async_reply(&msg);
+            continue;
+        }
+
+        // LB-1: in CQ mode IRFS replies arrive on IRFS_REPLY_PORT (no reply
+        // thread is spawned), so demux them to handle_irfs_reply here.  Inert
+        // in legacy mode — IRFS_REPLY_PORT is never in port_set, so src_port
+        // can never equal it.
+        if src_port == unsafe { IRFS_REPLY_PORT } {
+            handle_irfs_reply(&msg);
             continue;
         }
 
