@@ -1,0 +1,30 @@
+[package]
+name = "loom-completion-reap"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the completion-ABI REAP_WAIT / deliver lost-wakeup handshake
+# (2026-06-21, Phase 0 step ③).
+#
+# Models the §9.1 discipline: a server blocking in SYS_IO_REAP_WAIT registers
+# its tid in the per-task `io_waiter` (AtomicU32), RE-CHECKS the CQ after
+# registering, and only then parks; the deliver path posts a CQE then `swap`s
+# `io_waiter` and wakes the registered tid. The invariant: if the server ever
+# decides to sleep, a wake must have been sent (it cannot sleep with work
+# pending) — i.e. no lost wakeup.
+#
+# Proves: (1) the recheck-after-register version upholds `slept => wake_sent`
+# across all interleavings; (2) the NO-recheck version DOES lose a wakeup
+# (the #[should_panic] test), so the model has teeth.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]

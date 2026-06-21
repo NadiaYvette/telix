@@ -937,6 +937,22 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
         return SendDirectResult::DirectTransfer(waiter);
     }
 
+    // Completion-enabled receiver? Post a CQE to its CQ + wake it, instead of
+    // queueing. Gated on the receiver task's io_depth != 0, which is only set by
+    // SYS_IO_SETUP — so legacy IPC is byte-for-byte unaffected (this adds one
+    // recv_holder lookup + one relaxed atomic load to the send path).
+    let recv_task = get_recv_holder(port_id);
+    if recv_task != u32::MAX && recv_task != 0 {
+        if let Some(t) = crate::sched::scheduler::task_ref_opt(recv_task) {
+            if t.io_depth.load(Ordering::Acquire) != 0
+                && crate::ipc::completion::deliver_to_completion_cq(recv_task, msg)
+            {
+                return SendDirectResult::Queued;
+            }
+            // CQ full or not completion-enabled → fall through to legacy queue.
+        }
+    }
+
     // No parked receiver — try to queue normally.
     let q = match port.mpsc() {
         Some(q) => q,

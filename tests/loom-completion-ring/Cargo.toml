@@ -1,0 +1,28 @@
+[package]
+name = "loom-completion-ring"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the completion-ABI SPSC ring (2026-06-21, Phase 0 step ①).
+#
+# Mirrors kernel/src/ipc/completion.rs `SpscRing::{push,pop}`: a single producer
+# owns `tail`, a single consumer owns `head`; the producer Release-stores `tail`
+# after writing the slot, the consumer Acquire-loads `tail` before reading it
+# (and symmetrically for `head` freeing the slot for reuse).
+#
+# Proves: (1) the Release/Acquire ring is FIFO with no loss/dup/reorder across
+# all interleavings (the passing test), and (2) a Relaxed publish DOES race —
+# loom catches the unsynchronized slot access (the #[should_panic] test), so the
+# correctness test has teeth.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]

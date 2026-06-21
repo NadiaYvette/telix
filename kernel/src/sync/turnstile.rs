@@ -30,6 +30,9 @@ pub const KEY_PORT_RECV: u8 = 1;
 pub const KEY_PORT_SEND: u8 = 2;
 /// Parked receiver (recv_or_park) — eligible for direct-transfer injection.
 pub const KEY_PORT_RECV_PARK: u8 = 3;
+/// Completion ABI: a server blocked in SYS_IO_REAP_WAIT parks here (on its
+/// task identity port). The deliver path posts a CQE then port_wake_one's it.
+pub const KEY_IO_REAP: u8 = 4;
 
 /// HAMT branching factor: 4 bits per level, 16 children per node.
 const HAMT_BITS: usize = 4;

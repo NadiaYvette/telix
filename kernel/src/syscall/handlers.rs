@@ -192,6 +192,17 @@ pub const SYS_GET_MEMORY_STATS: u64 = 128;
 /// experiment with PFF policies before the kernel commits to one.
 pub const SYS_GET_PF_COUNT: u64 = 129;
 
+/// Completion-based IPC ABI (Phase 0). See `ipc/completion.rs`.
+/// `IO_SETUP(depth)` allocates the per-task SQ/CQ rings and maps them into the
+/// caller: status in x0 (0/u64::MAX), SQ user VA in x1, CQ user VA in x2.
+/// `IO_SUBMIT()` drains the caller's SQ and returns the count performed.
+/// `IO_REAP_WAIT(min)` returns the count of available CQEs (Phase 0 is a
+/// non-blocking poll; the blocking/park discipline is step ③).
+pub const SYS_IO_SETUP: u64 = 130;
+pub const SYS_IO_SUBMIT: u64 = 131;
+pub const SYS_IO_REAP_WAIT: u64 = 132;
+pub const SYS_IO_TEARDOWN: u64 = 133;
+
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
 
@@ -414,6 +425,10 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GET_WORKING_SET => sys_get_working_set(),
         SYS_GET_MEMORY_STATS => sys_get_memory_stats(a0),
         SYS_GET_PF_COUNT => sys_get_pf_count(),
+        SYS_IO_SETUP => sys_io_setup(a0, frame),
+        SYS_IO_SUBMIT => crate::ipc::completion::io_submit(),
+        SYS_IO_REAP_WAIT => crate::ipc::completion::io_reap_wait(a0),
+        SYS_IO_TEARDOWN => crate::ipc::completion::io_teardown(),
         SYS_SET_QUOTA => sys_set_quota(a0, a1, a2),
         SYS_FORK => crate::sched::scheduler::fork_current(),
         SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
@@ -702,6 +717,16 @@ fn inject_recv_into_frame(receiver_tid: u32, msg: &crate::ipc::Message) {
             "inject_recv",
         )
     {
+        // DEMO-WEDGE PROBE: send_direct already DEQUEUED this receiver from the
+        // RECV_PARK HAMT; skipping the inject here orphans it (woken with no
+        // message, or left blocked_on=PortRecv) -> the sync call/reply wedge.
+        // Log tid + saved_sp to confirm saved_sp==0 (#228 corruption) is the
+        // trigger.  See project_demo_wedge_is_228_inject_drop.
+        static INJ_SKIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = INJ_SKIP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 48 {
+            crate::println!("INJECT-SKIP n={} tid={} saved_sp={:#x}", n + 1, receiver_tid, sp);
+        }
         return;
     }
     let frame = unsafe { &mut *(sp as *mut ExceptionFrame) };
@@ -1145,6 +1170,20 @@ fn sys_recv_nb(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     }
 }
 
+/// `SYS_IO_SETUP` wrapper: depth in a0. On success returns the SQ user VA as
+/// the primary value (x0) and the CQ user VA in the second register (x1) —
+/// mirroring `personality_read_args`, read back via `syscall1_2ret`. On failure
+/// returns `u64::MAX` in x0.
+fn sys_io_setup(depth: u64, frame: &mut ExceptionFrame) -> u64 {
+    match crate::ipc::completion::io_setup(depth as u32) {
+        Ok((sq_uva, cq_uva)) => {
+            set_reg(frame, 1, cq_uva as u64);
+            sq_uva as u64
+        }
+        Err(()) => u64::MAX,
+    }
+}
+
 // -------------------------------------------------------------------------
 // seL4-style call/reply IPC
 // -------------------------------------------------------------------------
@@ -1407,6 +1446,32 @@ fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
         }
         call_reply::FulfillResult::Abandoned => 0,
         call_reply::FulfillResult::InvalidHandle => 1,
+    }
+}
+
+/// Complete a sync caller blocked on a reply-cap, given an explicit reply-cap
+/// `handle` + `reply` message: fulfill the cap, auto-grant reply caps, inject
+/// the reply into the caller's parked frame, wake it, and free the slot.
+/// Returns 0 on success, 1 on stale/invalid handle. Used by the completion
+/// ABI's OP_REPLY bridge (mirrors `sys_reply`'s WakeCaller arm).
+pub(crate) fn complete_reply_to(handle: u64, reply: &crate::ipc::Message) -> u64 {
+    match crate::ipc::call_reply::fulfill(handle, reply) {
+        crate::ipc::call_reply::FulfillResult::WakeCaller(caller_tid) => {
+            let caller_task = crate::sched::scheduler::thread_task_id(caller_tid);
+            auto_grant_reply_caps(caller_task, reply);
+            inject_recv_into_frame(caller_tid, reply);
+            crate::sched::scheduler::wake_parked_thread(caller_tid);
+            crate::ipc::call_reply::free(handle);
+            0
+        }
+        crate::ipc::call_reply::FulfillResult::Abandoned => {
+            crate::println!("CMPLREPLY-ABANDONED: handle={:#x}", handle);
+            0
+        }
+        crate::ipc::call_reply::FulfillResult::InvalidHandle => {
+            crate::println!("CMPLREPLY-INVALID: handle={:#x}", handle);
+            1
+        }
     }
 }
 

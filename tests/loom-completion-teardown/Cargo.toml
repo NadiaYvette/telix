@@ -1,0 +1,27 @@
+[package]
+name = "loom-completion-teardown"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the completion-ABI deliver ‖ io_teardown race (2026-06-21,
+# Phase 0). SYS_IO_TEARDOWN clears a task's io_depth + io_cq_kva so the
+# send_direct deliver-hook stops routing into the CQ. A concurrent sender may be
+# mid-deliver: it gates on io_depth, then reads io_cq_kva, then pushes a CQE.
+#
+# Models WHY the current "clear pointers, LEAK the ring pages" teardown is
+# memory-safe (no UAF/no null-deref across all interleavings), and proves that a
+# naive "free the ring pages on teardown" variant WOULD UAF — i.e. reclaiming
+# the CQ needs a refcount / RCU / per-port scoping, not a bare free. See
+# project_completion_abi_phase0 and kernel/src/ipc/completion.rs::io_teardown.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]

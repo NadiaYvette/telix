@@ -243,6 +243,17 @@ pub struct Task {
     pub sa_pending: core::sync::atomic::AtomicBool,
     pub sa_event: core::sync::atomic::AtomicU64,
     pub sa_waiter: core::sync::atomic::AtomicU32,
+    // --- Completion ABI (Phase 0) ---
+    /// Kernel direct-map VA of this task's submission-queue (SQ) ring, or 0 if
+    /// no completion context is set up. The kernel reaches the rings via these
+    /// KVAs from *any* context (they live in the shared kernel half), including
+    /// the deliver path which runs on another task's page table. `io_depth != 0`
+    /// is the readiness flag, published last with Release ordering.
+    pub io_sq_kva: core::sync::atomic::AtomicUsize,
+    /// Kernel direct-map VA of the completion-queue (CQ) ring (0 = none).
+    pub io_cq_kva: core::sync::atomic::AtomicUsize,
+    /// Per-ring depth in entries (power of two); 0 = no completion context.
+    pub io_depth: core::sync::atomic::AtomicU32,
 }
 
 /// Supplementary groups stored inline in the Task struct (common case).
@@ -333,6 +344,9 @@ impl Task {
             sa_pending: core::sync::atomic::AtomicBool::new(false),
             sa_event: core::sync::atomic::AtomicU64::new(0),
             sa_waiter: core::sync::atomic::AtomicU32::new(u32::MAX),
+            io_sq_kva: core::sync::atomic::AtomicUsize::new(0),
+            io_cq_kva: core::sync::atomic::AtomicUsize::new(0),
+            io_depth: core::sync::atomic::AtomicU32::new(0),
         }
     }
 

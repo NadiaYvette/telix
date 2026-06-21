@@ -2403,9 +2403,15 @@ pub fn call(dest_port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> Opt
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let s: u64;
+        // #208/completion-abi root cause: `syscall` faults as #UD (EFER.SCE
+        // unset), and vector 6 (#UD) runs on IST 6 (idt.rs:179). sys_call
+        // PARKS for the reply, context-switching off the per-CPU IST stack,
+        // whose frame is then clobbered by the next #UD on that CPU. recv()
+        // already uses int 0x80 (vector 0x80, IST=0, rsp0/kstack) which parks
+        // safely — mirror it here so the caller's frame lives on its kstack.
         core::arch::asm!(
             "push rbx",
-            "syscall",
+            "int 0x80",
             "mov {r7}, rbx",
             "pop rbx",
             r7 = lateout(reg) r7,
@@ -2471,8 +2477,11 @@ pub fn recv_with_cap(port: u64) -> Option<Message> {
     unsafe {
         let s: u64;
         core::arch::asm!(
+            // #208/IST: see call() — `syscall` faults as #UD on IST 6, and
+            // recv_with_cap PARKS, so the IST frame is corrupted on resume.
+            // int 0x80 (vector 0x80, IST=0, rsp0/kstack) parks safely.
             "push rbx",
-            "syscall",
+            "int 0x80",
             "mov {r7}, rbx",
             "pop rbx",
             r7 = lateout(reg) r7,
@@ -2537,8 +2546,10 @@ pub fn recv_with_cap_nb(port: u64) -> Option<Message> {
     unsafe {
         let s: u64;
         core::arch::asm!(
+            // #208/IST: mirror recv_with_cap — use int 0x80 (rsp0/kstack) so
+            // any park lands on the thread's own stack, not the #UD IST stack.
             "push rbx",
-            "syscall",
+            "int 0x80",
             "mov {r7}, rbx",
             "pop rbx",
             r7 = lateout(reg) r7,

@@ -1,29 +1,31 @@
 //! grant_echo_srv — call/reply server that echoes a client-leased buffer
 //! with ASCII uppercasing applied in-place.
 //!
-//! Pilot Step-4 migration to the new IPC primitives (sys_call, sys_reply,
-//! grant_pages_lease). The client stages a grant lease against us, calls,
-//! we see the client's page mapped at a known dst_va, transform in place,
-//! reply with the byte count. The kernel auto-revokes the lease when the
-//! cap is freed by sys_reply — no explicit revoke on either side.
+//! **Completion-ABI pilot (Phase 0 step ④).** This server now receives via its
+//! completion queue (blocking `io_reap_wait`) and replies via an `OP_REPLY`
+//! submission, instead of the legacy `recv_with_cap`/`sys_reply` path. Calling
+//! `Rings::setup` marks the task completion-enabled, so the kernel deliver path
+//! routes incoming calls into our CQ (and never the recv_or_park/DirectTransfer
+//! path that the legacy servers can wedge on). **Clients are unchanged** — they
+//! still do a sync `sys_call`; the kernel bridges it: the call lands as a CQE
+//! carrying the reply-cap in `delivered_cap`, and our `OP_REPLY` to that handle
+//! completes the (legacy, parked) caller.
 //!
-//! Protocol:
-//!   request: tag = GRANT_ECHO_REQ
-//!            data[0] = granted_va (where the lease was mapped in our aspace)
-//!            data[1] = length in bytes
-//!   reply:   tag = GRANT_ECHO_OK  | data[0] = bytes processed
+//! Protocol (unchanged on the wire):
+//!   request: tag = GRANT_ECHO_REQ, data[0] = granted_va, data[1] = length
+//!   reply:   tag = GRANT_ECHO_OK | data[0] = bytes processed
 //!            tag = GRANT_ECHO_ERR | data[0] = error code
 //!
-//! Registers under the nameserver as b"grant_echo_srv". Clients do:
-//!   let p = ns_lookup_wait(b"grant_echo_srv")?;
-//!   grant_pages_lease(p, src_va, DST_VA, 1, false);
-//!   let r = call(p, GRANT_ECHO_REQ, DST_VA, len, 0, 0);
+//! CQE decode: result = tag, inline[0]=va, inline[1]=len, delivered_cap = the
+//! reply-cap handle. OP_REPLY: user_data = reply tag, inline[0] = reply data[0],
+//! target_cap = the reply-cap handle.
 
 #![no_std]
 #![no_main]
 
 extern crate userlib;
 
+use userlib::completion::{Rings, Sqe, OP_REPLY};
 use userlib::syscall;
 
 pub const GRANT_ECHO_REQ: u64 = 0x6E01;
@@ -32,7 +34,7 @@ pub const GRANT_ECHO_ERR: u64 = 0x6E03;
 
 #[unsafe(no_mangle)]
 fn main(_a0: u64, _a1: u64, _a2: u64) {
-    syscall::debug_puts(b"[grant_echo_srv] starting\n");
+    syscall::debug_puts(b"[grant_echo_srv] starting (completion ABI)\n");
 
     let port = syscall::port_create();
     if port == u64::MAX {
@@ -44,47 +46,66 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         syscall::exit(1);
     }
 
-    syscall::debug_puts(b"[grant_echo_srv] listening\n");
+    // Switch to the completion ABI: allocate our SQ/CQ rings. This sets the
+    // task's io_depth, so the kernel deliver path posts incoming calls to our
+    // CQ + wakes us out of io_reap_wait (no legacy recv/park wedge).
+    let rings = match Rings::setup(8) {
+        Some(r) => r,
+        None => {
+            syscall::debug_puts(b"[grant_echo_srv] io_setup FAIL\n");
+            syscall::exit(1);
+        }
+    };
+
+    syscall::debug_puts(b"[grant_echo_srv] listening (completion)\n");
 
     loop {
-        let msg = match syscall::recv_with_cap(port) {
-            Some(m) => m,
-            None => continue,
-        };
+        // Block until at least one completion (an incoming call) is ready.
+        rings.reap_wait(1);
 
-        if msg.tag != GRANT_ECHO_REQ {
-            // Unknown request: reply with error. recv_with_cap already
-            // installed the cap on this thread, so sys_reply consumes it.
-            let _ = syscall::reply(GRANT_ECHO_ERR, 1, 0, 0, 0, 0);
-            continue;
-        }
+        // Drain all ready CQEs, queueing a reply for each.
+        while let Some(cqe) = rings.reap() {
+            let tag = cqe.result as u64;
+            let reply_handle = cqe.delivered_cap;
 
-        let va = msg.data[0] as usize;
-        let len = msg.data[1] as usize;
-
-        // The leased page is mapped at `va` in our address space by the
-        // kernel (sys_grant_pages_lease → mm::grant::grant_pages). Access
-        // it in place, uppercase ASCII letters, leave others untouched.
-        if va == 0 || len == 0 || len > 4096 {
-            let _ = syscall::reply(GRANT_ECHO_ERR, 2, 0, 0, 0, 0);
-            continue;
-        }
-
-        unsafe {
-            let p = va as *mut u8;
-            for i in 0..len {
-                let b = core::ptr::read_volatile(p.add(i));
-                let u = if (b'a'..=b'z').contains(&b) {
-                    b - 32
+            let (reply_tag, reply_d0) = if tag != GRANT_ECHO_REQ {
+                (GRANT_ECHO_ERR, 1)
+            } else {
+                let va = cqe.inline[0] as usize;
+                let len = cqe.inline[1] as usize;
+                if va == 0 || len == 0 || len > 4096 {
+                    (GRANT_ECHO_ERR, 2)
                 } else {
-                    b
-                };
-                core::ptr::write_volatile(p.add(i), u);
-            }
+                    // The leased page is mapped at `va` in our aspace (the
+                    // client's grant_pages_lease, still live until our reply
+                    // frees the reply-cap). Uppercase ASCII in place.
+                    unsafe {
+                        let p = va as *mut u8;
+                        for i in 0..len {
+                            let b = core::ptr::read_volatile(p.add(i));
+                            let u = if (b'a'..=b'z').contains(&b) { b - 32 } else { b };
+                            core::ptr::write_volatile(p.add(i), u);
+                        }
+                    }
+                    (GRANT_ECHO_OK, len as u64)
+                }
+            };
+
+            // Reply via OP_REPLY targeting the request's reply-cap. The kernel
+            // completes the (parked, legacy-sync) caller and frees the cap,
+            // which auto-revokes the lease.
+            rings.push(Sqe {
+                opcode: OP_REPLY,
+                flags: 0,
+                target_cap: reply_handle,
+                user_data: reply_tag,
+                inline: [reply_d0, 0, 0, 0, 0],
+            });
         }
 
-        let _ = syscall::reply(GRANT_ECHO_OK, len as u64, 0, 0, 0, 0);
-        // After sys_reply returns, the kernel has already revoked the
-        // client's lease — our mapping at `va` is gone. Do not touch it.
+        // Perform the queued OP_REPLYs (completes the callers). Must come after
+        // the in-place transform above, since freeing the reply-cap revokes the
+        // lease mapping at `va`.
+        rings.submit();
     }
 }

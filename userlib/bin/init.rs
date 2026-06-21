@@ -181,6 +181,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"Phase 5 process lifecycle + IPC test: PASSED\n");
     phase_log(b"Phase 5 PASSED");
 
+    // --- Phase 204: completion-ABI self-test (Phase 0 plumbing) ---
+    // Validates the SETUP -> SUBMIT(NOP) -> REAP round-trip on this task's own
+    // SQ/CQ rings (no deliver path / IPC needed yet — that's step 3).  Consumes
+    // init's one-shot completion context; init uses no completion ABI otherwise.
+    // See docs/completion-abi-design.md + plans/completion-phase0.md.
+    if userlib::completion::self_test() {
+        syscall::debug_puts(b"COMPLETION-SELFTEST: PASS\n");
+    } else {
+        syscall::debug_puts(b"COMPLETION-SELFTEST: FAIL\n");
+    }
+    phase_log(b"completion self-test");
+
     // --- Phase THRASH: kernel-side stress for #208 corruption family ---
     // Spawns waves of short-lived threads to force rapid tid alloc / exit /
     // recycle traffic.  Each worker yields a few times (user↔kernel

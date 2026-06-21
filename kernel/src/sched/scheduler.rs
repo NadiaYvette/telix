@@ -11676,6 +11676,46 @@ pub fn pre_save_frame(tid: ThreadId) {
     thread_ref(tid).park_state.store(PARK_ENQUEUED, Ordering::Release);
 }
 
+/// Relocate a 22-quad exception frame from an IST stack to `tid`'s kstack top
+/// (exactly where an int-0x80 frame would sit), returning the kstack sp.
+///
+/// Used when a `syscall`-instruction syscall is about to park: with EFER.SCE
+/// unset, `syscall` traps as #UD, which runs on IST-6 (idt.rs), so its frame is
+/// on the per-CPU IST stack. The IST stack is reused by the next #UD on that
+/// CPU, so a frame left there while we're parked gets clobbered. Copying it to
+/// the thread's private kstack lets the parked thread survive + resume (the
+/// resume path iretqs straight from `saved_sp`, never unwinding the abandoned
+/// IST call chain — same contract as `park_faulting_from_ist`, the #PF/IST
+/// async-PF analog). Keeps #UD on IST for #208 corruption capture.
+///
+/// Returns None if the kstack can't hold the frame (caller keeps the IST sp).
+#[cfg(target_arch = "x86_64")]
+fn relocate_ist_frame_to_kstack(tid: ThreadId, ist_sp: u64) -> Option<u64> {
+    let t = thread_ref(tid);
+    let kbase = t.stack_base as u64;
+    if kbase == 0 {
+        return None;
+    }
+    let ktop = kbase + kstack_size() as u64;
+    const FRAME_QUADS: usize = 22; // 15 gpregs + vector + error_code + 5 iretq
+    let frame_bytes = (FRAME_QUADS as u64) * 8;
+    let new_sp = ktop.saturating_sub(frame_bytes);
+    if new_sp < kbase || new_sp + frame_bytes > ktop {
+        return None;
+    }
+    // SAFETY: is_on_ist confirmed ist_sp is a live IST frame (readable); new_sp
+    // is within tid's own kstack (validated above). IST and kstack are disjoint
+    // regions, so src/dst do not overlap.
+    unsafe {
+        let src = ist_sp as *const u64;
+        let dst = new_sp as *mut u64;
+        for i in 0..FRAME_QUADS {
+            dst.add(i).write(src.add(i).read());
+        }
+    }
+    Some(new_sp)
+}
+
 /// Unlike block_current() which spins on-CPU, this truly takes the thread
 /// off the run queue and saves its frame for later injection by a sender.
 ///
@@ -11711,7 +11751,21 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // syscall_frame_sp is set once at syscall entry (store_frame_sp) and
     // never touched by try_switch, so it always holds the correct value.
     let t = unsafe { thread_mut_from_ref(tid as ThreadId) };
-    let _fsp_park_ipc = t.syscall_frame_sp;
+    #[allow(unused_mut)]
+    let mut _fsp_park_ipc = t.syscall_frame_sp;
+    // #UD-on-IST: if this syscall arrived via the `syscall` instruction it
+    // trapped as #UD (IST-6), so its frame is on the per-CPU IST stack, which
+    // the next #UD reuses — it would be clobbered while we're parked. Relocate
+    // it to this thread's kstack (where an int-0x80 frame sits) before saving
+    // it as saved_sp. Native parkers use int 0x80 and skip this; Linux-
+    // personality binaries (which emit `syscall`) rely on it.
+    #[cfg(target_arch = "x86_64")]
+    if crate::arch::x86_64::gdt::is_on_ist(_fsp_park_ipc).is_some() {
+        if let Some(kstack_sp) = relocate_ist_frame_to_kstack(tid as ThreadId, _fsp_park_ipc) {
+            t.syscall_frame_sp = kstack_sp;
+            _fsp_park_ipc = kstack_sp;
+        }
+    }
     // #208 KEPOCH guard.
     if validate_kstack_inject(tid as ThreadId, _fsp_park_ipc, "park_ipc") {
         write_saved_sp(t, _fsp_park_ipc);

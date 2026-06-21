@@ -1,0 +1,11 @@
+# Build/run on the host triple with --cfg loom so the loom model checker is
+# active. Empty build-std avoids the workspace's no_std build-std settings
+# leaking in (see tools/run-loom.sh, which copies the crate to /tmp).
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []

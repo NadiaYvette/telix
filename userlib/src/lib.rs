@@ -3,6 +3,7 @@
 
 pub mod aio;
 pub mod arch;
+pub mod completion;
 pub mod fd;
 pub mod green;
 pub mod pipe;
