@@ -945,7 +945,7 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     if recv_task != u32::MAX && recv_task != 0 {
         if let Some(t) = crate::sched::scheduler::task_ref_opt(recv_task) {
             if t.io_depth.load(Ordering::Acquire) != 0
-                && crate::ipc::completion::deliver_to_completion_cq(recv_task, msg)
+                && crate::ipc::completion::deliver_to_completion_cq(recv_task, port_id, msg)
             {
                 return SendDirectResult::Queued;
             }

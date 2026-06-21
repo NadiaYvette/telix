@@ -507,16 +507,34 @@ pub fn io_reap_wait(min: u64) -> u64 {
     unsafe { cq_avail(cq_kva) as u64 }
 }
 
+/// Set on an inbound-request CQE's `user_data` to carry the receive-port id
+/// (`user_data = recv_port | INBOUND_PORT_BIT`), so a multi-port server (linux_srv:
+/// personality + backend-reply + worker ports all funnel into one CQ) can demux
+/// which of its ports a request arrived on — the `port_set_recv` `src_port` it
+/// relied on, preserved into the completion model (linux_srv endgame phase LA).
+///
+/// Distinct from an OP_CALL reply's `user_data` (which carries the issuer's
+/// correlation token with `CALL_TOKEN_BIT = 1<<63` set, userlib-side) and from a
+/// legacy/self-completion `user_data` (no high bits). Port ids are < 2^32, so
+/// `recv_port | (1<<62)` never collides with either. MUST match the userlib
+/// `INBOUND_PORT_BIT` in `userlib/src/completion.rs`.
+pub const INBOUND_PORT_BIT: u64 = 1 << 62;
+
 /// Deliver an incoming `Message` to a completion-enabled task's CQ — the deliver
 /// path's replacement for queueing / DirectTransfer. Maps the message into a
 /// `Cqe` and wakes the server if it's parked in `io_reap_wait`. Returns false
 /// if the CQ is full (the caller falls back to the legacy queue for Phase 0).
 ///
+/// `recv_port` is the port the message was delivered TO (the receiver's source
+/// port); it is stamped into `user_data` (with `INBOUND_PORT_BIT`) so a multi-port
+/// server can demux. Leaf servers (`serve`/`serve_deferred`) ignore `user_data`.
+///
 /// Message → Cqe mapping (preserves all 7 message words):
+///   user_data     = recv_port | INBOUND_PORT_BIT  (which port it arrived on)
 ///   result        = tag        (the message tag / opcode)
 ///   inline[0..5]  = data[0..5] (payload; data[4] carries sender identity)
 ///   delivered_cap = data[5]    (the reply-cap handle for CALL; data for SEND)
-pub fn deliver_to_completion_cq(task_id: u32, msg: &crate::ipc::Message) -> bool {
+pub fn deliver_to_completion_cq(task_id: u32, recv_port: u64, msg: &crate::ipc::Message) -> bool {
     let task = match crate::sched::scheduler::task_ref_opt(task_id) {
         Some(t) => t,
         None => return false,
@@ -527,7 +545,7 @@ pub fn deliver_to_completion_cq(task_id: u32, msg: &crate::ipc::Message) -> bool
         return false;
     }
     let cqe = Cqe {
-        user_data: 0,
+        user_data: recv_port | INBOUND_PORT_BIT,
         result: msg.tag as i64,
         delivered_cap: msg.data[5],
         inline: [msg.data[0], msg.data[1], msg.data[2], msg.data[3], msg.data[4]],

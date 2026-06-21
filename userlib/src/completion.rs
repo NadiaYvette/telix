@@ -20,6 +20,10 @@ static NEXT_CALL_TOKEN: AtomicU64 = AtomicU64::new(0);
 /// High bit set on every call token so a reply CQE (`user_data != 0`) is always
 /// distinguishable from an inbound request CQE (`user_data == 0`).
 const CALL_TOKEN_BIT: u64 = 1 << 63;
+/// Set by the kernel deliver-hook on an inbound-request CQE's `user_data`
+/// (`recv_port | INBOUND_PORT_BIT`) so a multi-port server can demux which of its
+/// ports a request arrived on. MUST match kernel `completion::INBOUND_PORT_BIT`.
+pub const INBOUND_PORT_BIT: u64 = 1 << 62;
 
 const SYS_IO_SETUP: u64 = 130;
 const SYS_IO_SUBMIT: u64 = 131;
@@ -222,6 +226,11 @@ impl Rings {
                     tag: cqe.result as u64,
                     data: cqe.inline,
                     reply_cap: cqe.delivered_cap,
+                    source_port: if cqe.user_data & INBOUND_PORT_BIT != 0 {
+                        cqe.user_data & !INBOUND_PORT_BIT
+                    } else {
+                        0
+                    },
                 };
                 if let Some(reply) = handler(req) {
                     let sqe = Sqe {
@@ -278,6 +287,11 @@ impl Rings {
                     tag: cqe.result as u64,
                     data: cqe.inline,
                     reply_cap: cqe.delivered_cap,
+                    source_port: if cqe.user_data & INBOUND_PORT_BIT != 0 {
+                        cqe.user_data & !INBOUND_PORT_BIT
+                    } else {
+                        0
+                    },
                 };
                 if let Some(reply) = handler(req, &replier) {
                     let sqe = Sqe {
@@ -347,6 +361,11 @@ pub struct Request {
     pub data: [u64; 5],
     /// One-shot reply-cap handle to answer this request (legacy `reply_cap`).
     pub reply_cap: u64,
+    /// The server port this request arrived on (decoded from the CQE's
+    /// `user_data` via `INBOUND_PORT_BIT`), letting a multi-port server demux —
+    /// the completion equivalent of `port_set_recv`'s `src_port`. 0 if absent.
+    /// Single-port leaf servers can ignore it.
+    pub source_port: u64,
 }
 
 /// A reply to post via `OP_REPLY`. `tag` becomes the reply message tag,
