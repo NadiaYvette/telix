@@ -167,16 +167,29 @@ pub fn init() {
         // sequence — now lands cleanly on a fresh 1 MiB stack instead
         // of recursing into the corrupted kstack and triple-faulting.
         idt[14].set_ist(4);
-        // Vector 13 (#GP) uses IST 5 → TSS.ist[4]; vector 6 (#UD) uses IST 6
-        // → TSS.ist[5].  Diagnostics backstop for the #208 corruption family:
-        // wild-RIP / control-flow corruption surfaces as #GP/#UD, and when the
-        // kstack itself is the trashed object the handler needs a guaranteed-
-        // good stack to run + dump on (otherwise pushing the fault frame onto
-        // the corrupt kstack re-faults → #DF, losing the original signature).
-        // Both route through `exception_fault` (diverging `-> !`, same as #DF/
-        // #SS on IST 1/2), so there is no iretq-from-IST / SP-pinning concern.
+        // Vector 13 (#GP) uses IST 5 → TSS.ist[4].  Diagnostics backstop for
+        // the #208 corruption family: wild-RIP / control-flow corruption
+        // surfaces as #GP, and when the kstack itself is the trashed object the
+        // handler needs a guaranteed-good stack to run + dump on (otherwise
+        // pushing the fault frame onto the corrupt kstack re-faults → #DF,
+        // losing the signature).  #GP routes through `exception_fault`
+        // (diverging `-> !`), so there is no iretq-from-IST / SP-pinning concern.
         idt[13].set_ist(5);
-        idt[6].set_ist(6);
+        // Vector 6 (#UD) is DELIBERATELY off IST (runs on rsp0 = the current
+        // thread's kstack).  Unlike #GP, #UD is dual-use: besides real
+        // invalid-opcode corruption it is the emulated-`syscall` entry (EFER.SCE
+        // is unset), which can PARK and be PREEMPTED.  On a shared per-CPU IST
+        // stack that left the syscall frame there across a context switch, where
+        // the next #UD clobbered it → corruption.  Native parkers use int 0x80
+        // already; but Linux-personality processes emit `syscall` inherently and
+        // were systemically SIGSEGV'ing (boot comp17a: tid 20/34/44) via
+        // try_switch.save KEPOCH-BAILs.  rsp0 is valid for the userspace
+        // #UD/syscall case and is handled normally by park + try_switch.
+        // Tradeoff: a real corruption-#UD now dumps on rsp0 (possibly trashed)
+        // rather than a clean IST stack — acceptable, as the IST-park bug was
+        // itself generating #208 frames.  Validated comp18a: 0 try_switch.save
+        // bails, 0 Linux SIGSEGVs, 0 #DF.  See project_completion_abi_phase0.
+        idt[6].set_ist(0);
 
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
