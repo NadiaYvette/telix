@@ -375,6 +375,35 @@ pub fn ensure_path_unshared<F: PteFormat>(
     fg: *mut ForkGroup,
 ) -> bool {
     if fg.is_null() {
+        // Cheap invariant guard.  The contract is "null fork_group => no shared
+        // markers on this path".  PT_SHARED_LIVE is a sound over-approximation
+        // of live shared markers system-wide, so the common never-forked hot
+        // path costs a single atomic load when it reads zero.  Only when some
+        // sharing actually exists do we scan: an orphaned marker here (shared
+        // entry under a null fork_group) would make a later map_single_mmupage
+        // silently fail, so flag it (rate-limited) rather than miss it.
+        if crate::mm::stats::PT_SHARED_LIVE.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            let mut t = pt_kva(root);
+            for level in 0..F::LEVELS - 1 {
+                let idx = F::va_index(va, level);
+                let entry = unsafe { pt_read(t.add(idx)) };
+                if F::is_shared_entry(entry) {
+                    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
+                        crate::println!(
+                            "EPU-NULLFG-MARKER va={:#x} level={} entry={:#x} (orphaned shared PT marker, null fork_group)",
+                            va, level, entry
+                        );
+                    }
+                    break;
+                }
+                if F::is_valid(entry) && F::is_table(entry) {
+                    t = pt_kva(F::table_pa(entry));
+                } else {
+                    break;
+                }
+            }
+        }
         return true; // Never forked, no shared markers possible.
     }
     let mut table = pt_kva(root);

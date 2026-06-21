@@ -21,6 +21,11 @@ pub static WSCLOCK_RESERVATION_SKIPS: AtomicU64 = AtomicU64::new(0);
 pub static POOL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 pub static POOL_CREATES: AtomicU64 = AtomicU64::new(0);
 pub static PT_TABLES_SHARED: AtomicU64 = AtomicU64::new(0);
+/// Live gauge of currently-tracked shared PT markers (inc on first share,
+/// dec on removal). A sound over-approximation: zero ⇒ no shared markers
+/// exist anywhere, letting ensure_path_unshared skip its scan on the common
+/// never-forked path. See radix_pt::ensure_path_unshared.
+pub static PT_SHARED_LIVE: AtomicU64 = AtomicU64::new(0);
 pub static PT_COW_BREAKS: AtomicU64 = AtomicU64::new(0);
 pub static KSWAPD_SCANS: AtomicU64 = AtomicU64::new(0);
 pub static KSWAPD_RECLAIMED: AtomicU64 = AtomicU64::new(0);

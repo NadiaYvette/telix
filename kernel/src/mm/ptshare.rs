@@ -251,6 +251,9 @@ impl PtShareTable {
             b.pt_pa = pa;
             b.refcount = 2;
             self.count += 1;
+            // Live-marker gauge (paired with the dec in remove_at); lets
+            // ensure_path_unshared cheaply skip its scan when no markers exist.
+            stats::PT_SHARED_LIVE.fetch_add(1, Ordering::Relaxed);
             2
         } else {
             b.refcount += 1;
@@ -287,6 +290,10 @@ impl PtShareTable {
             *self.buckets.add(idx) = Bucket::empty();
         }
         self.count -= 1;
+        // Paired with the inc in share(); keeps PT_SHARED_LIVE a sound
+        // over-approximation of live shared markers (grow() rehashes in place
+        // and does not pass through here, so the count stays balanced).
+        stats::PT_SHARED_LIVE.fetch_sub(1, Ordering::Relaxed);
 
         // Rehash entries in the same probe chain that may have been
         // displaced past the removed slot.
