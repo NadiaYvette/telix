@@ -11,3 +11,31 @@ tools/xport/cache/
 vendor/
 build/
 stage/
+
+# --- build/run artifacts & helper binaries (2026-06-21) ---
+# QEMU-dumped device trees, numbered per run (singular .qemu-virt.dtb is above)
+.qemu-virt-*.dtb
+# Stray rustc rlibs from ad-hoc in-tree builds
+*.rlib
+# Compiled helper binaries — sources are tracked (tools/*.c); binaries are output
+/tools/telix-cpuset
+/tools/sctp-echo-server
+/sctp-echo-server
+# Test disk images + backups
+*.img
+*.img.bak*
+# Downloaded source RPMs + their extracted trees (X11 port vendoring)
+*.rpm
+/libX11-*
+/libXt-*
+/libxcb-*
+/libxcvt-*
+# Loom test crates build in /tmp via tools/run-loom.sh; in-tree lockfiles are stray
+/tests/loom-*/Cargo.lock
+# musl-telix build output
+/musl-telix/out/
+# editor swap / one-off scratch
+*.swp
+.mb32
+/HELLO.TXT
+/qemu_test.txt
