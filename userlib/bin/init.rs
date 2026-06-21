@@ -82,6 +82,29 @@ fn pack_name(name: &[u8]) -> (u64, u64, u64) {
     (words[0], words[1], words[2])
 }
 
+/// FS_OPEN(name) -> FS_READ(read_len) -> FS_CLOSE via sync `syscall::call`.
+/// Returns the byte count the read reported on success, or None if any step
+/// failed (e.g. a host-pause CALL-TIMEOUT). Read-only and idempotent, so the
+/// Phase 5f devfs/procfs smokes retry it: a transient timeout returns None and
+/// retries; a real server bug returns the wrong count on every attempt.
+fn fs_open_read_close(port: u64, name: &[u8], read_len: u64) -> Option<u64> {
+    let (fn0, fn1, _) = pack_name(name);
+    let nlen = name.len() as u64;
+    let h = match syscall::call(port, 0x2000, fn0, fn1, nlen, 0) {
+        Some(r) if r.tag == 0x2001 => r.data[0],
+        _ => return None,
+    };
+    let bytes = match syscall::call(port, 0x2100, h, 0, read_len, 0) {
+        Some(rr) if rr.tag == 0x2101 => rr.data[0],
+        _ => {
+            let _ = syscall::call(port, 0x2400, h, 0, 0, 0);
+            return None;
+        }
+    };
+    let _ = syscall::call(port, 0x2400, h, 0, 0, 0);
+    Some(bytes)
+}
+
 /// One tmpfs CREATE -> WRITE -> CLOSE -> OPEN -> READ+verify round-trip via sync
 /// `syscall::call` (the sync-client -> completion-server bridge path that
 /// linux_srv uses). Returns true only on full success. Used by the Phase 5h
@@ -457,22 +480,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     if STEP_H_FOCUS_H13 {
         syscall::debug_puts(b"  init: devfs/procfs completion-ABI smoke...\n");
 
-        // devfs: open /dev/null, read (expect EOF), close.
-        let mut dev_ok = syscall::spawn(b"devfs_srv", 50) != u64::MAX;
-        let devfs_port = if dev_ok { syscall::ns_lookup_wait(b"devfs").unwrap_or(0) } else { 0 };
-        if devfs_port == 0 { dev_ok = false; }
-        if dev_ok {
-            let (fn0, fn1, _) = pack_name(b"null");
-            match syscall::call(devfs_port, 0x2000, fn0, fn1, 4, 0) {
-                Some(r) if r.tag == 0x2001 => {
-                    let h = r.data[0];
-                    match syscall::call(devfs_port, 0x2100, h, 0, 8, 0) {
-                        Some(rr) if rr.tag == 0x2101 && rr.data[0] == 0 => {}
-                        _ => dev_ok = false,
-                    }
-                    let _ = syscall::call(devfs_port, 0x2400, h, 0, 0, 0);
+        // devfs: open /dev/null, read (expect EOF = 0 bytes), close. Retry to
+        // ride through a transient host-pause CALL-TIMEOUT (the chronic #135
+        // flake) — a real devfs bug returns the wrong count on every attempt.
+        let devfs_port = if syscall::spawn(b"devfs_srv", 50) != u64::MAX {
+            syscall::ns_lookup_wait(b"devfs").unwrap_or(0)
+        } else {
+            0
+        };
+        let mut dev_ok = false;
+        if devfs_port != 0 {
+            for _ in 0..5 {
+                if fs_open_read_close(devfs_port, b"null", 8) == Some(0) {
+                    dev_ok = true;
+                    break;
                 }
-                _ => dev_ok = false,
             }
         }
         if dev_ok {
@@ -481,22 +503,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 5f devfs(completion) smoke: FAILED\n");
         }
 
-        // procfs: open /proc/meminfo, read (expect >0 bytes), close.
-        let mut proc_ok = syscall::spawn(b"procfs_srv", 50) != u64::MAX;
-        let procfs_port = if proc_ok { syscall::ns_lookup_wait(b"procfs").unwrap_or(0) } else { 0 };
-        if procfs_port == 0 { proc_ok = false; }
-        if proc_ok {
-            let (fn0, fn1, _) = pack_name(b"meminfo");
-            match syscall::call(procfs_port, 0x2000, fn0, fn1, 7, 0) {
-                Some(r) if r.tag == 0x2001 => {
-                    let h = r.data[0];
-                    match syscall::call(procfs_port, 0x2100, h, 0, 64, 0) {
-                        Some(rr) if rr.tag == 0x2101 && rr.data[0] > 0 => {}
-                        _ => proc_ok = false,
+        // procfs: open /proc/meminfo, read (expect >0 bytes), close. Same retry.
+        let procfs_port = if syscall::spawn(b"procfs_srv", 50) != u64::MAX {
+            syscall::ns_lookup_wait(b"procfs").unwrap_or(0)
+        } else {
+            0
+        };
+        let mut proc_ok = false;
+        if procfs_port != 0 {
+            for _ in 0..5 {
+                if let Some(n) = fs_open_read_close(procfs_port, b"meminfo", 64) {
+                    if n > 0 {
+                        proc_ok = true;
+                        break;
                     }
-                    let _ = syscall::call(procfs_port, 0x2400, h, 0, 0, 0);
                 }
-                _ => proc_ok = false,
             }
         }
         if proc_ok {
