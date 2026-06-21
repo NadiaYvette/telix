@@ -25,7 +25,7 @@
 
 extern crate userlib;
 
-use userlib::completion::{Rings, Sqe, OP_REPLY};
+use userlib::completion::{Reply, Request, Rings};
 use userlib::syscall;
 
 pub const GRANT_ECHO_REQ: u64 = 0x6E01;
@@ -59,53 +59,33 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
 
     syscall::debug_puts(b"[grant_echo_srv] listening (completion)\n");
 
-    loop {
-        // Block until at least one completion (an incoming call) is ready.
-        rings.reap_wait(1);
-
-        // Drain all ready CQEs, queueing a reply for each.
-        while let Some(cqe) = rings.reap() {
-            let tag = cqe.result as u64;
-            let reply_handle = cqe.delivered_cap;
-
-            let (reply_tag, reply_d0) = if tag != GRANT_ECHO_REQ {
-                (GRANT_ECHO_ERR, 1)
+    // Classic request/reply server over the completion queue via the shared
+    // `serve` helper (it does reap_wait → drain → OP_REPLY → submit). The
+    // in-place uppercase transform happens inside the handler, before the
+    // helper submits the reply — required, since freeing the reply-cap on
+    // reply revokes the lease mapping at `va`.
+    rings.serve(|req: Request| {
+        let reply = if req.tag != GRANT_ECHO_REQ {
+            Reply { tag: GRANT_ECHO_ERR, data: [1, 0, 0, 0, 0] }
+        } else {
+            let va = req.data[0] as usize;
+            let len = req.data[1] as usize;
+            if va == 0 || len == 0 || len > 4096 {
+                Reply { tag: GRANT_ECHO_ERR, data: [2, 0, 0, 0, 0] }
             } else {
-                let va = cqe.inline[0] as usize;
-                let len = cqe.inline[1] as usize;
-                if va == 0 || len == 0 || len > 4096 {
-                    (GRANT_ECHO_ERR, 2)
-                } else {
-                    // The leased page is mapped at `va` in our aspace (the
-                    // client's grant_pages_lease, still live until our reply
-                    // frees the reply-cap). Uppercase ASCII in place.
-                    unsafe {
-                        let p = va as *mut u8;
-                        for i in 0..len {
-                            let b = core::ptr::read_volatile(p.add(i));
-                            let u = if (b'a'..=b'z').contains(&b) { b - 32 } else { b };
-                            core::ptr::write_volatile(p.add(i), u);
-                        }
+                // The leased page is mapped at `va` in our aspace (the client's
+                // grant_pages_lease, live until our reply frees the reply-cap).
+                unsafe {
+                    let p = va as *mut u8;
+                    for i in 0..len {
+                        let b = core::ptr::read_volatile(p.add(i));
+                        let u = if (b'a'..=b'z').contains(&b) { b - 32 } else { b };
+                        core::ptr::write_volatile(p.add(i), u);
                     }
-                    (GRANT_ECHO_OK, len as u64)
                 }
-            };
-
-            // Reply via OP_REPLY targeting the request's reply-cap. The kernel
-            // completes the (parked, legacy-sync) caller and frees the cap,
-            // which auto-revokes the lease.
-            rings.push(Sqe {
-                opcode: OP_REPLY,
-                flags: 0,
-                target_cap: reply_handle,
-                user_data: reply_tag,
-                inline: [reply_d0, 0, 0, 0, 0],
-            });
-        }
-
-        // Perform the queued OP_REPLYs (completes the callers). Must come after
-        // the in-place transform above, since freeing the reply-cap revokes the
-        // lease mapping at `va`.
-        rings.submit();
-    }
+                Reply { tag: GRANT_ECHO_OK, data: [len as u64, 0, 0, 0, 0] }
+            }
+        };
+        Some(reply)
+    });
 }

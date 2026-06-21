@@ -372,6 +372,65 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5f: early devfs + procfs COMPLETION-ABI smoke test ---
+    // devfs_srv and procfs_srv were migrated to the completion ABI (the
+    // Rings::serve helper). Their full tests are Phase 55/56, which FOCUS_H13
+    // skips — so under focus, validate the converted servers here: a sync
+    // `call` from init bridges through the kernel deliver-hook into the server's
+    // CQ and back via OP_REPLY. Gated to focus so it never double-spawns
+    // against Phase 55/56 (which run only when focus is off).
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"  init: devfs/procfs completion-ABI smoke...\n");
+
+        // devfs: open /dev/null, read (expect EOF), close.
+        let mut dev_ok = syscall::spawn(b"devfs_srv", 50) != u64::MAX;
+        let devfs_port = if dev_ok { syscall::ns_lookup_wait(b"devfs").unwrap_or(0) } else { 0 };
+        if devfs_port == 0 { dev_ok = false; }
+        if dev_ok {
+            let (fn0, fn1, _) = pack_name(b"null");
+            match syscall::call(devfs_port, 0x2000, fn0, fn1, 4, 0) {
+                Some(r) if r.tag == 0x2001 => {
+                    let h = r.data[0];
+                    match syscall::call(devfs_port, 0x2100, h, 0, 8, 0) {
+                        Some(rr) if rr.tag == 0x2101 && rr.data[0] == 0 => {}
+                        _ => dev_ok = false,
+                    }
+                    let _ = syscall::call(devfs_port, 0x2400, h, 0, 0, 0);
+                }
+                _ => dev_ok = false,
+            }
+        }
+        if dev_ok {
+            syscall::debug_puts(b"Phase 5f devfs(completion) smoke: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5f devfs(completion) smoke: FAILED\n");
+        }
+
+        // procfs: open /proc/meminfo, read (expect >0 bytes), close.
+        let mut proc_ok = syscall::spawn(b"procfs_srv", 50) != u64::MAX;
+        let procfs_port = if proc_ok { syscall::ns_lookup_wait(b"procfs").unwrap_or(0) } else { 0 };
+        if procfs_port == 0 { proc_ok = false; }
+        if proc_ok {
+            let (fn0, fn1, _) = pack_name(b"meminfo");
+            match syscall::call(procfs_port, 0x2000, fn0, fn1, 7, 0) {
+                Some(r) if r.tag == 0x2001 => {
+                    let h = r.data[0];
+                    match syscall::call(procfs_port, 0x2100, h, 0, 64, 0) {
+                        Some(rr) if rr.tag == 0x2101 && rr.data[0] > 0 => {}
+                        _ => proc_ok = false,
+                    }
+                    let _ = syscall::call(procfs_port, 0x2400, h, 0, 0, 0);
+                }
+                _ => proc_ok = false,
+            }
+        }
+        if proc_ok {
+            syscall::debug_puts(b"Phase 5f procfs(completion) smoke: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5f procfs(completion) smoke: FAILED\n");
+        }
+    }
+
     // --- Phase 5f: early pipe_srv call/reply smoke test ---
     // Covers PIPE_CREATE, PIPE_WRITE (synchronous), PIPE_READ (data-available
     // path), and PIPE_CLOSE. The blocking-read path (sys_reply_take +

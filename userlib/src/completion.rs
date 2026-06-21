@@ -151,6 +151,75 @@ impl Rings {
     pub fn reap(&self) -> Option<Cqe> {
         unsafe { ring_pop::<Cqe>(self.cq) }
     }
+
+    /// Run a classic request/reply server on the completion queue — the
+    /// completion-ABI equivalent of the legacy `loop { recv_with_cap; handle;
+    /// reply }` (design docs §2.5.2 → §2.5.4; the `completion_server_loop`
+    /// helper of completion-abi-design.md Appendix A). Never returns.
+    ///
+    /// Each iteration blocks in `reap_wait`, then drains every ready CQE. An
+    /// inbound client call arrives as a CQE the kernel deliver hook synthesised
+    /// (`result` = tag, `inline` = data with `inline[4]` = sender identity,
+    /// `delivered_cap` = the one-shot reply-cap). For each request the handler
+    /// returns `Some(Reply)` to answer via a batched `OP_REPLY`, or `None` for
+    /// fire-and-forget. Replies are submitted once per drained batch.
+    ///
+    /// Leaf servers only (no outbound `OP_CALL` yet): every CQE is treated as a
+    /// request. Fan-out servers (replies to our own `OP_CALL`, `user_data != 0`)
+    /// are Phase 2.
+    pub fn serve<F>(&self, mut handler: F) -> !
+    where
+        F: FnMut(Request) -> Option<Reply>,
+    {
+        loop {
+            self.reap_wait(1);
+            let mut pending = false;
+            while let Some(cqe) = self.reap() {
+                let req = Request {
+                    tag: cqe.result as u64,
+                    data: cqe.inline,
+                    reply_cap: cqe.delivered_cap,
+                };
+                if let Some(reply) = handler(req) {
+                    let sqe = Sqe {
+                        opcode: OP_REPLY,
+                        flags: 0,
+                        target_cap: cqe.delivered_cap,
+                        user_data: reply.tag,
+                        inline: reply.data,
+                    };
+                    // SQ full mid-batch → flush the queued replies, then retry.
+                    if !self.push(sqe) {
+                        self.submit();
+                        let _ = self.push(sqe);
+                    }
+                    pending = true;
+                }
+            }
+            if pending {
+                self.submit();
+            }
+        }
+    }
+}
+
+/// One inbound request decoded from a CQE, mirroring the legacy
+/// `recv_with_cap` fields so a converted handler sees identical data.
+pub struct Request {
+    /// Message tag / opcode (legacy `msg.tag`).
+    pub tag: u64,
+    /// Payload words; `data[4]` carries the sender identity (kernel deliver
+    /// mapping), matching the legacy `data[0..5]`.
+    pub data: [u64; 5],
+    /// One-shot reply-cap handle to answer this request (legacy `reply_cap`).
+    pub reply_cap: u64,
+}
+
+/// A reply to post via `OP_REPLY`. `tag` becomes the reply message tag,
+/// `data[0..5]` the reply payload.
+pub struct Reply {
+    pub tag: u64,
+    pub data: [u64; 5],
 }
 
 /// Phase-0 self-test: SETUP → push a NOP SQE → SUBMIT → REAP → verify the CQE

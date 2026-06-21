@@ -12,6 +12,7 @@
 
 extern crate userlib;
 
+use userlib::completion::{Reply, Request, Rings};
 use userlib::syscall;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -256,16 +257,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     let mut handles = [OpenHandle::empty(); MAX_OPEN];
 
-    loop {
-        let msg = match syscall::recv_with_cap(port) {
-            Some(m) => m,
-            None => break,
-        };
+    // Completion-ABI server (Phase 1): switch to the SQ/CQ rings so inbound
+    // calls land in our CQ and we answer via OP_REPLY through the shared
+    // `serve` helper — the completion equivalent of the legacy
+    // recv_with_cap/reply loop (docs §2.5.2 → §2.5.4). Clients are unchanged:
+    // they still sync `call`, and the kernel bridges via the reply-cap in
+    // `delivered_cap`. FS_READ_ASYNC keeps its fire-and-forget send to the
+    // client's read-reply port and returns None (no reply-cap answer).
+    let rings = match Rings::setup(8) {
+        Some(r) => r,
+        None => {
+            syscall::debug_puts(b"  [procfs_srv] io_setup FAIL\n");
+            syscall::exit(1);
+        }
+    };
 
-        match msg.tag {
+    rings.serve(|req: Request| -> Option<Reply> {
+        match req.tag {
             FS_OPEN => {
-                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name_len = (req.data[2] & 0xFFFF_FFFF) as usize;
+                let (name, nlen) = unpack_name(req.data[0], req.data[1], name_len);
 
                 let mut buf = [0u8; MAX_BUF];
                 let buf_len;
@@ -277,12 +288,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 } else if let Some(pid) = parse_pid_status(&name, nlen) {
                     buf_len = gen_status(&mut buf, pid);
                     if buf_len == 0 {
-                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
-                        continue;
+                        return Some(Reply { tag: FS_ERROR, data: [ERR_NOT_FOUND, 0, 0, 0, 0] });
                     }
                 } else {
-                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
-                    continue;
+                    return Some(Reply { tag: FS_ERROR, data: [ERR_NOT_FOUND, 0, 0, 0, 0] });
                 }
 
                 let mut h = u64::MAX;
@@ -296,40 +305,42 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if h == u64::MAX {
-                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] })
                 } else {
-                    let _ = syscall::reply(
-                        FS_OPEN_OK,
-                        h,
-                        handles[h as usize].buf_len as u64,
-                        my_aspace,
-                        0,
-                        0,
-                    );
+                    Some(Reply {
+                        tag: FS_OPEN_OK,
+                        data: [h, handles[h as usize].buf_len as u64, my_aspace, 0, 0],
+                    })
                 }
             }
 
             FS_SET_READ_REPLY_PORT => {
-                ASYNC_READ_REPLY_PORT.store(msg.data[0], Ordering::Release);
-                let _ = syscall::reply(FS_SET_READ_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+                ASYNC_READ_REPLY_PORT.store(req.data[0], Ordering::Release);
+                Some(Reply { tag: FS_SET_READ_REPLY_PORT_OK, data: [0, 0, 0, 0, 0] })
             }
 
             FS_READ_ASYNC => {
-                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
-                let length = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
-                let offset = msg.data[1] as usize;
-                let grant_va = msg.data[2] as usize;
-                let correlation = msg.data[3];
+                let handle = (req.data[0] & 0xFFFF_FFFF) as usize;
+                let length = ((req.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let offset = req.data[1] as usize;
+                let grant_va = req.data[2] as usize;
+                let correlation = req.data[3];
                 let reply_port = ASYNC_READ_REPLY_PORT.load(Ordering::Acquire);
-                if reply_port == 0 { continue; }
+                if reply_port == 0 {
+                    return None;
+                }
                 let send = |bytes: u64| {
                     let _ = syscall::send_nb_4(reply_port, FS_READ_REPLY, correlation, bytes, 0, 0);
                 };
                 if handle >= MAX_OPEN || !handles[handle].active || grant_va == 0 {
-                    send(0); continue;
+                    send(0);
+                    return None;
                 }
                 let hnd = &handles[handle];
-                if offset >= hnd.buf_len { send(0); continue; }
+                if offset >= hnd.buf_len {
+                    send(0);
+                    return None;
+                }
                 let avail = hnd.buf_len - offset;
                 let to_read = length.min(avail).min(PAGE_SIZE);
                 let dst = grant_va as *mut u8;
@@ -337,23 +348,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     unsafe { *dst.add(i) = hnd.buf[offset + i]; }
                 }
                 send(to_read as u64);
+                None
             }
 
             FS_READ => {
-                let handle = msg.data[0] as usize;
-                let offset = msg.data[1] as usize;
-                let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let grant_va = msg.data[3] as usize;
+                let handle = req.data[0] as usize;
+                let offset = req.data[1] as usize;
+                let length = (req.data[2] & 0xFFFF_FFFF) as usize;
+                let grant_va = req.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-                    continue;
+                    return Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] });
                 }
 
                 let hnd = &handles[handle];
                 if offset >= hnd.buf_len {
-                    let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
-                    continue;
+                    return Some(Reply { tag: FS_READ_OK, data: [0, 0, 0, 0, 0] });
                 }
 
                 let avail = hnd.buf_len - offset;
@@ -367,47 +377,37 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             *dst.add(i) = hnd.buf[offset + i];
                         }
                     }
-                    let _ = syscall::reply(FS_READ_OK, actual as u64, 0, 0, 0, 0);
+                    Some(Reply { tag: FS_READ_OK, data: [actual as u64, 0, 0, 0, 0] })
                 } else {
                     let inline_len = to_read.min(MAX_INLINE);
                     let packed = pack_inline_data(&hnd.buf[offset..offset + inline_len]);
-                    let _ = syscall::reply(
-                        FS_READ_OK,
-                        inline_len as u64,
-                        packed[0],
-                        packed[1],
-                        packed[2],
-                        0,
-                    );
+                    Some(Reply {
+                        tag: FS_READ_OK,
+                        data: [inline_len as u64, packed[0], packed[1], packed[2], 0],
+                    })
                 }
             }
 
             FS_STAT => {
-                let handle = msg.data[0] as usize;
+                let handle = req.data[0] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-                    continue;
+                    return Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] });
                 }
 
                 let size = handles[handle].buf_len;
-                let _ = syscall::reply(FS_STAT_OK, size as u64, 0o100444u64, 0, 0, 0);
+                Some(Reply { tag: FS_STAT_OK, data: [size as u64, 0o100444u64, 0, 0, 0] })
             }
 
             FS_READDIR => {
-                let start_offset = msg.data[0] as usize;
-
-                let idx = start_offset;
-                let mut sent = false;
+                let idx = req.data[0] as usize;
 
                 if idx == 0 {
                     let name_lo = pack_name_lo(b"meminfo");
-                    let _ = syscall::reply(FS_READDIR_OK, 0, name_lo, 0, 1, 0);
-                    sent = true;
+                    return Some(Reply { tag: FS_READDIR_OK, data: [0, name_lo, 0, 1, 0] });
                 } else if idx == 1 {
                     let name_lo = pack_name_lo(b"uptime");
-                    let _ = syscall::reply(FS_READDIR_OK, 0, name_lo, 0, 2, 0);
-                    sent = true;
+                    return Some(Reply { tag: FS_READDIR_OK, data: [0, name_lo, 0, 2, 0] });
                 } else {
                     let mut slot = idx - 2;
                     while slot < MAX_TASKS {
@@ -416,41 +416,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let mut nbuf = [0u8; 8];
                             let nlen = u64_to_dec(tid, &mut nbuf);
                             let name_lo = pack_name_lo(&nbuf[..nlen]);
-                            let _ = syscall::reply(
-                                FS_READDIR_OK,
-                                0,
-                                name_lo,
-                                0,
-                                (slot + 3) as u64,
-                                0,
-                            );
-                            sent = true;
-                            break;
+                            return Some(Reply {
+                                tag: FS_READDIR_OK,
+                                data: [0, name_lo, 0, (slot + 3) as u64, 0],
+                            });
                         }
                         slot += 1;
                     }
                 }
 
-                if !sent {
-                    let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
-                }
+                Some(Reply { tag: FS_READDIR_END, data: [0, 0, 0, 0, 0] })
             }
 
             FS_CLOSE => {
-                let handle = msg.data[0] as usize;
+                let handle = req.data[0] as usize;
                 if handle < MAX_OPEN && handles[handle].active {
                     handles[handle].active = false;
                 }
-                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
+                Some(Reply { tag: FS_CLOSE_OK, data: [0, 0, 0, 0, 0] })
             }
 
-            _ => {
-                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-            }
+            _ => Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] }),
         }
-    }
-
-    loop {
-        core::hint::spin_loop();
-    }
+    });
 }

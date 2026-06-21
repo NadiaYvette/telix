@@ -8,6 +8,7 @@
 
 extern crate userlib;
 
+use userlib::completion::{Reply, Request, Rings};
 use userlib::syscall;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -210,16 +211,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     let mut handles = [OpenHandle::empty(); MAX_OPEN];
 
-    loop {
-        let msg = match syscall::recv_with_cap(port) {
-            Some(m) => m,
-            None => break,
-        };
+    // Completion-ABI server (Phase 1): switch to the SQ/CQ rings so inbound
+    // calls land in our CQ and we answer via OP_REPLY through the shared
+    // `serve` helper — the completion equivalent of the legacy
+    // recv_with_cap/reply loop. FS_READ_ASYNC keeps its fire-and-forget send
+    // to the client's read-reply port and returns None (no reply-cap answer).
+    let rings = match Rings::setup(8) {
+        Some(r) => r,
+        None => {
+            syscall::debug_puts(b"  [devfs_srv] io_setup FAIL\n");
+            syscall::exit(1);
+        }
+    };
 
-        match msg.tag {
+    rings.serve(|req: Request| -> Option<Reply> {
+        match req.tag {
             FS_OPEN => {
-                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name_len = (req.data[2] & 0xFFFF_FFFF) as usize;
+                let (name, nlen) = unpack_name(req.data[0], req.data[1], name_len);
 
                 match find_device(&name, nlen) {
                     Some(di) => {
@@ -233,35 +242,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                         }
                         if h == u64::MAX {
-                            let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                            Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] })
                         } else {
-                            let _ = syscall::reply(FS_OPEN_OK, h, 0, my_aspace as u64, 0, 0);
+                            Some(Reply { tag: FS_OPEN_OK, data: [h, 0, my_aspace as u64, 0, 0] })
                         }
                     }
-                    None => {
-                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
-                    }
+                    None => Some(Reply { tag: FS_ERROR, data: [ERR_NOT_FOUND, 0, 0, 0, 0] }),
                 }
             }
 
             FS_SET_READ_REPLY_PORT => {
-                ASYNC_READ_REPLY_PORT.store(msg.data[0], Ordering::Release);
-                let _ = syscall::reply(FS_SET_READ_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+                ASYNC_READ_REPLY_PORT.store(req.data[0], Ordering::Release);
+                Some(Reply { tag: FS_SET_READ_REPLY_PORT_OK, data: [0, 0, 0, 0, 0] })
             }
 
             FS_READ_ASYNC => {
-                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
-                let length = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
-                let _offset = msg.data[1];
-                let grant_va = msg.data[2] as usize;
-                let correlation = msg.data[3];
+                let handle = (req.data[0] & 0xFFFF_FFFF) as usize;
+                let length = ((req.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let _offset = req.data[1];
+                let grant_va = req.data[2] as usize;
+                let correlation = req.data[3];
                 let reply_port = ASYNC_READ_REPLY_PORT.load(Ordering::Acquire);
-                if reply_port == 0 { continue; }
+                if reply_port == 0 { return None; }
                 let send = |bytes: u64| {
                     let _ = syscall::send_nb_4(reply_port, FS_READ_REPLY, correlation, bytes, 0, 0);
                 };
                 if handle >= MAX_OPEN || !handles[handle].active || grant_va == 0 {
-                    send(0); continue;
+                    send(0); return None;
                 }
                 let dev_type = DEVICES[handles[handle].dev_idx].dev_type;
                 let bytes = match dev_type {
@@ -283,17 +290,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     DeviceType::Console | DeviceType::Tty => 0u64,
                 };
                 send(bytes);
+                None
             }
 
             FS_READ => {
-                let handle = msg.data[0] as usize;
-                let _offset = msg.data[1];
-                let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let grant_va = msg.data[3] as usize;
+                let handle = req.data[0] as usize;
+                let _offset = req.data[1];
+                let length = (req.data[2] & 0xFFFF_FFFF) as usize;
+                let grant_va = req.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-                    continue;
+                    return Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] });
                 }
 
                 let dev_type = DEVICES[handles[handle].dev_idx].dev_type;
@@ -301,7 +308,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 match dev_type {
                     DeviceType::Null => {
                         // EOF — 0 bytes.
-                        let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
+                        Some(Reply { tag: FS_READ_OK, data: [0, 0, 0, 0, 0] })
                     }
                     DeviceType::Zero | DeviceType::Full => {
                         let to_read = length.min(MAX_INLINE);
@@ -309,10 +316,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             unsafe {
                                 core::ptr::write_bytes(grant_va as *mut u8, 0, length.min(4096));
                             }
-                            let _ = syscall::reply(FS_READ_OK, length.min(4096) as u64, 0, 0, 0, 0);
+                            Some(Reply { tag: FS_READ_OK, data: [length.min(4096) as u64, 0, 0, 0, 0] })
                         } else {
                             // Inline zeros.
-                            let _ = syscall::reply(FS_READ_OK, to_read as u64, 0, 0, 0, 0);
+                            Some(Reply { tag: FS_READ_OK, data: [to_read as u64, 0, 0, 0, 0] })
                         }
                     }
                     DeviceType::Random | DeviceType::Urandom => {
@@ -325,27 +332,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     *p.add(i) = rng.next_u8();
                                 }
                             }
-                            let _ = syscall::reply(FS_READ_OK, actual as u64, 0, 0, 0, 0);
+                            Some(Reply { tag: FS_READ_OK, data: [actual as u64, 0, 0, 0, 0] })
                         } else {
                             let mut buf = [0u8; MAX_INLINE];
                             for i in 0..to_read {
                                 buf[i] = rng.next_u8();
                             }
                             let packed = pack_inline_data(&buf[..to_read]);
-                            let _ = syscall::reply(
-                                FS_READ_OK,
-                                to_read as u64,
-                                packed[0],
-                                packed[1],
-                                packed[2],
-                                0,
-                            );
+                            Some(Reply {
+                                tag: FS_READ_OK,
+                                data: [to_read as u64, packed[0], packed[1], packed[2], 0],
+                            })
                         }
                     }
                     DeviceType::Console | DeviceType::Tty => {
                         if console_port == 0 {
-                            let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
-                            continue;
+                            return Some(Reply { tag: FS_READ_OK, data: [0, 0, 0, 0, 0] });
                         }
                         // Send CON_READ to console_srv (legacy protocol path).
                         let d0 = (con_reply as u64) << 32;
@@ -354,32 +356,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             if cr.tag == CON_READ_OK {
                                 let len = cr.data[0] as usize;
                                 let actual = len.min(length);
-                                let _ = syscall::reply(
-                                    FS_READ_OK,
-                                    actual as u64,
-                                    cr.data[1],
-                                    cr.data[2],
-                                    cr.data[3],
-                                    0,
-                                );
+                                Some(Reply {
+                                    tag: FS_READ_OK,
+                                    data: [actual as u64, cr.data[1], cr.data[2], cr.data[3], 0],
+                                })
                             } else {
-                                let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
+                                Some(Reply { tag: FS_READ_OK, data: [0, 0, 0, 0, 0] })
                             }
                         } else {
-                            let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
+                            Some(Reply { tag: FS_READ_OK, data: [0, 0, 0, 0, 0] })
                         }
                     }
                 }
             }
 
             FS_WRITE => {
-                let handle = msg.data[0] as usize;
-                let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let grant_va = msg.data[2] as usize;
+                let handle = req.data[0] as usize;
+                let length = (req.data[1] & 0xFFFF_FFFF) as usize;
+                let grant_va = req.data[2] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-                    continue;
+                    return Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] });
                 }
 
                 let dev_type = DEVICES[handles[handle].dev_idx].dev_type;
@@ -387,19 +384,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 match dev_type {
                     DeviceType::Full => {
                         // ENOSPC.
-                        let _ = syscall::reply(FS_ERROR, ERR_NOSPC, 0, 0, 0, 0);
+                        Some(Reply { tag: FS_ERROR, data: [ERR_NOSPC, 0, 0, 0, 0] })
                     }
                     DeviceType::Null
                     | DeviceType::Zero
                     | DeviceType::Random
                     | DeviceType::Urandom => {
                         // Discard.
-                        let _ = syscall::reply(FS_WRITE_OK, length as u64, 0, 0, 0, 0);
+                        Some(Reply { tag: FS_WRITE_OK, data: [length as u64, 0, 0, 0, 0] })
                     }
                     DeviceType::Console | DeviceType::Tty => {
                         if console_port == 0 {
-                            let _ = syscall::reply(FS_WRITE_OK, 0, 0, 0, 0, 0);
-                            continue;
+                            return Some(Reply { tag: FS_WRITE_OK, data: [0, 0, 0, 0, 0] });
                         }
                         // Pack data for CON_WRITE: legacy path to console_srv.
                         let actual = length.min(24);
@@ -424,26 +420,25 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::send(console_port, CON_WRITE, d0, d1, d2, d3);
                         // Wait for ack.
                         syscall::recv_msg(con_reply);
-                        let _ = syscall::reply(FS_WRITE_OK, actual as u64, 0, 0, 0, 0);
+                        Some(Reply { tag: FS_WRITE_OK, data: [actual as u64, 0, 0, 0, 0] })
                     }
                 }
             }
 
             FS_STAT => {
-                let handle = msg.data[0] as usize;
+                let handle = req.data[0] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-                    continue;
+                    return Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] });
                 }
 
                 let di = handles[handle].dev_idx;
                 // mode = 0o020666 (char device, rw for all)
-                let _ = syscall::reply(FS_STAT_OK, 0, 0o020666u64, 0, di as u64, 0);
+                Some(Reply { tag: FS_STAT_OK, data: [0, 0o020666u64, 0, di as u64, 0] })
             }
 
             FS_READDIR => {
-                let start_offset = msg.data[0] as usize;
+                let start_offset = req.data[0] as usize;
 
                 if start_offset < NUM_DEVICES {
                     let dev = &DEVICES[start_offset];
@@ -456,34 +451,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for j in 8..nlen.min(16) {
                         name_hi |= (dev.name[j] as u64) << ((j - 8) * 8);
                     }
-                    let _ = syscall::reply(
-                        FS_READDIR_OK,
-                        0,
-                        name_lo,
-                        name_hi,
-                        (start_offset + 1) as u64,
-                        0,
-                    );
+                    Some(Reply {
+                        tag: FS_READDIR_OK,
+                        data: [0, name_lo, name_hi, (start_offset + 1) as u64, 0],
+                    })
                 } else {
-                    let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
+                    Some(Reply { tag: FS_READDIR_END, data: [0, 0, 0, 0, 0] })
                 }
             }
 
             FS_CLOSE => {
-                let handle = msg.data[0] as usize;
+                let handle = req.data[0] as usize;
                 if handle < MAX_OPEN && handles[handle].active {
                     handles[handle].active = false;
                 }
-                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
+                Some(Reply { tag: FS_CLOSE_OK, data: [0, 0, 0, 0, 0] })
             }
 
-            _ => {
-                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-            }
+            _ => Some(Reply { tag: FS_ERROR, data: [ERR_INVALID, 0, 0, 0, 0] }),
         }
-    }
-
-    loop {
-        core::hint::spin_loop();
-    }
+    });
 }
