@@ -1,0 +1,30 @@
+[package]
+name = "loom-completion-call"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the completion-ABI OP_CALL reply rendezvous (Phase 1, 2b).
+# An OP_CALL issuer does NOT park on a sync reply-cap; instead `fulfill` (the
+# shared reply path for sys_reply + complete_reply_to) pushes a reply-CQE into
+# the issuer's CQ and makes the issuer runnable if it is parked in reap_wait.
+# This is exactly the parked-caller rendezvous the completion model exists to
+# de-race (#198/#173 family), so it gets a loom model BEFORE the kernel wiring.
+#
+# Models the §9.1 LOCKED discipline (completion-abi-design.md): bucket-lock-
+# serialized, transition-only (empty->non-empty) wake + a re-check-before-sleep
+# lost-wakeup guard. Proves: (1) the serialized discipline never loses a wakeup
+# (the issuer always consumes the reply CQE — never sleeps forever with a CQE
+# pending); (2) a naive UNSYNCHRONIZED push+wake WOULD lose the wakeup, so the
+# serialization is load-bearing, not incidental.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]
