@@ -244,6 +244,97 @@ impl Rings {
             }
         }
     }
+
+    /// Like [`serve`], but for servers that use the *deferred-reply* pattern —
+    /// a request that cannot be answered now (e.g. a contended `FS_FLOCK` /
+    /// `FS_SETLKW`) stashes its `req.reply_cap` and returns `None`; a *later*
+    /// request (an unlock / close) answers the stashed cap via the [`Replier`]
+    /// handed to the handler.
+    ///
+    /// This is the completion-ABI equivalent of the legacy `reply_take()` /
+    /// `reply_to()` syscalls — except no `reply_take` is needed: `req.reply_cap`
+    /// (the CQE's `delivered_cap`) is *already* a durable handle the server may
+    /// hold across requests and answer with an `OP_REPLY` whenever it likes.
+    ///
+    /// The handler returns `Some(reply)` to answer the *current* request inline
+    /// (exactly as in `serve`), or `None` if it stashed the cap for later (or
+    /// the request was genuinely fire-and-forget). To wake a *previously*
+    /// stashed cap it calls `replier.reply_to(stashed_cap, reply)`. Every reply
+    /// — the current batch's inline replies and any deferred ones — is flushed
+    /// with a single `submit()` at the end of each drained batch.
+    pub fn serve_deferred<F>(&self, mut handler: F) -> !
+    where
+        F: FnMut(Request, &Replier) -> Option<Reply>,
+    {
+        let replier = Replier {
+            rings: self,
+            dirty: core::cell::Cell::new(false),
+        };
+        loop {
+            self.reap_wait(1);
+            let mut pending = false;
+            while let Some(cqe) = self.reap() {
+                let req = Request {
+                    tag: cqe.result as u64,
+                    data: cqe.inline,
+                    reply_cap: cqe.delivered_cap,
+                };
+                if let Some(reply) = handler(req, &replier) {
+                    let sqe = Sqe {
+                        opcode: OP_REPLY,
+                        flags: 0,
+                        target_cap: cqe.delivered_cap,
+                        user_data: reply.tag,
+                        inline: reply.data,
+                    };
+                    // SQ full mid-batch → flush the queued replies, then retry.
+                    if !self.push(sqe) {
+                        self.submit();
+                        let _ = self.push(sqe);
+                    }
+                    pending = true;
+                }
+            }
+            // Submit if anything was posted this batch — inline replies
+            // (`pending`) OR deferred ones pushed through the replier (`dirty`).
+            if pending || replier.dirty.replace(false) {
+                self.submit();
+            }
+        }
+    }
+}
+
+/// Reply poster handed to a [`Rings::serve_deferred`] handler so it can answer
+/// a *stashed* reply-cap (kept from an earlier, deferred request) — the
+/// completion-ABI equivalent of the legacy `reply_to()` syscall. It posts an
+/// `OP_REPLY` SQE; the enclosing `serve_deferred` loop flushes it with the
+/// batch's `submit()`.
+pub struct Replier<'a> {
+    rings: &'a Rings,
+    /// Set when a deferred reply was pushed, so `serve_deferred` knows to
+    /// `submit()` even if the current request returned `None`.
+    dirty: core::cell::Cell<bool>,
+}
+
+impl Replier<'_> {
+    /// Post a deferred reply to a previously-stashed reply-cap `handle` (a
+    /// `Request::reply_cap` the handler kept from an earlier request). If the
+    /// original caller has since died, the kernel drops the reply cleanly (the
+    /// handle is generation-checked) — a harmless no-op in that case.
+    pub fn reply_to(&self, handle: u64, reply: Reply) {
+        let sqe = Sqe {
+            opcode: OP_REPLY,
+            flags: 0,
+            target_cap: handle,
+            user_data: reply.tag,
+            inline: reply.data,
+        };
+        if !self.rings.push(sqe) {
+            self.rings.submit();
+            let _ = self.rings.push(sqe);
+        }
+        self.dirty.set(true);
+    }
 }
 
 /// One inbound request decoded from a CQE, mirroring the legacy

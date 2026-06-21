@@ -82,6 +82,81 @@ fn pack_name(name: &[u8]) -> (u64, u64, u64) {
     (words[0], words[1], words[2])
 }
 
+/// One tmpfs CREATE -> WRITE -> CLOSE -> OPEN -> READ+verify round-trip via sync
+/// `syscall::call` (the sync-client -> completion-server bridge path that
+/// linux_srv uses). Returns true only on full success. Used by the Phase 5h
+/// completion-ABI smoke, which retries with fresh filenames so a transient
+/// CALL-TIMEOUT (the chronic #135 host-pause / timer-calibration flake) does not
+/// mask a clean pass — a real tmpfs bug fails every attempt.
+fn tmpfs_roundtrip(port: u64, name: &[u8]) -> bool {
+    let (fn0, fn1, _) = pack_name(name);
+    let nlen = name.len() as u64;
+    // FS_CREATE
+    let (handle, srv_aspace) = match syscall::call(port, 0x2500, fn0, fn1, nlen, 0) {
+        Some(r) if r.tag == 0x2501 => (r.data[0], r.data[2]),
+        _ => return false,
+    };
+    // FS_WRITE 48 bytes of pattern via a grant (copy-before-reply path)
+    let scratch = match syscall::mmap_anon(0, 1, 1) {
+        Some(s) => s,
+        None => return false,
+    };
+    unsafe {
+        let p = scratch as *mut u8;
+        for i in 0..48 {
+            *p.add(i) = ((i * 13 + 0x30) & 0xFF) as u8;
+        }
+    }
+    let gd: usize = 0x8_0000_0000;
+    let mut ok = true;
+    if syscall::grant_pages(srv_aspace, scratch, gd, 1, false) {
+        match syscall::call(port, 0x2600, handle, 48, gd as u64, 0) {
+            Some(w) if w.tag == 0x2601 && w.data[0] == 48 => {}
+            _ => ok = false,
+        }
+        syscall::revoke(srv_aspace, gd);
+    } else {
+        ok = false;
+    }
+    syscall::munmap(scratch);
+    if !ok {
+        return false;
+    }
+    // FS_CLOSE
+    let _ = syscall::call(port, 0x2400, handle, 0, 0, 0);
+    // FS_OPEN + FS_READ verify
+    let (rh, ra) = match syscall::call(port, 0x2000, fn0, fn1, nlen, 0) {
+        Some(r) if r.tag == 0x2001 && r.data[1] == 48 => (r.data[0], r.data[2]),
+        _ => return false,
+    };
+    let scratch = match syscall::mmap_anon(0, 1, 1) {
+        Some(s) => s,
+        None => return false,
+    };
+    let gd: usize = 0x8_0000_0000;
+    let mut ok = true;
+    if syscall::grant_pages(ra, scratch, gd, 1, false) {
+        match syscall::call(port, 0x2100, rh, 0, 48, gd as u64) {
+            Some(rd) if rd.tag == 0x2101 && rd.data[0] == 48 => {
+                let p = scratch as *const u8;
+                for i in 0..48 {
+                    if unsafe { *p.add(i) } != ((i * 13 + 0x30) & 0xFF) as u8 {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            _ => ok = false,
+        }
+        syscall::revoke(ra, gd);
+    } else {
+        ok = false;
+    }
+    syscall::munmap(scratch);
+    let _ = syscall::call(port, 0x2400, rh, 0, 0, 0);
+    ok
+}
+
 /// Global flag address for signal handler test.
 static mut SIG_FLAG_PTR: *mut u64 = core::ptr::null_mut();
 
@@ -464,6 +539,43 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 5g OP_CALL round-trip: PASSED\n");
         } else {
             syscall::debug_puts(b"Phase 5g OP_CALL round-trip: FAILED\n");
+        }
+    }
+
+    // --- Phase 5h: tmpfs COMPLETION-ABI smoke test (focus-surviving) ---
+    // tmpfs_srv is spawned + exercised in Phase 54, which FOCUS_H13 SKIPS — so a
+    // focus boot never validates the completion-converted tmpfs. This focus-gated
+    // copy spawns tmpfs and runs a CREATE -> WRITE -> CLOSE -> OPEN -> READ+verify
+    // round-trip via sync syscall::call (the production sync-client ->
+    // completion-server bridge path that linux_srv uses), covering the converted
+    // serve_deferred sync arms incl. the grant copy-before-reply on WRITE/READ.
+    if STEP_H_FOCUS_H13 {
+        let port = if syscall::spawn(b"tmpfs_srv", 50) != u64::MAX {
+            syscall::ns_lookup_wait(b"tmpfs").unwrap_or(0)
+        } else {
+            0
+        };
+        // Retry the round-trip with a fresh filename each attempt: a transient
+        // CALL-TIMEOUT (the chronic #135 host-pause / timer-calibration flake)
+        // returns None and fails one attempt; a real tmpfs bug fails them all.
+        // Fresh names avoid an FS_CREATE "already exists" error on a retry that
+        // follows a partially-completed attempt.
+        let mut ok = false;
+        if port != 0 {
+            let mut attempt = 0u8;
+            while attempt < 5 {
+                let name = [b'c', b't', b'0' + attempt, b'.', b't', b'x', b't'];
+                if tmpfs_roundtrip(port, &name) {
+                    ok = true;
+                    break;
+                }
+                attempt += 1;
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5h tmpfs(completion): PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5h tmpfs(completion): FAILED\n");
         }
     }
 

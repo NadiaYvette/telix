@@ -1,0 +1,31 @@
+[package]
+name = "loom-completion-deferred"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the completion-ABI DEFERRED-REPLY cap lifecycle (serve_deferred).
+# A deferred server stashes a request's reply-cap handle and answers it much
+# later (OP_REPLY to the stashed handle). That long stash window maximises the
+# chance the original caller dies and its slab slot is reused by a *different*
+# caller before the server replies — the cap-handle ABA surface.
+#
+# call_reply.rs makes this safe with TWO mechanisms that this model proves are
+# both load-bearing: (1) caller death marks the cap CAP_ABANDONED (an
+# intermediate state), NOT CAP_FREE — so the slot cannot be re-alloc'd until the
+# server's own fulfill consumes the ABANDONED marker and sets FREE; (2) fulfill
+# re-validates the generation AFTER its PENDING->FULFILLED CAS. The model shows
+# the ABANDONED-intermediate-state is what prevents a reusing caller's freshly
+# allocated cap from being stolen by a stale stashed-handle fulfill (the
+# should_panic DirectFree variant reproduces the double-ownership corruption).
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]
