@@ -1,0 +1,42 @@
+[package]
+name = "loom-release-slot"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# #198 RELEASE_SLOT_TID clobber model (project_198_releasing_stuck_orphan).
+#
+# The kernel's per-cpu single-slot RELEASE_SLOT_TID (scheduler.rs:626) is written
+# by transition_release_to_pending (684) with a BLIND store, and drained by
+# finalize_release_after_stack_switch (705), which flips the ONE stashed tid
+# RELEASING->PENDING.  If two releases hit the slot before a finalize drains it
+# (vol_resched's deferred finalize + a try_switch, or a nested release), the first
+# tid is overwritten and never finalized -> stuck RELEASING forever -> the #198
+# orphan churn (the pick correctly re-defers a RELEASING thread; it never becomes
+# PENDING, so it can never be dispatched).
+#
+#   INVARIANT: every released thread (on_cpu=RELEASING) is eventually finalized
+#   (on_cpu=PENDING) — no tid is stranded in RELEASING.
+#
+# This crate proves the single-slot LOSES an update and a drain-before-overwrite
+# fix does NOT.  FIDELITY NOTE: the kernel slot is per-cpu (one writer cpu), so the
+# real trigger is nested / deferred-finalize releases on ONE cpu; loom's two
+# concurrent actors over-generalize to cross-actor contention — a STRONGER property
+# that subsumes the sequential case (a valid, conservative proof).
+#
+# DD-SAFETY of finalizing a clobbered predecessor is a SEPARATE kernel argument
+# (not modeled here): a clobbered tid's stack switch completed before the next
+# release, so it is off-kstack when finalized — flipping it PENDING cannot
+# double-dispatch.  This model proves the lost-update property only.
+
+[lib]
+doctest = false  # model crate; doc comments are prose, not runnable
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
