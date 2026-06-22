@@ -606,13 +606,55 @@ pub const TRANS_DESCHED: u8 = 4;
 #[allow(dead_code)]
 pub const TRANS_WAKE_SET_READY: u8 = 5;
 
+/// #208/DD invariant counter (preempt_count step 1 — DETECTION only, no behavior
+/// change): the number of times a thread was made claimable (on_cpu=PENDING) while
+/// still `current_thread` on some CPU (i.e. a RUNNING thread made claimable — the
+/// release-of-running producer that feeds rescue/steal double-dispatch).  Dumped in
+/// DISPATCH-DIAG.  See docs/dd-structural-fix-proposal.md.
+pub static RUN_CLAIM_VIOLATIONS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Ring of the last violations, packed `tid | cur_cpu<<20 | action_tag<<40`, so
+/// DISPATCH-DIAG can name the producing site.  Recorded with plain atomics only —
+/// NO serial output in this (hot / IRQ) path (cf the BAD-ENQ probe lesson).
+static RCV_RING: [core::sync::atomic::AtomicU64; 16] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; 16]
+};
+static RCV_POS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// #208/DD part-B: count of picks where the guard REFUSED to publish PENDING
+/// (lease was RELEASING / still-running / lost a race), so try_switch's claim CAS
+/// bails instead of double-dispatching.  Nonzero = the fix is actively catching
+/// would-be double-dispatches.  Emitted in DISPATCH-DIAG.
+pub static DEQUEUE_GUARD_REDEFERS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// #135 set on_cpu=ON_CPU_PENDING with action-tagged transition record.
 /// Use this instead of `t.on_cpu.store(ON_CPU_PENDING, Release)` at any
 /// site where the thread is transitioning Ready/Blocked → about-to-be-picked.
 /// `action_tag`: 5 = WAKE_SET_READY (wake/enqueue path),
 ///               6 = PARK_SET_PENDING (park_current_for_* deferred store).
+///
+/// #208/DD step-1 assert: making `tid` PENDING (claimable) while it is still
+/// `current_thread` on some CPU violates the dispatch invariant (a running thread
+/// must not be claimable).  Detect + record (the producer) — do NOT change behavior.
 #[inline]
 pub fn set_on_cpu_pending(tid: ThreadId, action_tag: u8, state: ThreadState) {
+    if tid != 0 {
+        let ncpu = smp::num_cpus() as usize;
+        let mut c = 0usize;
+        while c < ncpu {
+            if smp::get(c as u32).current_thread.load(Ordering::Acquire) as ThreadId == tid {
+                RUN_CLAIM_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                let pos =
+                    (RCV_POS.fetch_add(1, Ordering::Relaxed) as usize) % RCV_RING.len();
+                let packed = (tid as u64) | ((c as u64) << 20) | ((action_tag as u64) << 40);
+                RCV_RING[pos].store(packed, Ordering::Relaxed);
+                break;
+            }
+            c += 1;
+        }
+    }
     thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
     record_trans(tid as u32, action_tag, state, ON_CPU_PENDING);
 }
@@ -2983,11 +3025,69 @@ fn dequeue_set_pending(tid: ThreadId) {
         .steal_time_ns()
         .unwrap_or(0);
     thread_ref(tid).pending_set_steal_ns.store(steal_at_pending, Ordering::Relaxed);
-    thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    // #208/DD part-B fix (loom-dispatch-compose: blind_pick_overwrites_releasing_
+    // double_dispatches / guarded_pick_*).  The PICK must NOT blindly publish
+    // PENDING: a blind store overwrites ON_CPU_RELEASING / a real-cpu lease, so a
+    // peer's claim CAS(PENDING→cpu) succeeds on a thread still executing elsewhere
+    // → double-dispatch (boot 91amfsq66: tid=20 cpu0+cpu3 → #PF RIP=0x0).
+    //
+    // Publish PENDING (make claimable) only from a SAFE lease, via CAS so a
+    // concurrent claim is never clobbered back to claimable:
+    //   * cur == PENDING                       — normal enqueued thread.
+    //   * cur == real cpu c, current[c] != tid — a STALE orphan; publish so it
+    //     still dispatches (liveness — avoids the #262 over-deferral a pure
+    //     CAS-only pick would cause; see loom guarded_pick_dispatches_stale_orphan).
+    // For the DD-dangerous leases — RELEASING, or a real cpu STILL executing tid —
+    // leave on_cpu untouched: try_switch's claim CAS(PENDING→cpu) then fails and
+    // bails to idle (CAS_FAIL_RESCUE_BAILS); the thread is recovered by rescue.
+    let ncpus = smp::num_cpus() as u32;
+    let cur = thread_ref(tid).on_cpu.load(Ordering::Acquire);
+    // Full execution-state scan: is tid still current_thread on ANY cpu?  An
+    // on_cpu-only check is INSUFFICIENT — a producer can hide the running state by
+    // stamping on_cpu=PENDING (rescue/site8 re-stamp, boot 91amfsq73: the pick then
+    // reads PENDING="claimable" and double-dispatches a still-running thread).
+    // loom-dispatch-compose: rescue_restamp_defeats_oncpu_guard (DD) vs
+    // strong_guard_survives_rescue_restamp (DD-free).
+    let mut running_on = u32::MAX;
+    let mut c = 0u32;
+    while c < ncpus {
+        if smp::get(c).current_thread.load(Ordering::Acquire) == tid {
+            running_on = c;
+            break;
+        }
+        c += 1;
+    }
+    if running_on != u32::MAX {
+        // Executing on running_on → NOT dispatchable.  Restore a consistent
+        // running lease (on_cpu=running_on) so try_switch's claim CAS(PENDING→cpu)
+        // fails and bails; the duplicate heap entry we popped is correctly
+        // discarded (the real copy keeps running + re-enqueues on its own release).
+        let _ = thread_ref(tid).on_cpu.compare_exchange(
+            cur,
+            running_on,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        DEQUEUE_GUARD_REDEFERS.fetch_add(1, Ordering::Relaxed);
+        record_trans(tid as u32, TRANS_SET_PENDING, thread_ref(tid).state, running_on);
+    } else if cur != ON_CPU_RELEASING
+        && thread_ref(tid)
+            .on_cpu
+            .compare_exchange(cur, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        // Safe (claimable PENDING, or a stale orphan whose CPU no longer runs it):
+        // publish PENDING → dispatch.  The stale-orphan case keeps liveness (no
+        // #262 over-deferral; loom strong_guard_dispatches_stale_orphan).
+        record_trans(tid as u32, TRANS_SET_PENDING, thread_ref(tid).state, ON_CPU_PENDING);
+    } else {
+        // RELEASING, or lost a race: leave on_cpu so the claim CAS rejects it.
+        DEQUEUE_GUARD_REDEFERS.fetch_add(1, Ordering::Relaxed);
+        record_trans(tid as u32, TRANS_SET_PENDING, thread_ref(tid).state, cur);
+    }
     smp::current()
         .dispatch_set_pending_count
         .fetch_add(1, Ordering::Relaxed);
-    record_trans(tid as u32, TRANS_SET_PENDING, thread_ref(tid).state, ON_CPU_PENDING);
 }
 
 #[inline]
@@ -7308,14 +7408,30 @@ pub fn tick(current_sp: u64) -> u64 {
                 let claim_self_pick = DISPATCH_CLAIM_SELF_PICK.load(Ordering::Relaxed);
                 let stale_reclaim = DISPATCH_CLAIM_STALE_RECLAIM.load(Ordering::Relaxed);
                 let torn_block = TORN_BLOCK_FIRES.load(Ordering::Relaxed);
+                // #208/DD step-1: count of release-of-running producers (a thread made
+                // on_cpu=PENDING while still current_thread on some CPU) + the last one's
+                // producing site (action_tag) / tid / cpu, decoded from RCV_RING.
+                let run_claim_viol = RUN_CLAIM_VIOLATIONS.load(Ordering::Relaxed);
+                let (rcv_site, rcv_tid, rcv_cpu) = {
+                    let p = RCV_POS.load(Ordering::Relaxed);
+                    if p == 0 {
+                        (0u64, 0u64, 0u64)
+                    } else {
+                        let e = RCV_RING[((p - 1) as usize) % RCV_RING.len()]
+                            .load(Ordering::Relaxed);
+                        ((e >> 40) & 0xff, e & 0xfffff, (e >> 20) & 0xfff)
+                    }
+                };
                 crate::println!(
-                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={} stale_reclaim={} torn_block={} kstack_guard_hits={} kstack_realias_hits={} stack_base_zero_skips={} publish_redefers={}",
+                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={} stale_reclaim={} torn_block={} kstack_guard_hits={} kstack_realias_hits={} stack_base_zero_skips={} publish_redefers={} run_claim_viol={} rcv_last=site{}/tid{}/cpu{} dq_guard_redefer={}",
                     if gate_on { "ON" } else { "OFF" },
                     stuck_on, stuck_off, claim_fail, claim_self_pick, stale_reclaim, torn_block,
                     KSTACK_GUARD_HITS.load(Ordering::Relaxed),
                     KSTACK_REALIAS_HITS.load(Ordering::Relaxed),
                     STACK_BASE_ZERO_SKIPS.load(Ordering::Relaxed),
                     PUBLISH_REDEFERS.load(Ordering::Relaxed),
+                    run_claim_viol, rcv_site, rcv_tid, rcv_cpu,
+                    DEQUEUE_GUARD_REDEFERS.load(Ordering::Relaxed),
                 );
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
             }
@@ -9159,9 +9275,9 @@ pub fn wake_thread(tid: ThreadId) {
             // tid=17 (compositor_srv) starvation.  Benign under the legacy pick
             // (dequeue_set_pending overwrote on_cpu=PENDING after the pop), but
             // an orphan source under the claim helper (gate=ON default on x86_64).
-            tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+            // #208/DD step-1: checked PENDING-set (scans for a still-current producer).
+            set_on_cpu_pending(tid, 14, ThreadState::Ready);
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
-            record_trans(tid as u32, 14, ThreadState::Ready, ON_CPU_PENDING);
             tref.prio.store(tref.base_priority, Ordering::Release);
             unsafe { thread_mut_from_ref(tid) }.effective_priority =
                 tref.base_priority;
@@ -9649,14 +9765,14 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
             }
             // NEW_INV: on_cpu must be ON_CPU_PENDING before state=Ready
             // (was u32::MAX from park_for_sleep).
-            thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
             // #135 action=20: kill_thread waking a Sleep-blocked victim.
             // If a rescue captures a tid whose TRANS-RING ends with
             // action=20 just before the orphan signature, the victim
             // was kill-promoted out of sleep and the wake path didn't
             // complete percpu_enqueue.  Otherwise this path is rare
             // (only fires during kill_thread on a Sleep-blocked target).
-            record_trans(tid as u32, 20, ThreadState::Ready, ON_CPU_PENDING);
+            // #208/DD step-1: checked PENDING-set (records action=20 + scans).
+            set_on_cpu_pending(tid, 20, ThreadState::Ready);
             t.state = ThreadState::Ready;
             t.blocked_on = BlockReason::None;
             t.sleep_deadline_ns = 0;
@@ -12283,9 +12399,9 @@ pub fn wake_parked_thread(tid: ThreadId) {
                 // re-dispatch doesn't immediately pend.
                 let target = choose_wake_target_steal_aware(parking_cpu);
                 // NEW_INV: store ON_CPU_PENDING BEFORE state=Ready.
-                tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                // #208/DD step-1: checked PENDING-set (scans for a still-current producer).
+                set_on_cpu_pending(tid, 12, ThreadState::Ready);
                 unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
-                record_trans(tid as u32, 12, ThreadState::Ready, ON_CPU_PENDING);
                 trace_sched(tid, 16);
                 set_enq_tag(6);
                 percpu_enqueue(target, prio, tid);
@@ -13364,8 +13480,9 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     RESCUE_PHANTOM.fetch_add(1, Ordering::Relaxed);
                     rescue_per_tid_inc(tid as u32);
                     t.in_queue.store(false, Ordering::Release);
-                    t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
-                    record_trans(tid as u32, 8, t.state, ON_CPU_PENDING);
+                    // #208/DD step-1: route the re-stamp through the checked helper so
+                    // a rescue of a still-`current_thread` orphan is COUNTED (producer).
+                    set_on_cpu_pending(tid as u32, 8, t.state);
                     trace_sched(tid as u32, 8); // 8=rescue_enq
                     set_enq_tag(7); // 7=rescue
                     // Layer 3/4 paravirt: rescuing onto `t.last_cpu` re-
@@ -13485,8 +13602,9 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // side, but doing it here closes a window where a concurrent
                 // try_switch reads on_cpu as a stale CPU number before
                 // dequeue.
-                t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
-                record_trans(tid as u32, 8, t.state, ON_CPU_PENDING);
+                // #208/DD step-1: route the re-stamp through the checked helper so
+                // a rescue of a still-`current_thread` orphan is COUNTED (producer).
+                set_on_cpu_pending(tid as u32, 8, t.state);
                 trace_sched(tid as u32, 8); // 8=rescue_enq
                 set_enq_tag(7); // 7=rescue
                 // Per-branch rescue counter: the two predicates that lead
@@ -13718,8 +13836,8 @@ fn check_sleep_timers() {
         // NEW_INV: store ON_CPU_PENDING (was u32::MAX from park_for_sleep)
         // BEFORE state=Ready, so rescue's on==MAX orphan predicate cannot
         // observe (state=Ready ∧ on_cpu=MAX).
-        thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
-        record_trans(tid as u32, 15, ThreadState::Ready, ON_CPU_PENDING);
+        // #208/DD step-1: checked PENDING-set (scans for a still-current producer).
+        set_on_cpu_pending(tid, 15, ThreadState::Ready);
         // Diagnostic: stamp wake timestamp for the wake-to-dispatch
         // latency histogram.  Set BEFORE state=Ready so try_switch on
         // any CPU that picks up this thread observes a non-zero
