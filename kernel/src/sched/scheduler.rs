@@ -490,7 +490,7 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
             static SEQ: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
             let n = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 256 {
+            if n < 256 && SCHED_TRACE_VERBOSE.load(core::sync::atomic::Ordering::Relaxed) {
                 use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
                 let mut buf = [0u8; 128];
                 let mut k = 0;
@@ -4684,6 +4684,9 @@ fn log_kuser_spawn(
     tid: ThreadId, task: TaskId, entry: &[u8],
     entry_addr: Option<u64>, prio: u8, q: u32,
 ) {
+    if !SCHED_TRACE_VERBOSE.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     use crate::arch::x86_64::serial::{put_byte, put_bytes, put_hex_u64, put_dec_u64};
     let mut buf = [0u8; 128];
     let mut k = 0;
@@ -7645,7 +7648,8 @@ fn try_switch(current_sp: u64) -> u64 {
             core::sync::atomic::AtomicU32::new(0);
         [Z; 8]
     };
-    let trace_on = (cpu as usize) < TS_TRACE_COUNT.len() && {
+    let trace_on = SCHED_TRACE_VERBOSE.load(Ordering::Relaxed)
+        && (cpu as usize) < TS_TRACE_COUNT.len() && {
         let n = TS_TRACE_COUNT[cpu as usize].fetch_add(1, Ordering::Relaxed);
         n < 200
     };
@@ -7976,7 +7980,7 @@ fn try_switch(current_sp: u64) -> u64 {
             if (cpu as usize) < IDLE_SP_TRACE_COUNT.len() {
                 let n = IDLE_SP_TRACE_COUNT[cpu as usize]
                     .fetch_add(1, Ordering::Relaxed);
-                if n < 200 {
+                if n < 200 && SCHED_TRACE_VERBOSE.load(Ordering::Relaxed) {
                     let kbase = prev_t.stack_base;
                     let kend = kbase as u64 + kstack_size() as u64;
                     let in_kstack = (current_sp >= kbase as u64) && (current_sp < kend);
@@ -8817,6 +8821,16 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 // mips64 stay OFF until per-arch validated — they call finalize_release_after_
 // stack_switch from their own trap handlers but have not been A/B'd yet
 // (mips64's hook was wired in 9bcfe48; riscv64 also carries open #251).
+/// #H14-perf: gate the hot-path scheduler DEBUG traces (TS-IN, IDLE-SP-WRITE,
+/// KSTACK-ALLOC, KUSER-SPAWN, EXIT-THREAD-ENTRY) behind a runtime flag, default
+/// OFF.  These are per-event probes from the now-closed #208/#135/#136
+/// investigations; KUSER-SPAWN + EXIT-THREAD-ENTRY are UNCAPPED (scale with
+/// thread spawn/exit churn) and each line is a polled-UART VMEXIT storm.  No
+/// harness greps them.  Re-enable for debugging with the `sched_trace=1`
+/// cmdline flag (cmdline.rs → here).  Reversible.
+pub static SCHED_TRACE_VERBOSE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub static BLOCK_REAL_PARK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(cfg!(any(
         target_arch = "x86_64",
@@ -11129,7 +11143,7 @@ pub fn wait4_for_task(target_task_id: u32, pid: i64, flags: u32) -> (u64, i32, i
 pub fn exit_current_thread(exit_code: i32) -> ! {
     // DIAG: confirm this fires for clone3_test child.  Will remove
     // once #136 INVOL-EXIT validation completes.
-    {
+    if SCHED_TRACE_VERBOSE.load(Ordering::Relaxed) {
         let _tmp_tid = smp::current().current_thread.load(Ordering::Relaxed);
         let _tmp_task = thread_ref(_tmp_tid).task_id;
         #[cfg(target_arch = "x86_64")]

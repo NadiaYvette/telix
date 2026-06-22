@@ -228,6 +228,16 @@ fn handle_param(key: &[u8], val: &[u8]) {
                     .store(n != 0, core::sync::atomic::Ordering::Relaxed);
             }
         }
+        b"sched_trace" => {
+            // #H14-perf: re-enable the hot-path scheduler debug traces (TS-IN,
+            // IDLE-SP-WRITE, KSTACK-ALLOC, KUSER-SPAWN, EXIT-THREAD-ENTRY), which
+            // default OFF to keep the polled-UART out of the boot's hot path.
+            // 1=ON, 0=OFF.  Parsed at boot, before those sites first fire.
+            if let Some(n) = parse_u64(val) {
+                crate::sched::scheduler::SCHED_TRACE_VERBOSE
+                    .store(n != 0, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         _ => {
             // Store as extra param for personality layers.
             store_extra(key, val);
