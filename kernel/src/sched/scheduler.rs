@@ -629,6 +629,13 @@ static RCV_POS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 pub static DEQUEUE_GUARD_REDEFERS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// #198: count of RELEASE_SLOT clobbers the drain-before-overwrite fix RESCUED —
+/// a release that overwrote a DIFFERENT un-finalized occupant, which we finalize
+/// (RELEASING→PENDING) instead of stranding it RELEASING forever.  Nonzero = the
+/// clobber is real AND the fix is preventing #198 orphans.  Emitted in DISPATCH-DIAG.
+pub static RELEASE_SLOT_CLOBBERS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// #135 set on_cpu=ON_CPU_PENDING with action-tagged transition record.
 /// Use this instead of `t.on_cpu.store(ON_CPU_PENDING, Release)` at any
 /// site where the thread is transitioning Ready/Blocked → about-to-be-picked.
@@ -684,10 +691,30 @@ static RELEASE_SLOT_TID: [core::sync::atomic::AtomicU32; smp::MAX_CPUS] = {
 pub fn transition_release_to_pending(prev_id: ThreadId) {
     let cpu = smp::cpu_id() as usize;
     if cpu < smp::MAX_CPUS {
-        RELEASE_SLOT_TID[cpu].store(
+        // #198 fix (loom-release-slot proven: drain_before_overwrite_loses_no_release).
+        // SWAP instead of a blind store: if we clobber a DIFFERENT un-finalized
+        // occupant, finalize it now (RELEASING→PENDING).  The old blind store
+        // stranded the prior tid RELEASING forever (finalize only ever drains the
+        // LAST stash) → the #198 orphan churn (the pick correctly re-defers a
+        // RELEASING thread, so a stranded one can never be dispatched, only
+        // rescue-bounced).  DD-SAFE: a clobbered predecessor's stack switch
+        // completed before THIS release ran (releases serialize on a cpu; the
+        // predecessor's `mov rsp` already happened), so it is off-kstack —
+        // flipping it PENDING cannot double-dispatch.  Mirrors
+        // finalize_release_after_stack_switch's CAS (idempotent vs that finalize).
+        let prev = RELEASE_SLOT_TID[cpu].swap(
             prev_id as u32,
-            core::sync::atomic::Ordering::Release,
+            core::sync::atomic::Ordering::AcqRel,
         );
+        if prev != 0 && prev != prev_id as u32 {
+            RELEASE_SLOT_CLOBBERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let _ = thread_ref(prev).on_cpu.compare_exchange(
+                ON_CPU_RELEASING,
+                ON_CPU_PENDING,
+                core::sync::atomic::Ordering::Release,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 }
 
@@ -7423,7 +7450,7 @@ pub fn tick(current_sp: u64) -> u64 {
                     }
                 };
                 crate::println!(
-                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={} stale_reclaim={} torn_block={} kstack_guard_hits={} kstack_realias_hits={} stack_base_zero_skips={} publish_redefers={} run_claim_viol={} rcv_last=site{}/tid{}/cpu{} dq_guard_redefer={}",
+                    "DISPATCH-DIAG: gate={} stuck_gate_on={} stuck_gate_off={} claim_fail={} claim_self_pick={} stale_reclaim={} torn_block={} kstack_guard_hits={} kstack_realias_hits={} stack_base_zero_skips={} publish_redefers={} run_claim_viol={} rcv_last=site{}/tid{}/cpu{} dq_guard_redefer={} rel_slot_clobber={}",
                     if gate_on { "ON" } else { "OFF" },
                     stuck_on, stuck_off, claim_fail, claim_self_pick, stale_reclaim, torn_block,
                     KSTACK_GUARD_HITS.load(Ordering::Relaxed),
@@ -7432,6 +7459,7 @@ pub fn tick(current_sp: u64) -> u64 {
                     PUBLISH_REDEFERS.load(Ordering::Relaxed),
                     run_claim_viol, rcv_site, rcv_tid, rcv_cpu,
                     DEQUEUE_GUARD_REDEFERS.load(Ordering::Relaxed),
+                    RELEASE_SLOT_CLOBBERS.load(Ordering::Relaxed),
                 );
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
             }
