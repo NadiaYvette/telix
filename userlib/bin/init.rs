@@ -549,9 +549,42 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     None => ok = false,
                 }
+                // Phase 5g2: reuse the SAME ring (Rings::setup is one-shot per
+                // task — SYS_IO_TEARDOWN does not re-enable a fresh SYS_IO_SETUP,
+                // confirmed boot lc9) to also OP_CALL a SYNC server. event_srv
+                // answers via the legacy reply/reply_take/reply_to path (NOT a
+                // completion serve loop), validating the OTHER reply route the
+                // linux_srv LC conversion needs: OP_CALL -> sys_reply ->
+                // call_reply::fulfill -> completion-cap branch -> reply CQE. The
+                // devfs call above exercises the completion-NATIVE serve/OP_REPLY
+                // route; this is the missing sync-server coverage.
+                // event_srv normally spawns later (in the Phase 5g event smoke),
+                // so ensure it is up here before we call it (boot lc11 FAILED
+                // purely because it was not yet registered at this point).
+                if syscall::ns_lookup(b"event").is_none() {
+                    let _ = syscall::spawn(b"event_srv", 50);
+                    let _ = syscall::ns_lookup_wait(b"event");
+                }
+                let sync_pass = match syscall::ns_lookup(b"event") {
+                    Some(ep) => match rings.call(ep, 0x7000, [0, 0, 0, 0]) {
+                        // EVENTFD_CREATE -> reply tag 0x7100, data[1]=handle.
+                        Some(cqe) if cqe.result as u64 == 0x7100 => {
+                            // close the eventfd we created (handle in inline[1]).
+                            let _ = rings.call(ep, 0x7030, [cqe.inline[1], 0, 0, 0]);
+                            true
+                        }
+                        _ => false,
+                    },
+                    None => false,
+                };
                 // Drop the ring so the deliver hook stops routing init's normal
                 // recv IPC into the (now unreaped) CQ.
                 userlib::completion::teardown();
+                if sync_pass {
+                    syscall::debug_puts(b"Phase 5g2 OP_CALL->sync-server reply_to: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 5g2 OP_CALL->sync-server reply_to: FAILED\n");
+                }
             } else {
                 ok = false;
             }
@@ -718,7 +751,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // (sys_reply_take + sys_reply_to) is the novel kernel code path.
     syscall::debug_puts(b"  init: running event_srv (call/reply) smoke test...\n");
     {
-        let event_tid = syscall::spawn(b"event_srv", 50);
+        // event_srv may already be running — the Phase 5g OP_CALL->sync-server
+        // smoke spawns it early (when FOCUS). Reuse it instead of double-spawning
+        // (a second instance would shadow the first's "event" registration).
+        let event_tid = if syscall::ns_lookup(b"event").is_some() {
+            0 // already up — reuse
+        } else {
+            syscall::spawn(b"event_srv", 50)
+        };
         if event_tid == u64::MAX {
             syscall::debug_puts(b"Phase 5g event_srv call/reply smoke: FAILED (spawn)\n");
         } else {
