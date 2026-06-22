@@ -9519,9 +9519,16 @@ pub fn resume_task(task_id: u32) -> u32 {
             if tref.ts_blocked_on.load(Ordering::Relaxed) != 0 {
                 crate::sync::turnstile::cleanup_blocked(tid);
             }
+            // #198 orphan fix: publish on_cpu=PENDING BEFORE state=Ready
+            // (set_on_cpu_pending also records the transition).  Without it,
+            // resume_task enqueues a thread whose on_cpu is the STALE suspended
+            // value, so the pick's claim CAS (PENDING->cpu) fails and the claim
+            // helper drops it off the heap -> orphan (the #198 rescue-bounce, same
+            // class as wake_thread 8b8f82a + the other wake paths).  The resumed
+            // thread was Blocked/suspended (NOT running) so PENDING is safe.
+            set_on_cpu_pending(tid, 17, ThreadState::Ready);
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
             unsafe { thread_mut_from_ref(tid) }.blocked_on = BlockReason::None;
-            record_trans(tid, 17, ThreadState::Ready, tref.on_cpu.load(Ordering::Relaxed));
             tref.prio.store(tref.base_priority, Ordering::Release);
             // Enqueue on the current CPU for cache locality at resume time.
             let target_cpu = smp::cpu_id();
