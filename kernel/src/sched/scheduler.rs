@@ -7361,6 +7361,42 @@ pub fn tick(current_sp: u64) -> u64 {
         // noise on fast archs.  Reversible.
         if l3 > 0 && l3 % 10 == 0 {
             if LAYER3_DIAG_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                // #H14-perf: emit-on-change.  This DIAG block (LAYER3 + RSP0 +
+                // DISPATCH) was ~95% of boot serial volume (82K of 87K lines in the
+                // H14 demo); each line is a polled-UART write = a per-byte VMEXIT
+                // storm that stalls the printing CPU.  Every field is a monotonic
+                // event counter, so do the expensive serial emit ONLY when their sum
+                // changes — steady state prints nothing, every real event still
+                // prints immediately on every arch (the %10 CHECK cadence is
+                // unchanged; only the WRITE is gated).  Reversible.
+                static LAST_DIAG_SIG: AtomicU64 = AtomicU64::new(u64::MAX);
+                let diag_sig = FAST_RESCUE_TAKEOVERS.load(Ordering::Relaxed)
+                    .wrapping_add(CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed))
+                    .wrapping_add(STEAL_AWARE_REROUTES.load(Ordering::Relaxed))
+                    .wrapping_add(IPI_STALE_REROUTES.load(Ordering::Relaxed))
+                    .wrapping_add(HOST_PAUSE_PEERS_DETECTED.load(Ordering::Relaxed))
+                    .wrapping_add(HOST_PAUSE_STEALS.load(Ordering::Relaxed))
+                    .wrapping_add(RESCUE_STUCK_PENDING_FIRES_GATE_ON.load(Ordering::Relaxed))
+                    .wrapping_add(RESCUE_STUCK_PENDING_FIRES_GATE_OFF.load(Ordering::Relaxed))
+                    .wrapping_add(DISPATCH_CLAIM_FAIL.load(Ordering::Relaxed))
+                    .wrapping_add(DISPATCH_CLAIM_SELF_PICK.load(Ordering::Relaxed))
+                    .wrapping_add(DISPATCH_CLAIM_STALE_RECLAIM.load(Ordering::Relaxed))
+                    .wrapping_add(TORN_BLOCK_FIRES.load(Ordering::Relaxed))
+                    .wrapping_add(KSTACK_GUARD_HITS.load(Ordering::Relaxed))
+                    .wrapping_add(KSTACK_REALIAS_HITS.load(Ordering::Relaxed))
+                    .wrapping_add(STACK_BASE_ZERO_SKIPS.load(Ordering::Relaxed))
+                    .wrapping_add(PUBLISH_REDEFERS.load(Ordering::Relaxed))
+                    .wrapping_add(RUN_CLAIM_VIOLATIONS.load(Ordering::Relaxed))
+                    .wrapping_add(DEQUEUE_GUARD_REDEFERS.load(Ordering::Relaxed))
+                    .wrapping_add(RELEASE_SLOT_CLOBBERS.load(Ordering::Relaxed));
+                // include RSP0 fixed/skip + async-PF (exclude RSP0 `total` — it
+                // climbs every iretq and would defeat the change-gate).
+                #[cfg(target_arch = "x86_64")]
+                let diag_sig = diag_sig
+                    .wrapping_add(crate::arch::x86_64::exception::async_pf_event_count())
+                    .wrapping_add(crate::arch::x86_64::exception::RSP0_REFRESH_FIXED.load(Ordering::Relaxed))
+                    .wrapping_add(crate::arch::x86_64::exception::RSP0_REFRESH_SKIP.load(Ordering::Relaxed));
+                if diag_sig != LAST_DIAG_SIG.swap(diag_sig, Ordering::Relaxed) {
                 let frt = FAST_RESCUE_TAKEOVERS.load(Ordering::Relaxed);
                 let cfb = CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed);
                 let sar = STEAL_AWARE_REROUTES.load(Ordering::Relaxed);
@@ -7461,6 +7497,7 @@ pub fn tick(current_sp: u64) -> u64 {
                     DEQUEUE_GUARD_REDEFERS.load(Ordering::Relaxed),
                     RELEASE_SLOT_CLOBBERS.load(Ordering::Relaxed),
                 );
+                }
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
             }
         }
