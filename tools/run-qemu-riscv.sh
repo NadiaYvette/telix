@@ -38,9 +38,12 @@ if [ -n "${TELIX_CMDLINE:-}" ]; then
 fi
 
 # Add virtio-blk disk if test.img exists.
+# TELIX_DISK_SNAPSHOT=1 → qemu snapshot mode (writes to a temp overlay, base disk
+# opened read-only / no write-lock) so multiple boots can share one image in
+# parallel (matches run-qemu-x86.sh).  Unset = unchanged (persistent, write-lock).
 if [ -f "$DISK_IMG" ]; then
     QEMU_ARGS+=(
-        -drive file="$DISK_IMG",format=raw,if=none,id=disk0
+        -drive file="$DISK_IMG",format=raw,if=none,id=disk0${TELIX_DISK_SNAPSHOT:+,snapshot=on}
         -device virtio-blk-device,drive=disk0
     )
 fi
