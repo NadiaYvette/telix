@@ -1126,6 +1126,36 @@ static WORKERS_ENABLED: core::sync::atomic::AtomicBool =
 static LINUX_CQ_INBOUND: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// LC pilot (completion-ABI outbound): the task's completion rings, mapped in
+/// main() when LINUX_CQ_INBOUND is set.  A global (not a main() local) so the
+/// dispatch path (try_stat_vfs_async) can issue OP_CALLs on it.  None in legacy
+/// mode => the legacy send_nb_4 + BACKEND_REPLY_PORT path runs unchanged.
+static mut CQ_RINGS: Option<userlib::completion::Rings> = None;
+
+/// High bit set on every OP_CALL correlation token (the CQE's user_data) so a
+/// reply CQE is distinguishable from an inbound-request CQE.  MUST match the
+/// userlib completion module's CALL_TOKEN_BIT (1 << 63).
+const CALL_TOKEN_BIT: u64 = 1 << 63;
+
+/// First-N-fire validation counters for the LC (completion-ABI outbound) stat
+/// path.  Low-noise (each logs only its first 8 fires) but enough to prove on
+/// any boot that the OP_CALL stat round-trip actually executes and returns sane
+/// values — the path is otherwise silent.  Keep until the conversion is final.
+static LC_STAT_ISSUE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LC_STAT_DONE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Same as the LC_STAT counters but for the HOT IRFS connect path (every ld.so
+/// library open). Unlike VFS_STAT these fire under natural boot traffic, so a
+/// single flag-on boot self-validates the OP_CALL outbound conversion.
+static LC_CONNECT_ISSUE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LC_CONNECT_DONE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Same for the IRFS READ path (irfs_read_issue): the genuinely hot OP_CALL
+/// target — every non-cached initramfs read/mmap-fault chunk (e.g. the
+/// not-preloaded Xwayland binary).  Fires under natural deep-boot traffic.
+static LC_READ_ISSUE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LC_READ_DONE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 const MAX_PENDING_ASYNC: usize = 64;
 
 #[derive(Copy, Clone)]
@@ -3728,6 +3758,53 @@ fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> O
     Some(bytes_read)
 }
 
+/// LC/reads (completion-ABI outbound, HOT path): issue ONE IRFS chunk read,
+/// keyed by `correlation`.  When the task CQ is up, send it as an OP_CALL to
+/// initramfs_srv's SYNC IRFS_IO_READ — which carries the Release+mfence that
+/// prevents the grant zero-fill bug — and its IRFS_IO_READ_OK(bytes_read) reply
+/// returns as a reply CQE, demuxed by CALL_TOKEN_BIT to the IrfsRead*
+/// continuation (finish_irfs_read_fd / finish_irfs_read_mmap).  Legacy mode
+/// (CQ_RINGS None) sends IRFS_IO_READ_ASYNC, reply on IRFS_REPLY_PORT.  Returns
+/// 0 on success, nonzero on failure (caller frees its slot + falls back to the
+/// sync irfs_read_bulk path), matching send_nb_4's convention.  The caller must
+/// have already populated the PENDING_ASYNC[slot] for `correlation`.
+fn irfs_read_issue(
+    irfs: u64,
+    handle: u64,
+    offset: u64,
+    length: usize,
+    grant_va: u64,
+    correlation: u64,
+) -> i64 {
+    if let Some(rings) = unsafe { (*core::ptr::addr_of!(CQ_RINGS)).as_ref() } {
+        // SYNC IRFS_IO_READ arg layout: [tag, handle, offset, length, grant_va]
+        // (handle + length SEPARATE — the async ABI packs them into one word).
+        let sqe = userlib::completion::Sqe {
+            opcode: userlib::completion::OP_CALL,
+            flags: 0,
+            target_cap: irfs,
+            user_data: correlation | CALL_TOKEN_BIT,
+            inline: [IRFS_IO_READ, handle, offset, (length as u64) & 0xFFFF_FFFF, grant_va],
+        };
+        if !rings.push(sqe) {
+            return -1;
+        }
+        rings.submit();
+        if LC_READ_ISSUE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+            syscall::debug_puts(b"LC-READ-ISSUE corr=");
+            print_num(correlation);
+            syscall::debug_puts(b" len=");
+            print_num(length as u64);
+            syscall::debug_puts(b"\n");
+        }
+        0
+    } else {
+        // Legacy IRFS_IO_READ_ASYNC: d0 = handle(low32) | length(high32).
+        let d0 = (handle & 0xFFFF_FFFF) | (((length as u64) & 0xFFFF_FFFF) << 32);
+        syscall::send_nb_4(irfs, IRFS_IO_READ_ASYNC, d0, offset, grant_va, correlation) as i64
+    }
+}
+
 /// Try to fire an IRFS_IO_READ_ASYNC.  Returns Some(slot_idx) on success;
 /// caller must set REPLY_DEFERRED and is responsible for whatever the
 /// continuation does on completion (via finish_irfs_read_fd).  Returns
@@ -3790,17 +3867,12 @@ fn try_irfs_read_async(
             in_flight_chunk: 0,
             aux_port: 0,
         };
-        // Pack args per the IRFS_IO_READ_ASYNC contract:
-        //   d0 = handle (low 32) | length (high 32)
-        //   d1 = offset
-        //   d2 = grant_va
-        //   d3 = correlation
-        let d0 = (handle & 0xFFFF_FFFF) | (((length as u64) & 0xFFFF_FFFF) << 32);
-        let r = syscall::send_nb_4(
+        // CQ mode: OP_CALL to sync IRFS_IO_READ; legacy: IRFS_IO_READ_ASYNC.
+        let r = irfs_read_issue(
             irfs,
-            IRFS_IO_READ_ASYNC,
-            d0,
+            handle,
             offset,
+            length,
             async_scratch_remote_va(scratch_slot) as u64,
             correlation,
         );
@@ -3946,12 +4018,11 @@ fn try_irfs_read_mmap(
             in_flight_chunk: next_to_fetch as u8,
             aux_port: 0,
         };
-        let d0 = (handle & 0xFFFF_FFFF) | (((fetch_len as u64) & 0xFFFF_FFFF) << 32);
-        let r = syscall::send_nb_4(
+        let r = irfs_read_issue(
             irfs,
-            IRFS_IO_READ_ASYNC,
-            d0,
+            handle,
             fetch_off,
+            fetch_len,
             async_scratch_remote_va(scratch_slot) as u64,
             correlation,
         );
@@ -4133,13 +4204,11 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
                     let next_len =
                         CACHE_CHUNK_SIZE.min((file_size - next_off) as usize);
                     let correlation = next_correlation_id();
-                    let d0 = (info.extra_handle & 0xFFFF_FFFF)
-                        | (((next_len as u64) & 0xFFFF_FFFF) << 32);
-                    let r = syscall::send_nb_4(
+                    let r = irfs_read_issue(
                         irfs,
-                        IRFS_IO_READ_ASYNC,
-                        d0,
+                        info.extra_handle,
                         next_off,
+                        next_len,
                         async_scratch_remote_va(info.scratch_slot) as u64,
                         correlation,
                     );
@@ -4196,13 +4265,11 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
         let chunk = remaining.min(CACHE_CHUNK_SIZE);
         let next_off = info.flags + total_so_far as u64;
         let correlation = next_correlation_id();
-        let d0 = (info.extra_handle & 0xFFFF_FFFF)
-            | (((chunk as u64) & 0xFFFF_FFFF) << 32);
-        let r = syscall::send_nb_4(
+        let r = irfs_read_issue(
             irfs,
-            IRFS_IO_READ_ASYNC,
-            d0,
+            info.extra_handle,
             next_off,
+            chunk,
             async_scratch_remote_va(info.scratch_slot) as u64,
             correlation,
         );
@@ -5249,6 +5316,72 @@ fn try_open_initramfs(pi: usize, caller_port: u64, flags: u64, path: &[u8]) -> T
     if name.len() > 24 {
         return try_open_initramfs_sync(irfs_port, name);
     }
+    // LC/IRFS (completion-ABI outbound, HOT path): when the task CQ is up, issue
+    // the connect as an OP_CALL to initramfs_srv's SYNC IRFS_IO_CONNECT on our
+    // completion ring instead of the legacy IRFS_IO_CONNECT_ASYNC + send_nb_4 ->
+    // CONNECT_REPLY_PORT path.  initramfs_srv's sync IO_CONNECT handler replies
+    // via syscall::reply (-> call_reply::fulfill -> completion-cap -> reply CQE),
+    // so it needs NO changes.  The correlation rides in user_data (with
+    // CALL_TOKEN_BIT); the reply CQE is demuxed in the main loop straight to
+    // finish_connect_initramfs.  ld.so opens every library here, so this path
+    // self-validates under natural boot traffic.  Inert when CQ_RINGS is None
+    // (legacy send_nb_4 path below).  Slot fields are packed IDENTICALLY to the
+    // async path so finish_connect_initramfs is unchanged; <=24-byte names only
+    // (guaranteed above), matching that path's correlation-vs-name-bytes limit.
+    if let Some(rings) = unsafe { (*core::ptr::addr_of!(CQ_RINGS)).as_ref() } {
+        let slot = match async_alloc_slot() {
+            Some(s) => s,
+            None => return try_open_initramfs_sync(irfs_port, name),
+        };
+        let correlation = next_correlation_id();
+        let (w0, w1, w3, d2) = pack_irfs_name(name);
+        let n1_lo = (w1 & 0xFFFF_FFFF) as u32;
+        let n1_hi = (w1 >> 32) as u32;
+        unsafe {
+            PENDING_ASYNC[slot] = PendingAsync {
+                kind: PendingAsyncKind::ConnectInitramfs,
+                correlation,
+                pi,
+                caller_task_port: caller_port,
+                listen_fd: 0,
+                flags,
+                buf_va: w3 as usize,        // name[16..24]
+                buf_len: name.len(),
+                scratch_slot: 0xFF,
+                total_so_far: n1_lo,
+                mmap_prot_flags: 0,
+                mmap_aligned_len: n1_hi,
+                extra_handle: w0,
+                cache_slot: 0xFF,
+                in_flight_chunk: 0,
+                aux_port: 0,
+            };
+        }
+        // OP_CALL carries the SYNC IRFS_IO_CONNECT arg layout (tag, d0, d1, d2,
+        // d3) — identical to try_open_initramfs_sync's syscall::call — so the
+        // unchanged sync handler unpacks it the same way.  Correlation is in
+        // user_data, NOT d2, so the full sync d2 (name_len + bytes 24-27) rides.
+        let sqe = userlib::completion::Sqe {
+            opcode: userlib::completion::OP_CALL,
+            flags: 0,
+            target_cap: irfs_port,
+            user_data: correlation | CALL_TOKEN_BIT,
+            inline: [IRFS_IO_CONNECT, w0, w1, d2, w3],
+        };
+        if !rings.push(sqe) {
+            async_free_slot(slot);
+            return try_open_initramfs_sync(irfs_port, name);
+        }
+        rings.submit();
+        if LC_CONNECT_ISSUE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+            syscall::debug_puts(b"LC-CONNECT-ISSUE corr=");
+            print_num(correlation);
+            syscall::debug_puts(b" len=");
+            print_num(name.len() as u64);
+            syscall::debug_puts(b"\n");
+        }
+        return TryOpenInitramfs::Deferred;
+    }
     // Cache miss: dispatch async.  Failures (no async slot, port queue
     // full) fall back to the sync syscall::call path so we don't lose
     // openability under transient pressure.
@@ -5426,6 +5559,67 @@ fn try_stat_vfs_async(
     statbuf_va: usize,
     path: &[u8],
 ) -> TryAsyncVfs {
+    // LC pilot (completion-ABI outbound): when the task CQ is up, issue the
+    // stat as an OP_CALL on our completion ring instead of the legacy
+    // send_nb_4(VFS_STAT_ASYNC) + BACKEND_REPLY_PORT path.  The correlation
+    // rides in user_data (with CALL_TOKEN_BIT), so the reply CQE is demuxed in
+    // the main loop straight to finish_stat_vfs.  Inert when CQ_RINGS is None.
+    if let Some(rings) = unsafe { (*core::ptr::addr_of!(CQ_RINGS)).as_ref() } {
+        if path.is_empty() || path.len() > 24 {
+            return TryAsyncVfs::NotTaken;
+        }
+        let vfs_port = get_vfs_port();
+        if vfs_port == 0 {
+            return TryAsyncVfs::NotTaken;
+        }
+        let slot = match async_alloc_slot() {
+            Some(s) => s,
+            None => return TryAsyncVfs::NotTaken,
+        };
+        let correlation = next_correlation_id();
+        let (w0, w1, w3) = pack_path_async24(path);
+        unsafe {
+            PENDING_ASYNC[slot] = PendingAsync {
+                kind: PendingAsyncKind::StatVfs,
+                correlation,
+                pi: 0,
+                caller_task_port: caller_port,
+                listen_fd: 0,
+                flags: 0,
+                buf_va: statbuf_va,
+                buf_len: 144,
+                scratch_slot: 0xFF,
+                total_so_far: 0,
+                mmap_prot_flags: 0,
+                mmap_aligned_len: 0,
+                extra_handle: 0,
+                cache_slot: 0xFF,
+                in_flight_chunk: 0,
+                aux_port: 0,
+            };
+        }
+        // d2 is path.len() only — the correlation rides in user_data, not d2<<16.
+        let sqe = userlib::completion::Sqe {
+            opcode: userlib::completion::OP_CALL,
+            flags: 0,
+            target_cap: vfs_port,
+            user_data: correlation | CALL_TOKEN_BIT,
+            inline: [VFS_STAT, w0, w1, path.len() as u64, w3],
+        };
+        if !rings.push(sqe) {
+            async_free_slot(slot);
+            return TryAsyncVfs::NotTaken;
+        }
+        rings.submit();
+        if LC_STAT_ISSUE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+            syscall::debug_puts(b"LC-STAT-ISSUE corr=");
+            print_num(correlation);
+            syscall::debug_puts(b" len=");
+            print_num(path.len() as u64);
+            syscall::debug_puts(b"\n");
+        }
+        return TryAsyncVfs::Deferred;
+    }
     unsafe {
         if !VFS_ASYNC_REGISTERED {
             return TryAsyncVfs::NotTaken;
@@ -14595,13 +14789,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // mode the reply/worker thread pools are NOT spawned (their ports route
     // to this same CQ), and the main loop reaps + demuxes by source_port.
     // Default false => None => legacy port_set_recv + thread pools.
-    let cq_rings = if LINUX_CQ_INBOUND.load(core::sync::atomic::Ordering::Relaxed) {
-        let r = userlib::completion::Rings::setup(32);
-        syscall::debug_puts(if r.is_some() { b"[linux_srv] CQ inbound: rings up\n" } else { b"[linux_srv] CQ inbound: rings setup FAIL\n" });
-        r
-    } else {
-        None
-    };
+    unsafe {
+        CQ_RINGS = if LINUX_CQ_INBOUND.load(core::sync::atomic::Ordering::Relaxed) {
+            let r = userlib::completion::Rings::setup(32);
+            syscall::debug_puts(if r.is_some() { b"[linux_srv] CQ inbound: rings up\n" } else { b"[linux_srv] CQ inbound: rings setup FAIL\n" });
+            r
+        } else {
+            None
+        };
+    }
 
     // Plan A.2b: pool of reply threads, all parked on IRFS_REPLY_PORT.
     // 8-page stacks fixed the original N=4 stack-overflow crash.
@@ -14616,7 +14812,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // LB-1: in CQ mode (cq_rings.is_some()) the reply-thread pool is NOT
     // spawned — IRFS_REPLY_PORT traffic routes to the task CQ and the main
     // loop demuxes it via handle_irfs_reply.  Legacy mode (None) spawns it.
-    if cq_rings.is_none() {
+    if unsafe { (*core::ptr::addr_of!(CQ_RINGS)).is_none() } {
         const N_REPLY_THREADS: usize = 2;
         const REPLY_STACK_PAGES: usize = 8;
         let mut spawned = 0usize;
@@ -14655,7 +14851,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // LB-1: in CQ mode the syscall-worker pool is NOT spawned —
     // SYSCALL_WORKER_PORT traffic would route to the task CQ.  Legacy mode
     // (cq_rings.is_none()) spawns it; WORKERS_ENABLED still gates routing.
-    if cq_rings.is_none() {
+    if unsafe { (*core::ptr::addr_of!(CQ_RINGS)).is_none() } {
         const N_SYSCALL_WORKERS: usize = 2;
         const SYSCALL_WORKER_STACK_PAGES: usize = 8;
         let mut sw_spawned = 0usize;
@@ -14901,10 +15097,87 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
-        let (src_port, msg) = if let Some(ref rings) = cq_rings {
+        let (src_port, msg) = if let Some(rings) = unsafe { (*core::ptr::addr_of!(CQ_RINGS)).as_ref() } {
             rings.reap_wait(1);
             match rings.reap() {
                 Some(cqe) => {
+                    // LC pilot: an OP_CALL reply (CALL_TOKEN_BIT set on user_data)
+                    // is one of OUR outbound calls coming back — route it to its
+                    // PendingAsync continuation and loop, never to the inbound
+                    // source-port demux below.
+                    if (cqe.user_data & CALL_TOKEN_BIT) != 0 {
+                        let corr = cqe.user_data & !CALL_TOKEN_BIT;
+                        if let Some(slot) = async_find_by_correlation(corr) {
+                            let kind = unsafe { PENDING_ASYNC[slot].kind };
+                            match kind {
+                                PendingAsyncKind::StatVfs => {
+                                    if LC_STAT_DONE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                                        syscall::debug_puts(b"LC-STAT-DONE corr=");
+                                        print_num(corr);
+                                        syscall::debug_puts(b" res=");
+                                        print_num(cqe.result as u64);
+                                        syscall::debug_puts(b" size=");
+                                        print_num(cqe.inline[0]);
+                                        syscall::debug_puts(b"\n");
+                                    }
+                                    if cqe.result as u64 == VFS_STAT_OK {
+                                        finish_stat_vfs(slot, cqe.inline[0], cqe.inline[1], cqe.inline[3]);
+                                    } else {
+                                        finish_stat_vfs(slot, 0, 0, 0); // error -> ENOENT
+                                    }
+                                }
+                                PendingAsyncKind::ConnectInitramfs => {
+                                    if LC_CONNECT_DONE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                                        syscall::debug_puts(b"LC-CONNECT-DONE corr=");
+                                        print_num(corr);
+                                        syscall::debug_puts(b" res=");
+                                        print_num(cqe.result as u64);
+                                        syscall::debug_puts(b" h=");
+                                        print_num(cqe.inline[0]);
+                                        syscall::debug_puts(b"\n");
+                                    }
+                                    // initramfs_srv sync IO_CONNECT replies
+                                    // IO_CONNECT_OK(handle, size, aspace) or
+                                    // IO_ERROR; map to finish_connect_initramfs
+                                    // (handle=0 => not-found => ENOENT).
+                                    if cqe.result as u64 == IRFS_IO_CONNECT_OK {
+                                        finish_connect_initramfs(slot, cqe.inline[0], cqe.inline[1]);
+                                    } else {
+                                        finish_connect_initramfs(slot, 0, 0);
+                                    }
+                                }
+                                PendingAsyncKind::IrfsReadFd => {
+                                    if LC_READ_DONE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                                        syscall::debug_puts(b"LC-READ-DONE corr=");
+                                        print_num(corr);
+                                        syscall::debug_puts(b" res=");
+                                        print_num(cqe.result as u64);
+                                        syscall::debug_puts(b" n=");
+                                        print_num(cqe.inline[0]);
+                                        syscall::debug_puts(b"\n");
+                                    }
+                                    // sync IRFS_IO_READ replies IRFS_IO_READ_OK(bytes_read)
+                                    // (data[0]) or IO_ERROR; map error -> 0 bytes so the
+                                    // continuation takes its short/failed-read path.
+                                    let n = if cqe.result as u64 == IRFS_IO_READ_OK { cqe.inline[0] } else { 0 };
+                                    finish_irfs_read_fd(slot, n);
+                                }
+                                PendingAsyncKind::IrfsReadMmap => {
+                                    if LC_READ_DONE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                                        syscall::debug_puts(b"LC-READ-DONE(mmap) corr=");
+                                        print_num(corr);
+                                        syscall::debug_puts(b" n=");
+                                        print_num(cqe.inline[0]);
+                                        syscall::debug_puts(b"\n");
+                                    }
+                                    let n = if cqe.result as u64 == IRFS_IO_READ_OK { cqe.inline[0] } else { 0 };
+                                    finish_irfs_read_mmap(slot, n);
+                                }
+                                _ => { async_free_slot(slot); }
+                            }
+                        }
+                        continue; // OP_CALL reply handled; next loop iteration
+                    }
                     let sp = cqe.user_data & !userlib::completion::INBOUND_PORT_BIT;
                     let m = syscall::Message {
                         tag: cqe.result as u64,

@@ -980,7 +980,9 @@ fn handle_open(data: &[u64; 6]) {
 fn handle_stat(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
 
-    let (mut path, plen) = unpack_path(data[0], data[1], path_len);
+    // 24-byte path: data[0..1] + data[3] (LC pilot OP_CALL carries the path this
+    // way; legacy callers send data[3]=0, so this stays backward-compatible).
+    let (mut path, plen) = unpack_path_24(data[0], data[1], data[3], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
