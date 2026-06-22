@@ -8446,8 +8446,19 @@ pub fn voluntary_reschedule() {
     // on THIS CPU (or by remote drain after the 250ms+ stale-slot guard,
     // long after the assembly switch has completed).
     if cur_id != idle_id {
-        thread_ref(cur_id).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
-        record_trans(cur_id as u32, 7, thread_ref(cur_id).state, ON_CPU_PENDING);
+        // #208/DD fix (loom-dispatch-compose proven): publish the NON-claimable
+        // ON_CPU_RELEASING here — we are STILL on cur's kstack (the asm `mov rsp`
+        // hasn't run).  The old code stored ON_CPU_PENDING here, which let a peer
+        // (rescue scan / remote deferred-drain) claim+RUN cur while this CPU was
+        // still on its kstack → double-dispatch (mb1: cur=tid=20).  RELEASING is
+        // rescue-skipped (>ncpus) and fails the claim CAS, so cur stays put until
+        // finalize_release_after_stack_switch flips RELEASING→PENDING at the true
+        // off-kstack point (mirrors try_switch).  It also satisfies the original
+        // NEW_INV goal (rescue never observes state=Ready with on_cpu=cpu_real).
+        // The bail path below restores on_cpu=cpu; the commit path (before the
+        // pending_switch_sp store) calls transition_release_to_pending(cur_id).
+        thread_ref(cur_id).on_cpu.store(ON_CPU_RELEASING, Ordering::Release);
+        record_trans(cur_id as u32, 7, thread_ref(cur_id).state, ON_CPU_RELEASING);
         let packed = (cur_id as u64) | ((cur_prio as u64) << 32) | ((cpu as u64) << 40);
         let old_deferred = deferred_requeue()[cpu as usize].swap(packed, Ordering::AcqRel);
         if old_deferred != 0 {
@@ -8551,6 +8562,14 @@ pub fn voluntary_reschedule() {
     }
     let next_sp = next_t.saved_sp;
 
+    // #208/DD fix: commit path only (the bail above returns without switching and
+    // restores cur.on_cpu=cpu).  Stash cur for the off-kstack RELEASING→PENDING
+    // handoff that finalize_release_after_stack_switch performs right after the
+    // asm `mov rsp` consumes pending_switch_sp.  Mirrors try_switch's
+    // transition_release_to_pending at its return sites.
+    if cur_id != idle_id {
+        transition_release_to_pending(cur_id);
+    }
     pending_switch_sp()[cpu as usize].store(next_sp, Ordering::Release);
 
     // Reprogram the timer so the deferred slot (holding cur_id) is drained

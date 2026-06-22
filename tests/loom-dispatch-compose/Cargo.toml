@@ -1,0 +1,37 @@
+[package]
+name = "loom-dispatch-compose"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Composed dispatch model (#173 / #208 double-dispatch).  Standalone (excluded
+# from the kernel workspace; loom needs std).
+#
+# Prior loom models each cover ONE side of the dispatch protocol in isolation:
+#   * loom-claim-helper  — the on_cpu claim/reclaim/rescue mutex only.
+#   * loom-runqueue-v2   — the in_queue run-queue membership only.
+# Double-dispatch (mb1: tid=20 executing on two CPUs; #173 rung-2 amplified it)
+# is a property of the COMPOSITION — wake-enqueue ⋈ on_cpu-release-window ⋈
+# claim ⋈ heap — which neither single-side model can express.  This crate models
+# the composition with an explicit per-CPU EXECUTION state (the kstack owner),
+# distinct from the on_cpu claim lease, and asserts the real safety invariant:
+#
+#   a Thread executes (is current_thread) on AT MOST ONE cpu at any instant
+#   — its kstack is single-owner.  (No double-dispatch.)
+#
+# v1 isolates the release⋈claim core: it proves the preempt-release ordering
+# (leave-kstack-before-publishing-on_cpu=PENDING) and its Release fence are the
+# load-bearing DD-freedom conditions.  Later phases add the enqueue/membership
+# side (legacy vs MEMBERSHIP_ATOMIC) and the rescue/steal actors.
+
+[lib]
+doctest = false  # model crate; doc comments use prose/Unicode, not runnable code
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

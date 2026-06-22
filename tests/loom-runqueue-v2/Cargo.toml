@@ -1,0 +1,43 @@
+[package]
+name = "loom-runqueue-v2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace; loom needs std/Arc, the
+# kernel is no_std).  #173 atomic run-queue membership redesign.
+#
+# This is the gated successor to tests/loom-runqueue, which the 2026-06-18
+# #173 verdict said was needed: it INCLUDES the `on_cpu == ON_CPU_PENDING`
+# gate that the kernel's dispatch path sets between heap.pop and the
+# in_queue/membership update, and that rescue checks before re-enqueuing.
+# loom-runqueue deliberately omitted that gate (so it fails by design).
+#
+# Three protocols are modeled + compared, each racing dispatch ‖ wake ‖
+# rescue on ONE thread's run-queue membership:
+#
+#   * `current`  — the live kernel protocol: in_queue: AtomicBool +
+#                  separate heap, mitigated by the on_cpu==PENDING gate in
+#                  rescue + (out of model) fast-rescue.  Baseline: should
+#                  PASS now that the gate is modeled.
+#   * `approach_a` — in_queue folded INTO the rq lock (single source of
+#                  truth; no swap-outside-lock fast path).  Membership is
+#                  one variable under the lock → phantom impossible by
+#                  construction.  No on_cpu gate / rescue needed.
+#   * `approach_b` — single packed atomic membership word (state machine
+#                  NOT_QUEUED/QUEUED/CLAIMED), keeping a lock-free wake
+#                  fast path.  No on_cpu gate / rescue needed.
+#
+# Invariant at every quiescent point (all racers joined): the thread is in
+# exactly ONE of {claimed-by-one-cpu, queued-in-one-rq}; never STRANDED
+# (runnable per membership but in no heap and not claimed) and never DOUBLE
+# (two claimers or heap_member > 1).
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

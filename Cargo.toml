@@ -8,6 +8,8 @@ exclude = [
     "tests/loom-turnstile",
     "tests/loom-turnstile-slab",
     "tests/loom-runqueue",
+    "tests/loom-runqueue-v2",
+    "tests/loom-dispatch-compose",
     "tests/loom-linux-futex-exit",
     "tests/loom-clone-thread-iretq",
     "tests/loom-claim-helper",
