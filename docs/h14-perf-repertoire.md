@@ -107,13 +107,34 @@ contend 4 slots; the win is at the multi-client phase, **quantify on a clean hos
 (watch `FS_ASYNC_SCRATCH_EXHAUST`/`FS_MMAP_SYNC_FALLBACK` drop vs the 4-slot
 baseline). If they still fire at 8, go to 16 (needs the `AtomicU16` widening).
 
-### 4. [MED · risk] Defer/background the preload
-**Today:** preload runs **before** the dispatch loop (`linux_srv.rs:~15006`),
-blocking boot for its whole duration before any process starts.
-**Improvement:** start serving immediately; fill `LIB_CACHE` lazily/in-background
-so Xwayland launches in parallel and hits cache as it fills.
-**Risk:** moderate — first process races the fill (double-fetch a few chunks);
-needs careful chunk-state handling. Do after #1/#2.
+### 4. [MED · risk · loom-first · NEXT] Defer/background the preload
+**Today:** `lib_cache_eager_populate` runs **before** the dispatch loop
+(`linux_srv.rs:~15006`) via synchronous `irfs_read_bulk` for ~51 libs, blocking
+boot for its whole duration before any process starts.
+**Improvement:** start serving immediately; fill `LIB_CACHE` on a background
+thread (which CAN block on sync reads, unlike the pre-loop preload — that was #2's
+blocker: no reply pickup before the loop) so Xwayland launches in parallel and
+hits cache as it fills.
+**Concurrency analysis (2026-06-23, done):** today `lib_cache_lookup_or_alloc`
+(`linux_srv.rs:4512`) is **lock-free** and there is **no `LIB_CACHE_LOCK`** in the
+per-table lock set (`linux_srv.rs:772`). It's safe right now only because its sole
+callers are the pre-loop preload (single-threaded) and `handle_mmap`, and
+**`__NR_MMAP` is NOT in `is_worker_safe_syscall` (`:13042`) → mmap runs
+main-thread-only.** So #4 **introduces the first concurrency**: a background
+preload thread ‖ main-thread `handle_mmap` both calling `lookup_or_alloc(handle)`
+→ double-scan → **two slots allocated for one handle** (slot-alloc race). Chunk
+*content* publication is already fenced (the `chunks_cached` Release/Acquire,
+loom-validated in `tests/loom-libcache-share`), and concurrent same-chunk fills
+write identical file bytes (idempotent) — but the slot-alloc + per-chunk
+double-fetch need guarding.
+**Plan (loom-first, like #1):** (a) loom-model preload-thread ‖ main-thread
+`lookup_or_alloc` + chunk-fill → prove no double-slot-alloc / no torn read / no
+lost chunk; (b) make `lookup_or_alloc` race-safe — add a `LIB_CACHE_LOCK`
+(TicketSpinLock, the Phase-B idiom) around the scan+claim, or a CAS slot-claim;
+(c) per-chunk "fill-in-progress" claim to avoid double-fetch; (d) spawn the
+preload on a worker thread that starts after the dispatch loop is serving.
+**Risk:** moderate — the hot lib-load path + new concurrency. Do with the loom
+model first; no-regression boot on a clean host.
 
 ### 5. [MED · SENSITIVE · UNVERIFIED] init.rs H14 orchestration latency
 Candidate (agent-reported, line numbers NOT yet verified): a fixed
