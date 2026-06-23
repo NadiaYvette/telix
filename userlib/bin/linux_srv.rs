@@ -3217,10 +3217,21 @@ fn ensure_fs_scratch_grants() {
 // that region: local VA = FS_ASYNC_SCRATCH_LOCAL + slot*PAGES*page_size,
 // remote VA = LIN_FS_ASYNC_SCRATCH_REMOTE_BASE + slot*PAGES*4096.
 const FS_ASYNC_SCRATCH_PAGES: usize = 64;
-const FS_ASYNC_SCRATCH_SLOTS: usize = 4;
+// #258 / H14 perf #3: pipeline depth for concurrent in-flight IRFS/FS chunk
+// fills.  Raised 4 -> 8 (2026-06-23): the H14 target runs several Linux
+// processes (compositor + Xwayland + N X clients) that dlopen libc / libwayland
+// / libX11 / ... concurrently; with the worker pool each in-flight mmap-fill
+// holds a slot, so 4 slots throttle the concurrent-load burst and force the
+// handle_mmap sync fallback (FS_MMAP_SYNC_FALLBACK) once exhausted
+// (FS_ASYNC_SCRATCH_EXHAUST).  8 is the ceiling for the AtomicU8 FS_ASYNC_SCRATCH_BUSY
+// bitmap — going to 16 needs AtomicU16 + widening the `1u8 << i` shift literals
+// in alloc/free_async_scratch_slot.  Cost: the region is FS_ASYNC_SCRATCH_PAGES ×
+// SLOTS pages, pre-faulted + grant-shared (not duplicated) into each FS task —
+// 8×64 = 512 pages (~2 MiB) at the remote base, ending below the next grant window.
+const FS_ASYNC_SCRATCH_SLOTS: usize = 8;
 const LIN_FS_ASYNC_SCRATCH_REMOTE_BASE: usize = 0x5_0010_0000;
 
-/// Local base of the async scratch region (4 × 64 pages contiguous).
+/// Local base of the async scratch region (SLOTS × 64 pages contiguous).
 /// 0 = not yet allocated.
 static mut FS_ASYNC_SCRATCH_LOCAL: usize = 0;
 /// True once the bulk grant to initramfs_srv has succeeded.

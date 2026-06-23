@@ -87,11 +87,25 @@ serial stalls per library.
 **Risk:** low — self-contained to the preload routine, runs at boot before the
 dispatch loop; bounded by existing scratch slots. Good first implementation.
 
-### 3. [MED · pending #258] Lift `FS_ASYNC_SCRATCH_SLOTS` (4 → 8/16)
-`linux_srv.rs:~3220`. More concurrent in-flight chunk fills (helps #2 and the
-lazy mmap-fill path; also reduces the sync-fallback frequency that #258 tracks).
-**Risk:** low-moderate — costs scratch VA/memory; validate no grant-region
-pressure. Already a tracked task (#258).
+### 3. [IMPLEMENTED 2026-06-23 · #258] Lift `FS_ASYNC_SCRATCH_SLOTS` (4 → 8)
+`linux_srv.rs:3220`. Raised 4 → **8** (one constant). More concurrent in-flight
+chunk fills → fewer mmap sync-fallbacks (`FS_MMAP_SYNC_FALLBACK`) under the
+multi-client load (compositor + Xwayland + N X clients dlopen'ing libs at once,
+each holding a scratch slot per in-flight fill).
+**Findings:** `FS_ASYNC_SCRATCH_BUSY` is an `AtomicU8` → **8 is the ceiling**
+without widening to `AtomicU16` (+ the `1u8 << i` shift literals); the loop only
+shifts by `i<8` so it's safe. Region = `FS_ASYNC_SCRATCH_PAGES(64) × SLOTS`
+pages, pre-faulted + grant-shared (not duplicated) into each FS task at
+`LIN_FS_ASYNC_SCRATCH_REMOTE_BASE=0x5_0010_0000`; at 8 slots it spans 2 MiB
+(→ `0x5_0030_0000`), clear of neighbors (`0x5_0000_0000`/`0x5_0001_0000`).
+**Validation:** build-clean. Boot 91amfsq100 exercised it past early bringup
+with **no exhaustion** and no slot-attributable fault (the one #PF was an ambient
+`#208`-family null-write in a native smoke-test process — task=18 "hello"/
+"echo_client" — that runs *before* linux_srv's preload, recovered, boot
+continued). Exhaustion didn't fire because the single-process bringup doesn't
+contend 4 slots; the win is at the multi-client phase, **quantify on a clean host**
+(watch `FS_ASYNC_SCRATCH_EXHAUST`/`FS_MMAP_SYNC_FALLBACK` drop vs the 4-slot
+baseline). If they still fire at 8, go to 16 (needs the `AtomicU16` widening).
 
 ### 4. [MED · risk] Defer/background the preload
 **Today:** preload runs **before** the dispatch loop (`linux_srv.rs:~15006`),
