@@ -191,6 +191,16 @@ Closest to the activations / non-blocking-syscall design.
   kernel hands scheduling decisions to userspace runtimes. **The
   closest published work to what Telix's activation upcalls
   should look like in practice.**
+- **UMCG / switchto** (Peter Oskolkov, Google → Linux, ~2021). User-
+  Managed Concurrency Groups: the *lightest* modern realization —
+  server (carrier) + worker uthreads as ordinary kernel threads, a
+  per-thread shared state word, and a **directed context switch**
+  (`umcg_wait(next)`), pairing with io_uring for the async-IO half.
+  Lives inside the host scheduler (no gang core-allocation, no fresh
+  upcall stack) — far smaller kernel surface than full SA, at the cost
+  of less core control. **The modern endpoint of the lineage; the
+  carrier model sidesteps the continuation-save and preempted-lock-
+  holder hard parts.** See `mn-scheduler-activations.md` §2–§4.
 - **Tessellation** (Liu et al., Berkeley). Space-time partitioned
   OS, channels, cells. Less mature than Akaros.
 - **Barrelfish / Multikernel** (ETH Zurich + MSR Cambridge).
