@@ -1,0 +1,47 @@
+[package]
+name = "loom-libcache-alloc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# H14 perf #4 — background the LIB_CACHE preload (docs/h14-perf-repertoire.md).
+#
+# Today lib_cache_eager_populate runs SYNCHRONOUSLY before linux_srv's dispatch
+# loop, and lib_cache_lookup_or_alloc (linux_srv.rs:4512) is LOCK-FREE — a
+# scan-for-existing-handle then scan-for-free-slot-and-claim, with no mutual
+# exclusion. That is safe ONLY because its callers today are the pre-loop preload
+# (single-threaded) and handle_mmap, and __NR_MMAP is not in is_worker_safe_syscall
+# so mmap runs main-thread-only.
+#
+# #4 backgrounds the preload onto a worker thread that runs CONCURRENTLY with the
+# dispatch loop, so the preload thread and the main-thread handle_mmap both call
+# lookup_or_alloc(handle) for the same initramfs handle at once. The lock-free
+# scan+claim then races:
+#
+#   INVARIANT: at most ONE cache slot is ever allocated for a given handle.
+#
+# Proves: (1) the current lock-free scan+claim ADMITS a double-alloc (two slots for
+# one handle → wasted backing region + an incoherent second copy that mmap serves);
+# (2) a Mutex (the Phase-B TicketSpinLock idiom) around the whole scan+claim makes
+# lookup_or_alloc atomic → exactly one slot per handle under every interleaving.
+# That mutex is the #4 fix.
+#
+# NOTE (concurrent chunk fill, not modeled — argued structurally): once both callers
+# share the single slot, two threads may fill the SAME chunk; both write identical
+# file bytes (idempotent) and set chunks_cached Release-after-write, so a reader that
+# observes the bit sees correct bytes regardless of interleave (the fill->read
+# publication itself is loom-proven in loom-libcache-share). The only cost is a
+# double-fetch, which the per-chunk fill-in-progress claim in the #4 fix avoids — an
+# optimization, not a correctness requirement.
+
+[lib]
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
