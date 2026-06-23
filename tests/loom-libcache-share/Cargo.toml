@@ -1,0 +1,43 @@
+[package]
+name = "loom-libcache-share"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# H14 perf #1 — RO library page SHARING (docs/h14-perf-repertoire.md).
+#
+# Today linux_srv COPIES a cached initramfs library chunk into each process's
+# private pages (personality_copy_out). #1 maps the cache page SHARED RO into each
+# process (personality_map_shared, the memfd/DRM mechanism) instead. That turns the
+# cache fill -> consumer read into a CROSS-CPU PUBLICATION: linux_srv fills a chunk
+# (writes backing_va) and sets the `chunks_cached` bit; a DIFFERENT process on a
+# DIFFERENT CPU then reads that physical page through its RO mapping. With a copy
+# the fill+copy were one thread; with sharing the reader is remote, so the
+# fill->set-bit / check-bit->read handshake must be a proper release/acquire
+# publication or the reader can observe a half-filled page.
+#
+#   INVARIANT: a consumer that maps+reads a chunk it observed `cached` sees the
+#   FULLY-FILLED content (never the pre-fill / torn page).
+#
+# Proves: (1) the release/acquire `chunks_cached` publication is safe under all
+# interleavings; (2) a relaxed handshake admits a torn read (so the fence the
+# current bitmap already uses is load-bearing ONCE the page is shared, not just
+# nice-to-have as it was for the same-thread copy).
+#
+# NOTE (teardown, not modeled — argued structurally): the shared pages are
+# VMA-less in the consumer (raw PTEs to linux_srv-owned, persistent cache pages),
+# so process exit / aspace teardown does NOT free them (same property as the
+# completion ring pages, project_completion_ring_lifecycle) -> no cross-process
+# refcount/free race to model for the persistent-cache case.
+
+[lib]
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

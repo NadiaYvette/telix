@@ -13,7 +13,22 @@ descheduling (paravirt). This doc covers the workload.
 
 ## Prioritized candidates
 
-### 1. [HIGH · verified] Share read-only library pages across processes
+> **FIRST TARGET (2026-06-23, user pick).** Scope refined after reading
+> `personality_map_shared` (personality.rs:1310): it maps the server's physical
+> pages directly into a process (RO supported) and the mapped pages are **VMA-less
+> in the consumer** — so, exactly like the completion ring pages, aspace teardown
+> does NOT free them and the **persistent cache owns them ⇒ no cross-process
+> refcount/free race** to build. It does **not** do COW, so the design is: **RO/exec
+> mmaps → `personality_map_shared(RO)` of the cached pages (the .text/.rodata bulk
+> = most of the win); RW/RELRO mmaps → keep the per-process copy** (ld.so writes
+> those; no COW needed). The one genuinely-new concurrency — sharing turns the
+> fill→read into a **cross-CPU publication** gated by `chunks_cached` — is
+> **loom-validated** (`tests/loom-libcache-share` 2/2: release/acquire safe, relaxed
+> torn-read caught). Net: lower-risk than first rated (reuses the memfd/DRM
+> mechanism + the existing cached-bit fence; no COW, no refcount). Next: implement
+> the RO-share branch in handle_mmap(FdKind::Initramfs) + a no-regression boot.
+
+### 1. [HIGH · verified · loom-validated] Share read-only library pages across processes
 **Today:** a file-backed mmap of an initramfs library **copies** the bytes into
 each process's private pages — `personality_copy_out` in the fill / cache-hit
 paths (`linux_srv.rs:4233/4321/4606`), backing allocated as anon
