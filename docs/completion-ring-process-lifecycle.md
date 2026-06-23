@@ -146,9 +146,30 @@ Concrete rules:
 - **Phase A — correctness (closes both live hazards).** `clear_completion_ctx`
   + RCU-deferred page free; call from exec (`aspace::reset`) and exit
   (`exit_current_thread`/`aspace::destroy`); zero `io_*` on Task-slot reuse.
-- **Phase B — principled.** VMA/object-back the ring pages (skip-clone flag);
-  remove the targeted exec/exit hooks in favor of automatic aspace reclamation;
-  lift the one-shot restriction.
+- **Phase B — REASSESSED 2026-06-23: UNNECESSARY (do not pursue).** On closer
+  reading of the code, every Phase-B item is moot:
+  - *Reclamation:* Phase A already frees the pages (RCU-deferred); no leak.
+  - *One-shot:* the only setup guard is `io_depth != 0`, which teardown and the
+    Phase-A exec/exit clears already reset — re-`io_setup` already works.
+  - *Clone isolation (#6):* a NON-issue. A forked child seeing a COW copy of the
+    parent's ring *memory* is normal fork semantics (the child is a memory copy,
+    COW-protected so it cannot corrupt the parent's ring), and the child's
+    KERNEL-side context is empty (`io_depth=0` via Task::empty + the Phase-A
+    reuse-zero), so the kernel never delivers into the child. That IS the correct
+    io_uring-fork behavior (the ring *context* doesn't transfer; leftover mmap
+    memory is just COW memory). VA-placement can't change this anyway:
+    `clone_shared_tables` shares whole PML4/PDPT subtrees across ALL user VAs
+    [1..507], and rings must be user-accessible, so there is no non-shared user
+    region to isolate them into.
+  - *VMA-backing (#7):* would be cosmetic AND conflicts with Phase A's
+    RCU-deferred free (double-free) while introducing a grace-vs-aspace-free
+    timing tension — net more complex, zero functional gain. The targeted
+    Phase-A hook (clear io_depth → RCU-defer free, co-located) is the cleaner
+    design.
+  Conclusion: **Phase A completes the ring lifecycle.** The completion ABI's
+  process-lifecycle prerequisite for general processes is met. (Remaining
+  completion-ABI work is the separate server-conversion breadth, Tracks 2-5 of
+  project_completion_linux_srv_design — not ring lifecycle.)
 - **Validation** (needs a calm host — deep boots are #120-flaky under load):
   1. `io_setup` → `execve` a different image → confirm the new image's inbound IPC
      works (no black-hole) and no leaked/again-routed CQEs.
