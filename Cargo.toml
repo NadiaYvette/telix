@@ -17,4 +17,5 @@ exclude = [
     "tests/loom-phys-chunk",
     "tests/loom-spawn-publish",
     "tests/loom-release-slot",
+    "tests/loom-ring-teardown",
 ]

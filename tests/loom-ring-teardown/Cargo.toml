@@ -1,0 +1,45 @@
+[package]
+name = "loom-ring-teardown"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Completion-ring teardown ‖ deliver-hook race (project_completion_ring_lifecycle).
+#
+# Phase A of the ring-lifecycle fix adds `clear_completion_ctx(task)`, called on
+# exec (aspace::reset) and exit, which clears `io_depth` and frees the two SQ/CQ
+# ring pages.  Concurrently, the deliver hook (kernel/src/syscall/port.rs ~944 ->
+# ipc/completion.rs ~519) routes an inbound port message into a task's CQ whenever
+# `io_depth != 0`, writing through the direct-map `io_cq_kva`.  If clear frees the
+# ring page while a deliver on another CPU is mid-write, that's a use-after-free.
+#
+#   INVARIANT: no deliver hook ever writes into a ring page that
+#   clear_completion_ctx has freed.
+#
+# This crate proves: (1) the NAIVE clear (store io_depth=0 then free immediately)
+# admits the UAF; (2) an RCU-deferred clear that publishes io_depth=0 and then
+# waits for in-flight delivers to quiesce (a grace period) before freeing is safe.
+#
+# WHY RwLock, NOT A FLAG: the grace period is modeled with an RwLock (deliver =
+# read guard across gate-check + write; clear = write guard = synchronize_rcu).
+# A Dekker-style flag handshake would be correct only under SeqCst's total order,
+# and loom does NOT fully model SeqCst (it reports a false UAF on that
+# actually-correct construct).  RwLock captures the grace period's SAFETY property
+# -- the free happens-after every in-flight reader -- which loom models precisely.
+#
+# KERNEL FIDELITY: the real deliver hook must run inside a recognized RCU
+# read-side section (preempt-off / rcu_read_lock) so the kernel's grace period
+# covers it, and the ring-page free must be deferred via call_rcu / the existing
+# RCU-defer path (aspace.rs:557), NOT freed synchronously.
+
+[lib]
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
