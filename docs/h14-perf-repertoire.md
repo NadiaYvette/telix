@@ -130,16 +130,16 @@ double-fetch need guarding.
 **Plan (loom-first, like #1):**
 - (a) ✅ **loom model DONE** — `tests/loom-libcache-alloc` (2/2): lock-free
   scan+claim double-allocates (`should_panic`), Mutex-guarded scan+claim unique.
-- (b) make `lookup_or_alloc` race-safe with a `LIB_CACHE_LOCK` (TicketSpinLock,
-  Phase-B idiom).  **Subtlety found (don't just wrap the whole fn):**
-  `lookup_or_alloc` (`:4512`) does `mmap_anon` + a prefault loop of up to
-  `LIB_CACHE_FILE_CAP/page_size` pages (~1280 for a 5 MiB lib) — holding a
-  spinlock across that would make the main dispatch thread spin for the whole
-  allocation.  Use **reserve-then-fill**: under the lock, scan + claim a slot
-  (`in_use=true, handle=H, backing_va=0, ready=false`), release; then `mmap_anon`
-  + prefault unlocked; publish `backing_va` + `ready=true` (Release).  Consumers
-  treat `handle==H && !ready` as not-yet-cached (fall through to the non-caching
-  path) — extend the loom model to cover this ready-state publication.
+- (b) ✅ **DONE** — `LIB_CACHE_LOCK` (TicketSpinLock, Phase-B idiom) guards both
+  `lib_cache_lookup` (the scan) and `lib_cache_lookup_or_alloc` (whole-function:
+  scan + claim + slot write) — `linux_srv.rs:782/4463/4512`.  Implemented as the
+  **whole-function lock the loom model validates** (not reserve-then-fill).
+  Rationale: the alloc path's `mmap_anon` + prefault is bounded (one-time per
+  handle, no blocking IPC), and only a cache *miss* takes it; cache *hits* go
+  through the lock-free fast path (`lib_cache_lookup` → immutable slot fields).
+  Reserve-then-fill (claim under lock, publish `backing_va`/`ready` after) is
+  kept as a **future optimization** if that one-time alloc spin ever shows up.
+  Uncontended today (still main-thread-only); becomes load-bearing once (e) lands.
 - (c) per-chunk "fill-in-progress" claim to avoid double-fetch (optimization).
 - (d) **scratch collision:** `irfs_read_bulk` (`:3727`) hardcodes the single sync
   scratch `LIN_FS_SCRATCH_VA`, so a background preload thread reading there would

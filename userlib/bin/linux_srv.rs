@@ -780,6 +780,17 @@ static FD_TRANSFER_LOCK:  TicketSpinLock<()> = TicketSpinLock::new(());
 static POLL_LOCK:         TicketSpinLock<()> = TicketSpinLock::new(());
 static FUTEX_LOCK:        TicketSpinLock<()> = TicketSpinLock::new(());
 static TRACE_PI_LOCK:     TicketSpinLock<()> = TicketSpinLock::new(());
+// H14 perf #4: serializes LIB_CACHE slot-table access (lib_cache_lookup +
+// lib_cache_lookup_or_alloc + the slot write).  Today both run main-thread-only
+// (mmap is not worker-safe) + the preload is pre-loop single-threaded, so this is
+// uncontended — but #4 backgrounds the preload onto its own thread, making
+// lookup_or_alloc concurrent with the main-thread handle_mmap.  Without it two
+// callers race the scan+claim and double-allocate a slot for one handle
+// (loom-proven: tests/loom-libcache-alloc).  The per-chunk `chunks_cached` bitmap
+// stays a fine-grained atomic (Release/Acquire); this lock covers only the coarse
+// slot metadata (in_use/handle/backing_va/chunk_count), which is immutable once a
+// slot is in_use, so callers may read those fields unlocked after a lookup.
+static LIB_CACHE_LOCK:    TicketSpinLock<()> = TicketSpinLock::new(());
 
 #[allow(dead_code)] fn epoll_lock()       -> TicketSpinLockGuard<'static, ()> { EPOLL_LOCK.lock() }
 #[allow(dead_code)] fn eventfd_lock()     -> TicketSpinLockGuard<'static, ()> { EVENTFD_LOCK.lock() }
@@ -792,6 +803,7 @@ static TRACE_PI_LOCK:     TicketSpinLock<()> = TicketSpinLock::new(());
 #[allow(dead_code)] fn poll_lock()        -> TicketSpinLockGuard<'static, ()> { POLL_LOCK.lock() }
 #[allow(dead_code)] fn futex_lock()       -> TicketSpinLockGuard<'static, ()> { FUTEX_LOCK.lock() }
 #[allow(dead_code)] fn trace_pi_lock()    -> TicketSpinLockGuard<'static, ()> { TRACE_PI_LOCK.lock() }
+#[allow(dead_code)] fn lib_cache_lock()   -> TicketSpinLockGuard<'static, ()> { LIB_CACHE_LOCK.lock() }
 
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
@@ -4479,6 +4491,10 @@ fn cache_full_mask(chunk_count: u8) -> u64 {
 /// Used by handle_read and the handle_mmap full-hit fast path; both
 /// assume backing_va is fully valid for any read offset/length.
 fn lib_cache_lookup(handle: u64) -> Option<usize> {
+    // H14 #4: serialize the slot-table scan against a concurrent
+    // lib_cache_lookup_or_alloc slot write (the backgrounded preload thread),
+    // so we never observe a half-written slot.  Uncontended pre-#4.
+    let _g = lib_cache_lock();
     unsafe {
         for i in 0..LIB_CACHE_MAX {
             if LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle {
@@ -4513,6 +4529,15 @@ fn lib_cache_lookup_or_alloc(handle: u64, file_size: u64) -> Option<usize> {
     if file_size == 0 || file_size > LIB_CACHE_FILE_CAP {
         return None;
     }
+    // H14 #4: hold LIB_CACHE_LOCK across the whole scan + claim + slot write so a
+    // concurrent caller (backgrounded preload thread ‖ main-thread handle_mmap)
+    // can't pass the no-existing-slot scan and claim a second slot for the same
+    // handle — the double-alloc proven in tests/loom-libcache-alloc.  The guard
+    // lives to function end, covering every return path.  The one-time
+    // mmap_anon + prefault runs under the lock; it does no blocking IPC and only
+    // the (rare) first open of each handle takes the alloc path, so the critical
+    // section is bounded.
+    let _g = lib_cache_lock();
     unsafe {
         for i in 0..LIB_CACHE_MAX {
             if LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle {
