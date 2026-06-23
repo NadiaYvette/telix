@@ -296,6 +296,49 @@ pub fn io_teardown() -> u64 {
     0
 }
 
+/// Tear down `task_id`'s completion ring context at ADDRESS-SPACE teardown
+/// (exec replace / exit) — distinct from `io_teardown`, which is for a *running*
+/// task and deliberately leaves the live mapping intact.
+///
+/// 1. Clear the deliver-hook gate FIRST (`io_depth` Release) so no new deliver
+///    routes into the ring.  The swap makes it idempotent — only the first
+///    caller observes a live depth.
+/// 2. RCU-defer freeing the two ring pages.  Syscall-context delivers are
+///    implicit RCU readers (see `sync/rcu`), so the grace period guarantees no
+///    deliver is mid-write when `free_page_callback` reclaims the page
+///    (loom-proven: tests/loom-ring-teardown::rcu_grace_period_free_is_safe).
+///    Freeing is safe HERE — and only here — because the caller is replacing or
+///    destroying the aspace, so the ring's user PTE is going away too; no
+///    userspace write can race the freed page.  (This also closes the per-task
+///    ring-page leak: the pages are VMA-less, so aspace teardown alone never
+///    reclaims them — see docs/completion-ring-process-lifecycle.md.)
+/// 3. Drop the kernel VAs.
+///
+/// No-op when the task has no ring context (the common case: a single swap).
+pub fn clear_completion_ctx(task_id: crate::sched::task::TaskId) {
+    if task_id == 0 {
+        return;
+    }
+    let task = crate::sched::scheduler::task_ref(task_id);
+    if task.io_depth.swap(0, Ordering::Release) == 0 {
+        return; // no completion context — nothing to reclaim
+    }
+    let sq_kva = task.io_sq_kva.swap(0, Ordering::Relaxed);
+    let cq_kva = task.io_cq_kva.swap(0, Ordering::Relaxed);
+    if sq_kva != 0 {
+        crate::sync::rcu::rcu_defer_free(
+            crate::mm::page::kva_to_phys(sq_kva),
+            crate::sync::rcu::free_page_callback,
+        );
+    }
+    if cq_kva != 0 {
+        crate::sync::rcu::rcu_defer_free(
+            crate::mm::page::kva_to_phys(cq_kva),
+            crate::sync::rcu::free_page_callback,
+        );
+    }
+}
+
 /// Perform a single SQE. Returns `Some(cqe)` to post a completion, or `None`
 /// for fire-and-forget ops (OP_REPLY) that produce no self-completion.
 fn perform_sqe(sqe: &Sqe) -> Option<Cqe> {

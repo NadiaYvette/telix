@@ -2928,6 +2928,12 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Create a fresh page table for the new image.
     let new_pt_root = crate::mm::hat::create_user_page_table().expect("execve: pt alloc");
 
+    // #ring-lifecycle: tear down this task's completion ring (clear the gate +
+    // RCU-free the ring pages) BEFORE the aspace is replaced — else the deliver
+    // hook keeps routing the new image's inbound IPC into the orphaned old ring.
+    // No-op when the task has no ring. See clear_completion_ctx.
+    crate::ipc::completion::clear_completion_ctx(crate::sched::scheduler::current_task_id());
+
     // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
     crate::mm::aspace::reset(aspace_id, new_pt_root);
 
@@ -3474,6 +3480,10 @@ pub(crate) fn exec_for_task(
     unsafe {
         crate::sched::scheduler::task_mut_from_ref(target_task_id).page_table_root = new_pt_root;
     }
+
+    // #ring-lifecycle: tear down the target's completion ring before its aspace
+    // is replaced (see clear_completion_ctx). No-op when it has no ring.
+    crate::ipc::completion::clear_completion_ctx(target_task_id);
 
     // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
     crate::mm::aspace::reset(aspace_id, new_pt_root);

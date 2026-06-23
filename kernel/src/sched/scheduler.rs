@@ -4776,6 +4776,15 @@ fn alloc_task_id() -> Option<TaskId> {
         }
     });
     if let Some(id) = found_id {
+        // #ring-lifecycle (defense in depth): a reaped slot is reused WITHOUT
+        // running Task::empty, so zero any stale completion-ring context — else
+        // the deliver hook could route the new task's IPC into a previous
+        // occupant's freed ring (the exec/exit clear should already have done
+        // this, but a reused slot must never carry a live io_depth).
+        let t = task_ref(id);
+        t.io_depth.store(0, Ordering::Release);
+        t.io_sq_kva.store(0, Ordering::Relaxed);
+        t.io_cq_kva.store(0, Ordering::Relaxed);
         return Some(id);
     }
     let id = NEXT_TASK_ID.load(Ordering::Relaxed);
@@ -6434,6 +6443,10 @@ fn drain_deferred_kills() {
         unsafe {
             (*tptr).free_groups_overflow();
         }
+
+        // #ring-lifecycle: tear down this task's completion ring before its
+        // aspace is destroyed. No-op if no ring.
+        crate::ipc::completion::clear_completion_ctx(task_id);
 
         // Destroy address space.
         let aspace_id = task.aspace_id;
@@ -11374,6 +11387,10 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
                 (*tptr).free_groups_overflow();
             }
         }
+
+        // #ring-lifecycle: tear down this task's completion ring before its
+        // aspace is destroyed (clear gate + RCU-free pages). No-op if no ring.
+        crate::ipc::completion::clear_completion_ctx(current_task_id());
 
         // Destroy address space (frees VMAs, backing pages, and PT tree).
         if aspace_id != 0 {
