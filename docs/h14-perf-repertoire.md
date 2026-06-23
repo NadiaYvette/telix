@@ -127,14 +127,32 @@ preload thread ‖ main-thread `handle_mmap` both calling `lookup_or_alloc(handl
 loom-validated in `tests/loom-libcache-share`), and concurrent same-chunk fills
 write identical file bytes (idempotent) — but the slot-alloc + per-chunk
 double-fetch need guarding.
-**Plan (loom-first, like #1):** (a) loom-model preload-thread ‖ main-thread
-`lookup_or_alloc` + chunk-fill → prove no double-slot-alloc / no torn read / no
-lost chunk; (b) make `lookup_or_alloc` race-safe — add a `LIB_CACHE_LOCK`
-(TicketSpinLock, the Phase-B idiom) around the scan+claim, or a CAS slot-claim;
-(c) per-chunk "fill-in-progress" claim to avoid double-fetch; (d) spawn the
-preload on a worker thread that starts after the dispatch loop is serving.
-**Risk:** moderate — the hot lib-load path + new concurrency. Do with the loom
-model first; no-regression boot on a clean host.
+**Plan (loom-first, like #1):**
+- (a) ✅ **loom model DONE** — `tests/loom-libcache-alloc` (2/2): lock-free
+  scan+claim double-allocates (`should_panic`), Mutex-guarded scan+claim unique.
+- (b) make `lookup_or_alloc` race-safe with a `LIB_CACHE_LOCK` (TicketSpinLock,
+  Phase-B idiom).  **Subtlety found (don't just wrap the whole fn):**
+  `lookup_or_alloc` (`:4512`) does `mmap_anon` + a prefault loop of up to
+  `LIB_CACHE_FILE_CAP/page_size` pages (~1280 for a 5 MiB lib) — holding a
+  spinlock across that would make the main dispatch thread spin for the whole
+  allocation.  Use **reserve-then-fill**: under the lock, scan + claim a slot
+  (`in_use=true, handle=H, backing_va=0, ready=false`), release; then `mmap_anon`
+  + prefault unlocked; publish `backing_va` + `ready=true` (Release).  Consumers
+  treat `handle==H && !ready` as not-yet-cached (fall through to the non-caching
+  path) — extend the loom model to cover this ready-state publication.
+- (c) per-chunk "fill-in-progress" claim to avoid double-fetch (optimization).
+- (d) **scratch collision:** `irfs_read_bulk` (`:3727`) hardcodes the single sync
+  scratch `LIN_FS_SCRATCH_VA`, so a background preload thread reading there would
+  race the main thread's sync-fallback reads.  Give the preload thread its own
+  buffer — read into an async scratch slot (`alloc_async_scratch_slot`, the #3
+  pool) via a new `irfs_read_bulk_into(scratch_va, …)`, or a dedicated preload
+  scratch region.
+- (e) spawn the preload on a worker thread that starts after the dispatch loop is
+  serving (sync reads OK on a dedicated thread; the pre-loop "no reply pickup"
+  blocker from #2 doesn't apply).
+**Risk:** moderate — hot lib-load path + new concurrency + reserve-then-fill
+state.  Implement with the loom model extended (ready-state); needs a no-regression
+boot on a **clean host** (the behavioral change's win + safety both want it).
 
 ### 5. [MED · SENSITIVE · UNVERIFIED] init.rs H14 orchestration latency
 Candidate (agent-reported, line numbers NOT yet verified): a fixed
