@@ -3245,6 +3245,13 @@ static FS_MMAP_SYNC_FALLBACK: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 static FS_ASYNC_SCRATCH_EXHAUST: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+//   FS_MMAP_RO_SHARED — # of read-only CODE library mmaps served by SHARING the
+//                       cached pages (personality_remap_shared) instead of a
+//                       per-process copy (H14 perf #1).  The win is N processes ×
+//                       M libs of avoided byte-copies + duplicate pages; this
+//                       counts how often the share fast path actually fired.
+static FS_MMAP_RO_SHARED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Per-FS-task grant tracking for the shared async scratch region.
 /// Each successful grant_pages records the target aspace_id here so we
@@ -8705,6 +8712,62 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                         let avail = if file_offset >= slot.file_size { 0 }
                                     else { (slot.file_size - file_offset) as usize };
                         let to_read_cached = len.min(avail);
+
+                        // H14 perf #1: SHARE read-only CODE pages instead of
+                        // copying them per-process.  When the mapping is
+                        // read+exec (kern_prot==2) — a library .text segment,
+                        // which ld.so never writes or mprotects writable — map
+                        // the cached backing pages SHARED into the process
+                        // (personality_remap_shared, over the region
+                        // personality_mmap_fixed/_anon just reserved) rather than
+                        // personality_copy_out.  The pages stay owned by
+                        // linux_srv's persistent LIB_CACHE and are RO in the
+                        // consumer, so no COW/refcount is needed and aspace
+                        // teardown won't free them (same property as memfd/DRM
+                        // map_shared).  Gated to:
+                        //   * kern_prot == 2 (ReadExec) — code, never mutated;
+                        //   * page-aligned file_offset — cache PTEs line up;
+                        //   * the ENTIRE page-rounded mapping within cached file
+                        //     content (off + pages*page_size <= file_size) — so
+                        //     every shared page is real file bytes and there is
+                        //     no zero-fill tail (Linux zero-fills past EOF; the
+                        //     copy path below handles those EOF-crossing maps).
+                        // RW / RELRO / RO-data / EOF-tail maps keep the copy.
+                        // lib_cache_lookup returned Some only when ALL chunks are
+                        // cached (Acquire-load pairing the reply thread's Release
+                        // store), so the shared bytes are fully published — the
+                        // cross-CPU publication loom-validated in
+                        // tests/loom-libcache-share.
+                        let share_ro = kern_prot == 2
+                            && (file_offset % page_size as u64) == 0
+                            && file_offset.saturating_add(pages * page_size as u64)
+                                <= slot.file_size;
+                        if share_ro {
+                            let mmu_pages = pages * (page_size as u64 / 4096);
+                            let src_va = (slot.backing_va + file_offset as usize) as u64;
+                            if syscall::personality_remap_shared(
+                                caller_port, src_va, va as u64, mmu_pages, kern_prot as u64,
+                            ).is_some() {
+                                // Realign the VMA prot if we bumped it to RW for
+                                // the (now-skipped) copy; the installed PTEs are
+                                // already RE, and mprotect preserves the present
+                                // PTEs' PFNs (the copy path relies on the same).
+                                if need_bump {
+                                    syscall::personality_mprotect(
+                                        caller_port, va, aligned_len, kern_prot as u8);
+                                }
+                                let n = FS_MMAP_RO_SHARED
+                                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if n == 0 {
+                                    syscall::debug_puts(
+                                        b"[lsrv] FS_MMAP_RO_SHARED: first RO code page shared (H14 #1)\n");
+                                }
+                                return va as u64;
+                            }
+                            // remap declined (OOM during COW-break / PTE install):
+                            // fall through to the per-process copy below.
+                        }
+
                         if to_read_cached > 0 {
                             let src = unsafe {
                                 core::slice::from_raw_parts(

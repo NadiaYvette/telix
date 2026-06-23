@@ -1399,3 +1399,102 @@ pub fn personality_map_shared(
 
     target_va as u64
 }
+
+/// Like `personality_map_shared`, but installs the shared PTEs over a region the
+/// target has ALREADY mapped (e.g. via `personality_mmap_fixed`/`_anon`) instead
+/// of allocating a fresh anon VMA.  Used by the H14 read-only library-page
+/// sharing path: linux_srv first reserves/splits the VMA (ld.so's
+/// reserve-then-replace needs `mmap_fixed`'s VMA split), then maps the cached
+/// library's physical pages SHARED into that region instead of copying the bytes
+/// out per-process.  Because the region was created moments earlier in the SAME
+/// mmap syscall and the target process has not resumed (so it never touched the
+/// region), its PTEs are still unfaulted and there are no stale TLB entries to
+/// shoot down — the same property memfd/DRM `map_shared` relies on.
+///
+/// SAFETY / sharing constraints (enforced by the caller, linux_srv): only used
+/// for read-only CODE mappings (`prot == 2`, ReadExec), which are never written
+/// or mprotected-writable, so the shared cache pages can never be mutated by the
+/// process — no COW is needed.  The shared pages are owned by linux_srv's
+/// persistent LIB_CACHE; like memfd/DRM, aspace teardown frees the target's anon
+/// object (which owns nothing here) and the page tables, but NOT these pages.
+///
+/// Args: `target_port`, `caller_va` (source pages in linux_srv), `target_va`
+/// (the existing region in the target — REQUIRED, must be non-zero),
+/// `page_count` (in MMUPAGE_SIZE units), `prot` (0=RO,1=RW,2=RX,3=RWX).
+/// Returns `target_va` on success, or `u64::MAX` on error.
+pub fn personality_remap_shared(
+    target_port: u64,
+    caller_va: u64,
+    target_va: u64,
+    page_count: u64,
+    prot: u64,
+) -> u64 {
+    use crate::mm::page::{self, MMUPAGE_SIZE};
+    use crate::mm::vma::VmaProt;
+
+    let caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let (target_task_id, aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+
+    let mmu_pages = page_count as usize;
+    if mmu_pages == 0 || mmu_pages > 256 * page::page_mmucount() {
+        return u64::MAX;
+    }
+    // The target region must already exist; no auto-allocation here.
+    if target_va == 0 {
+        return u64::MAX;
+    }
+
+    let prot_enum = match prot {
+        0 => VmaProt::ReadOnly,
+        1 => VmaProt::ReadWrite,
+        2 => VmaProt::ReadExec,
+        3 => VmaProt::ReadWriteExec,
+        _ => return u64::MAX,
+    };
+
+    // Walk the caller's page table to find physical addresses and install them
+    // in the target's already-mapped region (no map_anon — the VMA exists).
+    let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+    let target_pt = crate::sched::scheduler::task_ref(target_task_id).page_table_root;
+
+    let fork_group = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.fork_group);
+
+    let sw_z = crate::mm::fault::sw_zeroed_bit();
+    let pte_flags = if prot_enum == VmaProt::None {
+        0
+    } else {
+        crate::mm::hat::pte_flags_for_prot(prot_enum) | sw_z
+    };
+
+    for mmu_idx in 0..mmu_pages {
+        let src_va = caller_va as usize + mmu_idx * MMUPAGE_SIZE;
+        let dst_va = target_va as usize + mmu_idx * MMUPAGE_SIZE;
+
+        // Look up the physical address in the caller's page table.
+        let pa = match crate::mm::hat::translate_va(caller_pt, src_va) {
+            Some(pa) => pa,
+            None => return u64::MAX,
+        };
+
+        // Ensure the target's page table path is unshared (post-fork COW).
+        if !crate::mm::hat::ensure_path_unshared(target_pt, dst_va, fork_group) {
+            crate::println!("[remap_shared] COW-break OOM dst_va={:#x} -> ENOMEM", dst_va);
+            return u64::MAX;
+        }
+
+        // Install the caller's physical page into the target's existing region.
+        if !crate::mm::hat::map_single_mmupage(target_pt, dst_va, pa, pte_flags) {
+            crate::println!("[remap_shared] map PTE FAIL dst_va={:#x} -> ENOMEM", dst_va);
+            return u64::MAX;
+        }
+    }
+
+    target_va
+}

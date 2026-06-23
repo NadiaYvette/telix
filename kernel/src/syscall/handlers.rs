@@ -146,6 +146,13 @@ pub const SYS_PERSONALITY_PEEK_SIGNALS: u64 = 0xF015;
 /// root) rather than an initramfs lookup.  Args: target_port, image_va,
 /// image_len, argv_va, envp_va (image_va/len in the personality server aspace).
 pub const SYS_PERSONALITY_EXEC_IMAGE: u64 = 0xF016;
+/// H14 RO-share: like MAP_SHARED but installs the shared PTEs over a region the
+/// target has ALREADY mapped (via personality_mmap_fixed/anon) rather than
+/// allocating a fresh anon VMA.  Args: target_port, caller_va (source pages in
+/// linux_srv), target_va (the existing region, REQUIRED), page_count (in
+/// MMUPAGE_SIZE units), prot.  Lets linux_srv map a cached library's read-only
+/// CODE pages SHARED into each process instead of copying them out per-process.
+pub const SYS_PERSONALITY_REMAP_SHARED: u64 = 0xF017;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 pub const SYS_PORT_ALIVE: u64 = 110;
 pub const SYS_IRQ_ATTACH: u64 = 111;
@@ -330,6 +337,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         && nr != SYS_PERSONALITY_READ_FRAME
         && nr != SYS_PERSONALITY_WRITE_FRAME
         && nr != SYS_PERSONALITY_MAP_SHARED
+        && nr != SYS_PERSONALITY_REMAP_SHARED
         && nr != SYS_PERSONALITY_PEEK_SIGNALS {
         let tid = crate::sched::smp::current()
             .current_thread
@@ -669,6 +677,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_MAP_SHARED => {
             crate::syscall::personality::personality_map_shared(a0, a1, a2, a3, a4)
+        }
+        SYS_PERSONALITY_REMAP_SHARED => {
+            crate::syscall::personality::personality_remap_shared(a0, a1, a2, a3, a4)
         }
         SYS_PERSONALITY_PEEK_SIGNALS => {
             crate::syscall::personality::personality_peek_signals(a0)

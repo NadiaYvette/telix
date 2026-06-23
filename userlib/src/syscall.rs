@@ -99,6 +99,7 @@ const SYS_PERSONALITY_READ_FRAME: u64 = 0xF012;
 const SYS_PERSONALITY_WRITE_FRAME: u64 = 0xF013;
 const SYS_PERSONALITY_MAP_SHARED: u64 = 0xF014;
 const SYS_PERSONALITY_PEEK_SIGNALS: u64 = 0xF015;
+const SYS_PERSONALITY_REMAP_SHARED: u64 = 0xF017;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -350,6 +351,33 @@ pub fn personality_map_shared(
             target_port,
             caller_va,
             target_va_hint,
+            page_count,
+            prot,
+        )
+    };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Like `personality_map_shared`, but installs the shared PTEs over a region the
+/// target has ALREADY mapped (via `personality_mmap_fixed`/`_anon`) rather than
+/// allocating a fresh anon VMA.  `target_va` is REQUIRED (no auto-allocation).
+/// Used by the H14 read-only library-page sharing path to map a cached library's
+/// physical CODE pages SHARED into a process instead of copying them out.
+/// `caller_va` is the source range in linux_srv; `page_count` is in MMUPAGE_SIZE
+/// (4K) units; `prot`: 0=RO, 1=RW, 2=RX, 3=RWX.  Returns `target_va`, or None.
+pub fn personality_remap_shared(
+    target_port: u64,
+    caller_va: u64,
+    target_va: u64,
+    page_count: u64,
+    prot: u64,
+) -> Option<usize> {
+    let r = unsafe {
+        arch::syscall5(
+            SYS_PERSONALITY_REMAP_SHARED,
+            target_port,
+            caller_va,
+            target_va,
             page_count,
             prot,
         )
