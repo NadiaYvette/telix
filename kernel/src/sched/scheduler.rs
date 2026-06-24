@@ -9231,6 +9231,48 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
     let default_ipi_stale = ipi_staleness(default_cpu);
     let default_threshold = ipi_stale_threshold(default_cpu);
 
+    // Tier 0 (host-pause, (b)): the default target may be host-PAUSED — its vCPU
+    // descheduled by the host so it isn't running try_switch or taking IRQs.  Both
+    // Tier 1 (steal) and Tier 2 (IPI) can miss this: a paused vCPU accrues little
+    // steal (the host isn't scheduling it at all) and its IPI staleness only
+    // reflects the delivery side.  A wake / rescue-re-enqueue routed onto a paused
+    // CPU just sits there → re-orphan (the 145e systemic stall).  If the default's
+    // try_switch AND irq stamps are both stale past the pause window, route to the
+    // peer with the freshest stamps that isn't itself IPI-starved.  Read-only +
+    // monotonic: with no live peer it returns `default_cpu`, never worse.
+    const HOST_PAUSE_REROUTE_NS: u64 = 1_500_000_000; // match Layer 5's detect window
+    let cpu_pause_age = |cpu: u32| -> u64 {
+        let pc = smp::get(cpu);
+        let lts = pc.last_try_switch_ns.load(Ordering::Relaxed);
+        let lirq = pc.last_irq_ns.load(Ordering::Relaxed);
+        if lts == 0 || lirq == 0 {
+            return 0; // never-ran boot transient — not "paused"
+        }
+        // "Paused" only if BOTH stamps are stale: min(ts_age, irq_age) >= window.
+        now_ns.saturating_sub(lts).min(now_ns.saturating_sub(lirq))
+    };
+    if cpu_pause_age(default_cpu) >= HOST_PAUSE_REROUTE_NS {
+        let mut best = default_cpu;
+        let mut best_age = cpu_pause_age(default_cpu);
+        for c in 0..ncpus {
+            if c == default_cpu {
+                continue;
+            }
+            if ipi_staleness(c) >= ipi_stale_threshold(c) {
+                continue; // also IPI-starved — no better
+            }
+            let age = cpu_pause_age(c);
+            if age < best_age {
+                best_age = age;
+                best = c;
+            }
+        }
+        if best != default_cpu {
+            HOST_PAUSE_REROUTES.fetch_add(1, Ordering::Relaxed);
+            return best;
+        }
+    }
+
     // Tier 1: heavy host steal on default → look for less-stolen peer
     // that is ALSO not IPI-starved.  Boot 534 surfaced the trap: an
     // IPI-starved vCPU (cpu=3 in that boot, 627 IPIs/hour vs peers'
@@ -9283,6 +9325,15 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
 /// the default was being heavily host-stolen.  Surfaced in the
 /// WATCHDOG IPC-stall dump alongside fast_takeover.
 static STEAL_AWARE_REROUTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// #135/(b) Tier 0: wake/rescue-re-enqueue reroutes away from a host-PAUSED
+/// default CPU (stale last_try_switch_ns + last_irq_ns) to the freshest live
+/// peer.  Steal-time misses host-pause (the host just isn't scheduling the vCPU,
+/// so accumulated steal can be ~0 — project_contention_guest_side_confirmed) and
+/// IPI-staleness only catches the delivery side; without this, a rescued orphan
+/// re-enqueued onto a paused CPU just re-orphans (the 145e systemic stall).
+static HOST_PAUSE_REROUTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// Counts wake-target reroutes triggered by IPI-delivery staleness on
