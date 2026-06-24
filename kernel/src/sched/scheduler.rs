@@ -3988,6 +3988,11 @@ static RESCUE_PHANTOM: AtomicU64 = AtomicU64::new(0);
 /// taken, but the counter catches how often we observe it.
 static RESCUE_MAX: AtomicU64 = AtomicU64::new(0);
 static RESCUE_STALE_ON_CPU: AtomicU64 = AtomicU64::new(0);
+/// #173 option-1: the MAX-orphan rescue lost the CAS(MAX->PENDING) race to a
+/// concurrent claim/wake and correctly YIELDED (did not clobber).  Nonzero = the
+/// CAS-coordination is actively preventing a double-dispatch resurrection
+/// (loom: tests/loom-orphan-rescue).
+static RESCUE_CAS_LOST: AtomicU64 = AtomicU64::new(0);
 static RESCUE_PENDING: AtomicU64 = AtomicU64::new(0);
 /// #120 sub-pattern A: counts every time the new STUCK_PENDING_AGE check
 /// fires its rescue (logs RESCUE-STUCK-PENDING).  Dumped on CALL-TIMEOUT
@@ -13705,25 +13710,41 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // side, but doing it here closes a window where a concurrent
                 // try_switch reads on_cpu as a stale CPU number before
                 // dequeue.
-                // #208/DD step-1: route the re-stamp through the checked helper so
-                // a rescue of a still-`current_thread` orphan is COUNTED (producer).
-                set_on_cpu_pending(tid as u32, 8, t.state);
-                trace_sched(tid as u32, 8); // 8=rescue_enq
-                set_enq_tag(7); // 7=rescue
-                // Per-branch rescue counter: the two predicates that lead
-                // here are mutually exclusive.  `stale_on_cpu` is the Bug A
-                // pattern from commit 712e741; otherwise the orphan was
-                // detected via `on == u32::MAX`.
-                if stale_on_cpu {
+                // #173 option-1: CAS-coordinate the MAX-orphan re-stamp.  The old
+                // path used set_on_cpu_pending = a blind store(PENDING) that can
+                // CLOBBER a concurrent claim (CAS MAX->cpu), resurrecting a
+                // just-dispatched thread to PENDING => double-dispatch (loom:
+                // tests/loom-orphan-rescue).  For the MAX orphan, CAS(MAX->PENDING):
+                // enqueue only if we win; if a claim/wake moved on_cpu off MAX since
+                // we observed it (incl. the thread now running on a real cpu, which
+                // is exactly what RUN_CLAIM_VIOLATION used to count), that path owns
+                // the thread — yield (RESCUE_CAS_LOST).  The stale-cpu (Bug A) case
+                // keeps the existing owner-checked stamp.
+                let restamp_ok = if stale_on_cpu {
+                    set_on_cpu_pending(tid as u32, 8, t.state);
                     RESCUE_STALE_ON_CPU.fetch_add(1, Ordering::Relaxed);
-                } else {
+                    true
+                } else if t
+                    .on_cpu
+                    .compare_exchange(u32::MAX, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    record_trans(tid as u32, 8, t.state, ON_CPU_PENDING);
                     RESCUE_MAX.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    RESCUE_CAS_LOST.fetch_add(1, Ordering::Relaxed);
+                    false
+                };
+                if restamp_ok {
+                    trace_sched(tid as u32, 8); // 8=rescue_enq
+                    set_enq_tag(7); // 7=rescue
+                    rescue_per_tid_inc(tid as u32);
+                    // Layer 3/4 paravirt: avoid re-pending on the same
+                    // starved/stolen CPU that orphaned the thread.
+                    let target = choose_wake_target_steal_aware(target);
+                    percpu_enqueue(target, prio, tid as ThreadId);
                 }
-                rescue_per_tid_inc(tid as u32);
-                // Layer 3/4 paravirt: avoid re-pending on the same
-                // starved/stolen CPU that orphaned the thread.
-                let target = choose_wake_target_steal_aware(target);
-                percpu_enqueue(target, prio, tid as ThreadId);
             }
         }
     }
