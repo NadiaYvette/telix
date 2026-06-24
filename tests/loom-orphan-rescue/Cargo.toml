@@ -1,0 +1,33 @@
+[package]
+name = "loom-orphan-rescue"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# H14 #173 targeted mitigation (option 1): the 145e re-orphan cycle leaves a Ready
+# thread at on_cpu=MAX; the rescue makes it dispatchable + enqueues it. Today the
+# rescue stamps via set_on_cpu_pending = an UNCONDITIONAL store(PENDING). This model
+# asks whether that blind store is safe against a concurrent claim of the same
+# orphan (the proposed picker reclaim-MAX, or any path that CAS(MAX->cpu)s it):
+#
+#   INVARIANT: a thread claimed for dispatch (on_cpu = a real cpu) is never
+#   resurrected to PENDING by a concurrent orphan-rescue (else it is dispatched
+#   twice — the #208 double-dispatch family).
+#
+# Proves: (1) load==MAX then store(PENDING) is TOCTOU — the store lands after a
+# concurrent CAS(MAX->cpu) and clobbers the claim (double-dispatch); (2) a
+# CAS(MAX->PENDING) rescue is mutually exclusive with the dispatch CAS(MAX->cpu),
+# so a claimed thread is never resurrected. => the mitigation must CAS-coordinate
+# every MAX<->PENDING<->cpu transition, never blind-store, in the recovery window.
+
+[lib]
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

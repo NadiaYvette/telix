@@ -20,4 +20,5 @@ exclude = [
     "tests/loom-ring-teardown",
     "tests/loom-libcache-share",
     "tests/loom-libcache-alloc",
+    "tests/loom-orphan-rescue",
 ]
