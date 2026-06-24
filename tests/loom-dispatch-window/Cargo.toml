@@ -1,0 +1,44 @@
+[package]
+name = "loom-dispatch-window"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# #173 dispatch-protocol WINDOW-COLLAPSE refactor — the claim→switch window.
+#
+# Background (docs/dispatch-protocol-173-refactor.md, project_phase5_gate_isolation):
+# the legacy pop→stamp(PENDING)→CAS window is already collapsed by the
+# percpu_pick_next_*_and_claim helpers (pop + CAS(PENDING->cpu) under the rq lock).
+# The REMAINING window is claim→switch: a picker CAS-claims tid (on_cpu=cpuP,
+# dispatching_tid[cpuP]=tid, state=Running) under the rq lock, then performs the
+# asm context-switch LATER in try_switch.  If cpuP is host-paused in between, tid
+# is "Running, on_cpu=cpuP" but cpuP is not executing it.  reclaim_stale_on_cpu
+# refuses to reclaim it (dispatching_tid[cpuP]==tid ⇒ "leave it") — a false
+# assumption under host-pause — so it is stranded.  Fix = recoverability:
+#   (a) a host-pause-exempt reclaimer MAY take the claim, AND
+#   (b) the resuming cpuP re-validates ownership before the asm switch and bails
+#       if a peer took it.
+#
+#   SAFETY INVARIANT: run_count(tid) <= 1 — tid is executed on at most one CPU
+#   across every interleaving (no double-execution = the #208 family); and tid is
+#   never lost (some CPU runs it).
+#
+# Proves four things:
+#  (i)   no resume-side re-check (legacy)        => double-execution.
+#  (ii)  reclaimer via blind store (not CAS)     => double-execution (#208 clobber).
+#  (iii) resume re-check via a plain LOAD        => double-execution (TOCTOU).
+#        ^ REFINES the design doc: "re-check on_cpu==cpu" must be a CAS, not a load.
+#  (iv)  resume re-check via CAS-commit + CAS reclaim => exclusive (run_count<=1)
+#        and never lost.  This is the design the refactor must implement.
+
+[lib]
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

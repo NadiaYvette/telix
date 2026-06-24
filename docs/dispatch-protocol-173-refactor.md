@@ -1,9 +1,11 @@
 # #173 dispatch-protocol window-collapse refactor — design
 
-Status: **design / not yet implemented.** Opens the durable, portable fix for the
-145e systemic dispatch stall (the binding constraint to the H14 workload on hosts
-we can't isolate). Captures the 2026-06-23 analysis so the implementation is a
-focused, loom-backed next session. Related: [[project_phase5_gate_isolation]],
+Status: **loom-proven design; implementation pending.** Step 1 (loom) DONE
+2026-06-24 — `tests/loom-dispatch-window` 4/4, and it REFINED the design: the
+resume-side re-check must be a **CAS-commit, not a load** (a load is TOCTOU; see
+Proposed design §2 + Loom plan). Opens the durable, portable fix for the 145e
+systemic dispatch stall (the binding constraint to the H14 workload on hosts we
+can't isolate). Related: [[project_phase5_gate_isolation]],
 [[project_dispatch_protocol_refactor]], #173, the #135/#208 family.
 
 ## Problem
@@ -55,10 +57,15 @@ atomic. So the fix is **recoverability + double-execution safety**:
    concurrent re-stamp.
 2. **Resume-side re-validation closes double-execution.** `try_switch`, after the
    claim and **immediately before the asm switch** (i.e. after any host-pause that
-   stranded it), MUST re-check `on_cpu == cpu`. If a peer reclaimed it
-   (`on_cpu != cpu`), the resuming CPU **bails — does NOT switch** to tid (it goes
-   idle / re-picks). This is the load-bearing safety property: a reclaimed thread is
-   never run on two CPUs.
+   stranded it), MUST **CAS-commit** its ownership — atomically transition the
+   claim to a "running" state (`CAS(claimed_by_cpu → running)`). If the CAS fails
+   (a peer reclaimed it), the resuming CPU **bails — does NOT switch** to tid (it
+   goes idle / re-picks). ⚠ **A plain re-check `on_cpu == cpu` (a load) is NOT
+   enough** — loom (`load_recheck_double_runs`) proves a reclaimer can win the CAS
+   between cpuP's load and its asm switch (TOCTOU), double-running tid. The
+   resume-side commit and the reclaim must both compare-exchange from the same
+   claimed value, so exactly one wins. This is the load-bearing safety property: a
+   reclaimed thread is never run on two CPUs.
 3. Keep `dispatching_tid` for the common (non-paused) case (it correctly prevents the
    benign direct-dispatch race); only the host-paused exemption is new.
 
@@ -69,26 +76,39 @@ atomic. So the fix is **recoverability + double-execution safety**:
 > succeeds — and in case (b) the original CPU's resume-side re-check observes
 > `on_cpu != cpu` and bails. No interleaving runs it twice.
 
-## Loom plan (before any code)
-Model the claim→reclaim→resume race:
-- Thread P (picker): `CAS(PENDING→cpuP)` ok → [host-pause gap] → re-check
-  `on_cpu==cpuP`? if yes asm-switch(run); if no bail.
-- Thread R (reclaimer): observes cpuP host-paused + `dispatching_tid[cpuP]==tid` →
-  `CAS(cpuP→cpuR)` → if ok, run on cpuR.
-- INVARIANT: `run_count(tid) <= 1` across all interleavings (no double-execution),
-  AND tid is never lost (some path runs it). Two should_panic negatives: (i) no
-  resume-side re-check ⇒ double-run; (ii) reclaim via blind store ⇒ double-run.
-New crate `tests/loom-dispatch-window` (sibling of loom-orphan-rescue).
+## Loom plan — DONE 2026-06-24 (`tests/loom-dispatch-window`, 4/4)
+Modeled the claim→reclaim→resume race; invariant `run_count(tid) <= 1` (no
+double-execution) AND liveness (tid never lost). Results:
+- `no_recheck_double_runs` (should_panic) — (i) no resume-side re-check ⇒ double-run.
+- `reclaim_blind_store_double_runs` (should_panic) — (ii) the reclaimer must CAS,
+  not blind-store (the #208 clobber, cf. loom-orphan-rescue).
+- `load_recheck_double_runs` (should_panic) — **(iii) NEW: a load-only resume
+  re-check is TOCTOU ⇒ double-run.** This REFINED the design: step 2 is a
+  CAS-commit, not a load (see Proposed design §2).
+- `cas_commit_is_exclusive` (pass) — CAS-commit resume + CAS reclaim both
+  compare-exchange from the claimed value ⇒ exactly one wins; run_count ≤ 1, never
+  lost. **This is the protocol to implement.**
+Encoding-agnostic: the model puts the arbitration in `on_cpu`, but the kernel can
+realize it as a dedicated per-thread `dispatch_claim: AtomicU32` owner word so
+on_cpu's existing `==cpu` ⇒ "running here" contract is untouched. What's proven is
+the CAS-vs-CAS exclusivity, not the word it lives in.
 
-## Phased implementation (fresh session, behind a flag)
-0. **Probe (confirm)**: dump the full trace-ring history for a stuck tid at 145e
-   (not just `trace_last`) to confirm the claim→switch stranding sequence end-to-end
-   before changing the protocol. (Trace facilities: `record_trans`/`trace_sched`,
-   the WAKE_TRACE_RING; may need a per-tid full-history dump.)
-1. Loom the redesign (above) → 2/2.
-2. Add the resume-side `on_cpu==cpu` re-check + bail in `try_switch` (the safety
-   property) — gated behind a `DISPATCH_WINDOW_RECHECK` flag, default off.
-3. Add the host-pause exemption to `reclaim_stale_on_cpu` + the rescue.
+## Phased implementation (behind a flag)
+0. **Probe (confirm)** — DEFERRED (needs a quiescent-ish boot to 145e; the loom
+   model + the existing "evt=3 is the stuck tid's last trace" diagnosis already
+   give high confidence). When a boot is feasible: dump the full trace-ring history
+   for a stuck tid at 145e (not just `trace_last`) to confirm the claim→switch
+   stranding end-to-end. (Trace facilities: `record_trans`/`trace_sched`, the
+   WAKE_TRACE_RING; may need a per-tid full-history dump.)
+1. **DONE** 2026-06-24 — loomed the redesign, 4/4; the load-only re-check failed,
+   so §2 is now a CAS-commit.
+2. Add the resume-side **CAS-commit** (NOT a load — see §2 / loom) + bail in
+   `try_switch`, gated behind a `DISPATCH_WINDOW_RECHECK` flag, default off. Decide
+   the realization: a dedicated per-thread `dispatch_claim` owner word (preferred —
+   leaves on_cpu's `==cpu`⇒"running" contract intact) vs a CLAIMED(cpu) sentinel
+   band inside on_cpu.
+3. Add the host-pause exemption to `reclaim_stale_on_cpu` + the rescue (CAS-steal
+   the claim when the owner cpu is host-paused, despite `dispatching_tid==tid`).
 4. Apply consistently across ALL dispatch tails (the dispatching_tid sites above).
 5. Flip the flag on; validate at 145e under isolation (does the systemic stall
    clear? watch the orphan-tid count + RESCUE/HOST_PAUSE counters) + a no-burner
@@ -96,6 +116,8 @@ New crate `tests/loom-dispatch-window` (sibling of loom-orphan-rescue).
 
 ## Risk
 HIGHEST in the codebase — this is the #208 double-dispatch family's home. The
-resume-side re-check (step 2) is the safety net; it MUST land + be loom-proven before
-the reclaim exemption (step 3) is enabled, or a reclaim could double-execute a thread.
-Phase behind the flag; never enable 3 without 2.
+resume-side CAS-commit (step 2) is the safety net — now loom-proven
+(`cas_commit_is_exclusive`), and loom also proved a load-only re-check is NOT
+enough (`load_recheck_double_runs`). Step 2 MUST land before the reclaim exemption
+(step 3) is enabled, or a reclaim could double-execute a thread. Phase behind the
+flag; never enable 3 without 2.
