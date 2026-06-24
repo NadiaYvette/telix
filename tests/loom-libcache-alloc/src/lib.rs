@@ -21,7 +21,7 @@
 
 #![cfg(loom)]
 
-use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
@@ -31,6 +31,9 @@ const N: usize = 2;
 
 /// The shared initramfs handle both callers race to cache.
 const H: u64 = 0x11b;
+
+/// One filled "word" of a chunk's backing bytes (0 = pre-fill).
+const FILLED: u32 = 0xA5A5_A5A5;
 
 struct Slot {
     in_use: AtomicBool,
@@ -125,6 +128,49 @@ fn run(locked: bool) {
     assert!(n == 1, "handle allocated {} slots (double-alloc) — expected exactly 1", n);
 }
 
+/// Part B's other race: once the slot is unique (the lock above), the backgrounded
+/// preload thread AND the main-thread on-demand fill may fill the SAME chunk at
+/// once.  Both fetch the same immutable initramfs bytes (identical), write them to
+/// the backing region, then set the chunk's `chunks_cached` bit Release; a consumer
+/// Acquire-checks the bit before reading.
+///
+///   INVARIANT: a consumer that observes the bit set reads FILLED content, for
+///   every interleaving of the two writers.
+///
+/// This is the publication that makes the **benign idempotent double-write** safe:
+/// identical data ⇒ no torn *value*, and the Release/Acquire publishes a complete
+/// write. (The byte-level "no torn read on identical aligned stores" is an x86
+/// property argued separately; the per-chunk fetch is merely doubled, not wrong —
+/// a future per-chunk claim removes that waste.)
+fn run_concurrent_fill() {
+    let content = Arc::new(AtomicU32::new(0));
+    let cached = Arc::new(AtomicBool::new(false));
+    let (cf1, bf1) = (content.clone(), cached.clone());
+    let (cf2, bf2) = (content.clone(), cached.clone());
+    let (cr, br) = (content.clone(), cached.clone());
+
+    let f1 = thread::spawn(move || {
+        cf1.store(FILLED, Ordering::Relaxed);
+        bf1.store(true, Ordering::Release);
+    });
+    let f2 = thread::spawn(move || {
+        cf2.store(FILLED, Ordering::Relaxed);
+        bf2.store(true, Ordering::Release);
+    });
+    let r = thread::spawn(move || {
+        if br.load(Ordering::Acquire) {
+            assert_eq!(
+                cr.load(Ordering::Relaxed),
+                FILLED,
+                "consumer observed chunks_cached set but read a torn/pre-fill chunk",
+            );
+        }
+    });
+    f1.join().unwrap();
+    f2.join().unwrap();
+    r.join().unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +187,12 @@ mod tests {
     #[test]
     fn locked_alloc_is_unique() {
         loom::model(|| run(true));
+    }
+
+    /// Part B: two concurrent fillers of one chunk (preload thread ‖ main on-demand)
+    /// publish a complete chunk to a consumer under every interleaving.
+    #[test]
+    fn concurrent_identical_fill_publishes() {
+        loom::model(run_concurrent_fill);
     }
 }

@@ -128,8 +128,10 @@ loom-validated in `tests/loom-libcache-share`), and concurrent same-chunk fills
 write identical file bytes (idempotent) — but the slot-alloc + per-chunk
 double-fetch need guarding.
 **Plan (loom-first, like #1):**
-- (a) ✅ **loom model DONE** — `tests/loom-libcache-alloc` (2/2): lock-free
-  scan+claim double-allocates (`should_panic`), Mutex-guarded scan+claim unique.
+- (a) ✅ **loom DONE — both races** — `tests/loom-libcache-alloc` (3/3): lock-free
+  scan+claim double-allocates (`should_panic`); Mutex-guarded scan+claim unique;
+  AND concurrent same-chunk fill (preload ‖ main on-demand) publishes a complete
+  chunk under every interleaving (benign idempotent double-write + Release/Acquire).
 - (b) ✅ **DONE** — `LIB_CACHE_LOCK` (TicketSpinLock, Phase-B idiom) guards both
   `lib_cache_lookup` (the scan) and `lib_cache_lookup_or_alloc` (whole-function:
   scan + claim + slot write) — `linux_srv.rs:782/4463/4512`.  Implemented as the
