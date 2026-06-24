@@ -5715,6 +5715,36 @@ fn percpu_pick_next_and_claim(
 pub static DISPATCH_USE_CLAIM_HELPER: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// #173 window-collapse refactor — step 2 (docs/dispatch-protocol-173-refactor.md).
+///
+/// A/B gate for the resume-side CAS-commit that closes the dispatch claim→switch
+/// window.  The claim (on_cpu PENDING→cpu) and the asm context-switch are NOT
+/// atomic: a host-pause in between strands the claimed thread.  Step 3 will let a
+/// host-pause-exempt reclaimer CAS-steal such a claim; this gate adds the
+/// load-bearing safety net so that the resuming CPU, just before the asm switch,
+/// CAS-commits its claim (`dispatch_claim: cpu → MAX`) and BAILS if a reclaimer
+/// took it — preventing double-execution (the #208 family).  loom
+/// (tests/loom-dispatch-window) proves a plain load re-check is insufficient
+/// (TOCTOU) and this CAS-commit is exclusive.
+///
+/// Default OFF.  When OFF: `dispatch_claim` is never touched and try_switch is
+/// byte-for-byte the legacy path.  When ON but BEFORE step 3 lands (no reclaimer
+/// ever steals): the commit CAS always succeeds, so it is still a runtime no-op.
+/// `never enable [step 3] without [step 2]` — see the design doc Risk section.
+/// Set at boot via the `dispatch_window_recheck=` cmdline knob (0=default OFF,
+/// 1=ON, 2=OFF) so the harness can A/B at Phase 145e without a rebuild.
+pub static DISPATCH_WINDOW_RECHECK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// #173 step 2: count of resume-side CAS-commit failures (a reclaimer stole the
+/// claim while this CPU was host-paused mid-dispatch → we bailed to idle instead
+/// of double-executing).  Always 0 until step 3 adds a reclaimer.
+pub static DISPATCH_WINDOW_STOLEN: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// `dispatch_claim` "no owner" sentinel (mirrors on_cpu's u32::MAX = none).
+const DISPATCH_CLAIM_NONE: u32 = u32::MAX;
+
 /// #173 Phase 3c: cosched-aware variant of `percpu_pick_next_and_claim`.
 ///
 /// Mirrors `percpu_pick_next_cosched`'s prev-group preference and adds
@@ -5942,6 +5972,16 @@ pub fn init() {
     match knob {
         1 => DISPATCH_USE_CLAIM_HELPER.store(true, Ordering::Relaxed),
         2 => DISPATCH_USE_CLAIM_HELPER.store(false, Ordering::Relaxed),
+        _ => {}
+    }
+
+    // #173 window-collapse step 2: honor `dispatch_window_recheck=` (0|1|2).
+    let wr_knob = crate::boot::cmdline::BOOT_CONFIG
+        .dispatch_window_recheck
+        .load(Ordering::Relaxed);
+    match wr_knob {
+        1 => DISPATCH_WINDOW_RECHECK.store(true, Ordering::Relaxed),
+        2 => DISPATCH_WINDOW_RECHECK.store(false, Ordering::Relaxed),
         _ => {}
     }
 
@@ -8313,6 +8353,14 @@ fn try_switch(current_sp: u64) -> u64 {
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     trace_sched(next_id, 7); // 7=state_running
     set_current_thread(pcpu, next_id);
+    // #173 step 2 (DISPATCH_WINDOW_RECHECK): arm the claim→switch arbiter while we
+    // still hold the claim.  The resume-side CAS-commit just before the asm switch
+    // (end of try_switch) releases it `cpu → MAX`; if a host-pause-exempt reclaimer
+    // (step 3) CAS-stole it meanwhile, that commit fails and we bail to idle rather
+    // than double-execute.  Inert unless the flag is set; idle is never stolen.
+    if next_id != idle_id && DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+        next_t.dispatch_claim.store(cpu, Ordering::Release);
+    }
     // Clear dispatching_tid: dispatch is fully visible — on_cpu=cpu,
     // state=Running, current_thread=tid all observable to other CPUs.
     if next_id != idle_id {
@@ -8416,6 +8464,13 @@ fn try_switch(current_sp: u64) -> u64 {
                     let idle_sp = thread_ref(idle_id).saved_sp;
                     unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                     set_current_thread(pcpu, idle_id);
+                    // #173 step 2: re-enqueued next_id instead of switching — release
+                    // its claim arbiter so a later dispatch re-arms cleanly.
+                    if DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+                        thread_ref(next_id)
+                            .dispatch_claim
+                            .store(DISPATCH_CLAIM_NONE, Ordering::Release);
+                    }
                     transition_release_to_pending(prev_id);
                     return idle_sp;
                 }
@@ -8455,6 +8510,12 @@ fn try_switch(current_sp: u64) -> u64 {
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             set_current_thread(pcpu, idle_id);
+            // #173 step 2: killed next_id instead of switching — release its claim.
+            if DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+                thread_ref(next_id)
+                    .dispatch_claim
+                    .store(DISPATCH_CLAIM_NONE, Ordering::Release);
+            }
             // #208 Fix D: release prev → PENDING just before return.
             transition_release_to_pending(prev_id);
             return idle_sp;
@@ -8527,6 +8588,12 @@ fn try_switch(current_sp: u64) -> u64 {
                 }
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                 set_current_thread(pcpu, idle_id);
+                // #173 step 2: killed next_id instead of switching — release its claim.
+                if DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+                    thread_ref(next_id)
+                        .dispatch_claim
+                        .store(DISPATCH_CLAIM_NONE, Ordering::Release);
+                }
                 // #208 Fix D: release prev → PENDING just before return.
                 transition_release_to_pending(prev_id);
                 return idle_sp;
@@ -8545,10 +8612,39 @@ fn try_switch(current_sp: u64) -> u64 {
                 let idle_sp = thread_ref(idle_id).saved_sp;
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                 set_current_thread(pcpu, idle_id);
+                // #173 step 2: killed next_id instead of switching — release its claim.
+                if DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+                    thread_ref(next_id)
+                        .dispatch_claim
+                        .store(DISPATCH_CLAIM_NONE, Ordering::Release);
+                }
                 // #208 Fix D: release prev → PENDING just before return.
                 transition_release_to_pending(prev_id);
                 return idle_sp;
             }
+        }
+    }
+    // #173 step 2 (DISPATCH_WINDOW_RECHECK): resume-side CAS-commit — the
+    // load-bearing safety net.  If this CPU was host-paused between the dispatch
+    // claim and here, a (step 3) host-pause-exempt reclaimer may have CAS-stolen
+    // our claim.  Atomically commit `dispatch_claim: cpu → MAX`; on failure the
+    // claim was stolen, so DO NOT switch to next_id (it will run on the
+    // reclaimer's CPU) — bail to idle.  loom-dispatch-window proves a plain load
+    // here is TOCTOU (load_recheck_double_runs) and this CAS-commit is exclusive
+    // (cas_commit_is_exclusive).  Inert unless the flag is set; a runtime no-op
+    // until step 3 adds a reclaimer (the CAS then always succeeds).
+    if next_id != idle_id && DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+        if next_t
+            .dispatch_claim
+            .compare_exchange(cpu, DISPATCH_CLAIM_NONE, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            DISPATCH_WINDOW_STOLEN.fetch_add(1, Ordering::Relaxed);
+            let idle_sp = thread_ref(idle_id).saved_sp;
+            unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+            set_current_thread(pcpu, idle_id);
+            transition_release_to_pending(prev_id);
+            return idle_sp;
         }
     }
     // #208 Fix D: release prev → PENDING just before returning new_sp.

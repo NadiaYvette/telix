@@ -1,9 +1,11 @@
 # #173 dispatch-protocol window-collapse refactor — design
 
-Status: **loom-proven design; implementation pending.** Step 1 (loom) DONE
-2026-06-24 — `tests/loom-dispatch-window` 4/4, and it REFINED the design: the
-resume-side re-check must be a **CAS-commit, not a load** (a load is TOCTOU; see
-Proposed design §2 + Loom plan). Opens the durable, portable fix for the 145e
+Status: **steps 1–2 landed (flag-gated, dormant); steps 3–5 pending.** Step 1
+(loom) DONE 2026-06-24 — `tests/loom-dispatch-window` 4/4, and it REFINED the
+design: the resume-side re-check must be a **CAS-commit, not a load** (a load is
+TOCTOU; see Proposed design §2 + Loom plan). Step 2 (resume-side CAS-commit via a
+`dispatch_claim` word, behind `DISPATCH_WINDOW_RECHECK`, default OFF) DONE
+2026-06-24, build-clean, dormant until step 3. Opens the durable, portable fix for the 145e
 systemic dispatch stall (the binding constraint to the H14 workload on hosts we
 can't isolate). Related: [[project_phase5_gate_isolation]],
 [[project_dispatch_protocol_refactor]], #173, the #135/#208 family.
@@ -102,11 +104,23 @@ the CAS-vs-CAS exclusivity, not the word it lives in.
    WAKE_TRACE_RING; may need a per-tid full-history dump.)
 1. **DONE** 2026-06-24 — loomed the redesign, 4/4; the load-only re-check failed,
    so §2 is now a CAS-commit.
-2. Add the resume-side **CAS-commit** (NOT a load — see §2 / loom) + bail in
-   `try_switch`, gated behind a `DISPATCH_WINDOW_RECHECK` flag, default off. Decide
-   the realization: a dedicated per-thread `dispatch_claim` owner word (preferred —
-   leaves on_cpu's `==cpu`⇒"running" contract intact) vs a CLAIMED(cpu) sentinel
-   band inside on_cpu.
+2. **DONE** 2026-06-24 (flag-gated, dormant) — realized via a dedicated per-thread
+   `dispatch_claim: AtomicU32` owner word (on_cpu's `==cpu`⇒"running" contract left
+   untouched). Sites, all gated on `DISPATCH_WINDOW_RECHECK` (default OFF):
+   - `Thread::dispatch_claim` field + init = `u32::MAX` (thread.rs).
+   - `DISPATCH_WINDOW_RECHECK` flag + `DISPATCH_WINDOW_STOLEN` counter +
+     `DISPATCH_CLAIM_NONE` const + `dispatch_window_recheck=` cmdline knob (0|1|2,
+     honored in `scheduler::init`).
+   - **ARM** `dispatch_claim = cpu` right after `set_current_thread(next)` in
+     try_switch (while we still hold the claim).
+   - **COMMIT** `CAS(dispatch_claim: cpu → MAX)` immediately before the asm-switch
+     return; on failure → bail to idle (the load-bearing safety net).
+   - **RELEASE** `dispatch_claim = MAX` on the 4 post-claim bail-to-idle paths
+     (publish-redefer re-enqueue + the 3 corrupt-frame kill bails).
+   Flag OFF ⇒ try_switch is byte-for-byte the legacy path. Flag ON but pre-step-3 ⇒
+   no reclaimer ever steals, so the COMMIT CAS always succeeds = runtime no-op.
+   Build-clean x86_64. NOT yet boot-validated (nothing to validate until step 3
+   adds a reclaimer; then step 5 flips the knob).
 3. Add the host-pause exemption to `reclaim_stale_on_cpu` + the rescue (CAS-steal
    the claim when the owner cpu is host-paused, despite `dispatching_tid==tid`).
 4. Apply consistently across ALL dispatch tails (the dispatching_tid sites above).

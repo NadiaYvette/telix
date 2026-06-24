@@ -48,6 +48,13 @@ pub struct BootConfig {
     /// matched gate states without rebuilding the kernel.
     pub dispatch_claim_helper: AtomicU8,
 
+    /// #173 window-collapse step 2 A/B knob (`DISPATCH_WINDOW_RECHECK`).  0 = leave
+    /// the compile-time default (OFF); 1 = force ON; 2 = force OFF.  When ON, the
+    /// resume-side CAS-commit in try_switch is active (still a runtime no-op until
+    /// step 3 adds a host-pause-exempt reclaimer).  Lets the harness validate at
+    /// Phase 145e without rebuilding.
+    pub dispatch_window_recheck: AtomicU8,
+
     /// #228 alloc/free hammer kthread count.  0 = disabled (default);
     /// N = spawn N hammer kthreads that loop alloc_page → write
     /// sentinel → read-back → free.  See mm/hammer.rs.
@@ -89,6 +96,7 @@ pub static BOOT_CONFIG: BootConfig = BootConfig {
     loglevel: AtomicU8::new(5),
     nr_cpus: AtomicU32::new(0),
     dispatch_claim_helper: AtomicU8::new(0),
+    dispatch_window_recheck: AtomicU8::new(0),
     alloc_hammer: AtomicU8::new(0),
     alloc_hammer_persist: AtomicU8::new(0),
     wp_savedsp: AtomicU8::new(0),
@@ -184,6 +192,14 @@ fn handle_param(key: &[u8], val: &[u8]) {
             if let Some(n) = parse_u64(val) {
                 if n <= 2 {
                     BOOT_CONFIG.dispatch_claim_helper.store(n as u8, Ordering::Relaxed);
+                }
+            }
+        }
+        b"dispatch_window_recheck" => {
+            // #173 window-collapse step 2 A/B knob.  Accepts 0|1|2.
+            if let Some(n) = parse_u64(val) {
+                if n <= 2 {
+                    BOOT_CONFIG.dispatch_window_recheck.store(n as u8, Ordering::Relaxed);
                 }
             }
         }

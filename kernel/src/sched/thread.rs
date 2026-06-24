@@ -159,6 +159,17 @@ pub struct Thread {
     /// try_switch; store MAX when descheduling. If CAS fails, another CPU
     /// already has this thread — indicates double-scheduling bug.
     pub on_cpu: core::sync::atomic::AtomicU32,
+    /// #173 window-collapse (DISPATCH_WINDOW_RECHECK): single-word arbiter for the
+    /// dispatch claim→switch window.  Holds the owning cpu from the dispatch claim
+    /// until the asm switch commits, else `u32::MAX` (no owner).  The resuming CPU
+    /// CAS-commits `cpu → MAX` immediately before the asm switch; a (step 3)
+    /// host-pause-exempt reclaimer CAS-steals `cpu → reclaimer`.  Both
+    /// compare-exchange from the owning cpu, so exactly one wins ⇒ run_count(tid)
+    /// <= 1 (loom-proven in tests/loom-dispatch-window: a plain load re-check is
+    /// TOCTOU; only this CAS-commit is safe).  Dedicated word so on_cpu's existing
+    /// `==cpu` ⇒ "running here" contract is untouched.  Inert (never written/read)
+    /// unless DISPATCH_WINDOW_RECHECK is set; default OFF.
+    pub dispatch_claim: core::sync::atomic::AtomicU32,
     /// Debug: set true when thread is in a run queue, false when dequeued.
     /// Detects double-enqueue (thread added to queue while already queued).
     pub in_queue: core::sync::atomic::AtomicBool,
@@ -378,6 +389,7 @@ impl Thread {
             cosched_group: core::sync::atomic::AtomicU32::new(0),
             last_cpu: core::sync::atomic::AtomicU32::new(0),
             on_cpu: core::sync::atomic::AtomicU32::new(u32::MAX),
+            dispatch_claim: core::sync::atomic::AtomicU32::new(u32::MAX),
             in_queue: core::sync::atomic::AtomicBool::new(false),
             published: core::sync::atomic::AtomicBool::new(false),
             on_cpu_set_by: core::sync::atomic::AtomicU8::new(0),
