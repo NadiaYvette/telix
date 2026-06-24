@@ -1,14 +1,16 @@
 # #173 dispatch-protocol window-collapse refactor — design
 
-Status: **steps 1–2 landed (flag-gated, dormant); steps 3–5 pending.** Step 1
-(loom) DONE 2026-06-24 — `tests/loom-dispatch-window` 4/4, and it REFINED the
-design: the resume-side re-check must be a **CAS-commit, not a load** (a load is
-TOCTOU; see Proposed design §2 + Loom plan). Step 2 (resume-side CAS-commit via a
-`dispatch_claim` word, behind `DISPATCH_WINDOW_RECHECK`, default OFF) DONE
-2026-06-24, build-clean, dormant until step 3. Opens the durable, portable fix for the 145e
-systemic dispatch stall (the binding constraint to the H14 workload on hosts we
-can't isolate). Related: [[project_phase5_gate_isolation]],
-[[project_dispatch_protocol_refactor]], #173, the #135/#208 family.
+Status: **steps 1, 2, and 3b landed (flag-gated, dormant); step 3 residuals + 4 +
+5 pending.** Step 1 (loom) DONE 2026-06-24 — `tests/loom-dispatch-window` **5/5**,
+and it REFINED the design: the resume-side re-check must be a **CAS-commit, not a
+load** (a load is TOCTOU; see Proposed design §2 + Loom plan). Step 2 (resume-side
+CAS-commit via a `dispatch_claim` word, behind `DISPATCH_WINDOW_RECHECK`, default
+OFF) DONE 2026-06-24, build-clean. Step 3b (the production-path reclaimer in
+`rescue_host_paused_peers`) DONE 2026-06-24, build-clean, dormant until step 5
+flips the knob. Opens the durable, portable fix for the 145e systemic dispatch
+stall (the binding constraint to the H14 workload on hosts we can't isolate).
+Related: [[project_phase5_gate_isolation]], [[project_dispatch_protocol_refactor]],
+#173, the #135/#208 family.
 
 ## Problem
 Under a host-pause storm (QEMU vCPU threads descheduled by the host), Phase 145e
@@ -121,9 +123,29 @@ the CAS-vs-CAS exclusivity, not the word it lives in.
    no reclaimer ever steals, so the COMMIT CAS always succeeds = runtime no-op.
    Build-clean x86_64. NOT yet boot-validated (nothing to validate until step 3
    adds a reclaimer; then step 5 flips the knob).
-3. Add the host-pause exemption to `reclaim_stale_on_cpu` + the rescue (CAS-steal
-   the claim when the owner cpu is host-paused, despite `dispatching_tid==tid`).
-4. Apply consistently across ALL dispatch tails (the dispatching_tid sites above).
+3. **DONE (3b, the production path) 2026-06-24** — `rescue_host_paused_peers` now
+   recovers a STRANDED claim from a host-paused peer: gated on
+   `DISPATCH_WINDOW_RECHECK`, it CAS-steals `dispatch_claim: c → MAX` (exclusive vs
+   the peer's resume commit; loom `reclaim_followup_exclusive`), then re-orphans
+   (`on_cpu = PENDING`, `state = Ready`) + re-enqueues tid on the rescuer's CPU.
+   `dispatch_claim == c` holds ONLY inside the claim→switch window, so this is a
+   no-op on every healthy thread (a committed thread has `dispatch_claim == MAX`).
+   Counter `DISPATCH_WINDOW_RECLAIMS`. Build-clean.
+   **AUDIT (this session = the step-0 work, done by code-reading):**
+   `rescue_orphaned_threads_impl` SKIPS Running threads (scheduler.rs ~13823:
+   "dispatch completed → continue") and its stale-on-cpu re-stamp requires
+   `current_thread != tid`. ⇒ NO legacy path re-stamps a *claimed/Running* thread's
+   `on_cpu` behind the arbiter's back, so **step 2's commit CAS is sound as-landed
+   (no bypass; it won't spuriously fail).**
+   REMAINING in step 3: (a) the `reclaim_stale_on_cpu` exemption is only relevant on
+   the `DISPATCH_USE_CLAIM_HELPER` path (default OFF, a known dead-end) → deferred;
+   (b) `set_on_cpu_pending`'s RUN_CLAIM_VIOLATION re-stamp is a latent arbiter-bypass
+   in principle, but the audit found no live caller hits it on a claimed thread —
+   noted, not wired (would want the step-0 boot probe to justify touching it).
+4. **PARTIAL** — ARM/COMMIT live in `try_switch` only. Extend to the other dispatch
+   tails (`voluntary_reschedule`, `park_current_for_*` pick tails). SAFE to defer:
+   those tails leave `dispatch_claim == MAX`, so 3b correctly skips threads they
+   dispatch — it's missing *coverage*, not a safety gap.
 5. Flip the flag on; validate at 145e under isolation (does the systemic stall
    clear? watch the orphan-tid count + RESCUE/HOST_PAUSE counters) + a no-burner
    control + a stress fleet.

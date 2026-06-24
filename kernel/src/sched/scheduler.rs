@@ -4287,6 +4287,47 @@ fn rescue_host_paused_peers() {
             continue;
         }
         HOST_PAUSE_PEERS_DETECTED.fetch_add(1, Ordering::Relaxed);
+        // #173 step 3 (DISPATCH_WINDOW_RECHECK): recover a STRANDED dispatch
+        // claim from the host-paused peer `c`.  `dispatch_claim == c` holds ONLY
+        // during the claim→switch window (armed at try_switch's
+        // set_current_thread(next), committed → MAX just before the asm switch),
+        // so this can only ever touch a genuinely-stranded claim — a healthy
+        // running thread has dispatch_claim == MAX and is skipped.  Steal it via
+        // the arbiter CAS, which is mutually exclusive with the peer's resume-side
+        // commit CAS(c → MAX) (loom-dispatch-window::reclaim_followup_exclusive):
+        // if we win, the peer will bail on resume, so re-orphan + re-enqueue tid
+        // here; if we lose, the peer committed first and is running it — leave it.
+        if DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+            let stid = pc.current_thread.load(Ordering::Acquire) as ThreadId;
+            let c_idle = pc.idle_thread_id.load(Ordering::Relaxed);
+            if stid != 0 && stid != c_idle && (stid as usize) < RadixTable::capacity() {
+                if thread_ref(stid)
+                    .dispatch_claim
+                    .compare_exchange(c, DISPATCH_CLAIM_NONE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Won the stranded claim — the peer's resume commit CAS(c→MAX)
+                    // will now fail and it will bail to idle (DISPATCH_WINDOW_STOLEN).
+                    // Hand tid back to normal dispatch on this CPU.  Direct on_cpu
+                    // store (not set_on_cpu_pending) to avoid a spurious
+                    // RUN_CLAIM_VIOLATION bump: the paused peer still names tid as
+                    // current_thread until it resumes+bails, which is benign.
+                    unsafe { thread_mut_from_ref(stid) }.state = ThreadState::Ready;
+                    thread_ref(stid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                    record_trans(stid as u32, 21, ThreadState::Ready, ON_CPU_PENDING); // 21=window-reclaim
+                    let prio = thread_ref(stid).prio.load(Ordering::Relaxed);
+                    set_enq_tag(7); // 7=rescue
+                    percpu_enqueue(my_cpu, prio, stid);
+                    let n = DISPATCH_WINDOW_RECLAIMS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 {
+                        crate::println!(
+                            "DISPATCH-WINDOW-RECLAIM: stranded tid={} from paused_cpu={} -> my_cpu={} (n={})",
+                            stid, c, my_cpu, n
+                        );
+                    }
+                }
+            }
+        }
         // Drain up to N threads from the paused peer's run-queue onto
         // this CPU.  try_lock so a (briefly) racing access from the
         // peer doesn't deadlock — next sweep will retry.
@@ -5740,6 +5781,13 @@ pub static DISPATCH_WINDOW_RECHECK: core::sync::atomic::AtomicBool =
 /// claim while this CPU was host-paused mid-dispatch → we bailed to idle instead
 /// of double-executing).  Always 0 until step 3 adds a reclaimer.
 pub static DISPATCH_WINDOW_STOLEN: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// #173 step 3: count of stranded claims RECLAIMED from a host-paused peer by
+/// `rescue_host_paused_peers` (arbiter CAS won → peer will bail on resume → tid
+/// re-enqueued here).  Pairs with DISPATCH_WINDOW_STOLEN (the peer's matching
+/// resume-side bail).  Always 0 while DISPATCH_WINDOW_RECHECK is OFF.
+pub static DISPATCH_WINDOW_RECLAIMS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// `dispatch_claim` "no owner" sentinel (mirrors on_cpu's u32::MAX = none).

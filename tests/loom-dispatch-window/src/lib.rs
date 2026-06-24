@@ -160,6 +160,78 @@ fn run(resume: Resume, reclaim: Reclaim) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Step 3 shape: the rescue (rescue_host_paused_peers) reclaims a STRANDED claim
+// from a host-paused owner, with the real two-atomic follow-up the kernel does.
+//
+// In the kernel, the owner's resume commit is `CAS(dispatch_claim: ownerCpu →
+// MAX)` and the reclaimer's steal is `CAS(dispatch_claim: ownerCpu → MAX)` too
+// (DISPATCH_CLAIM_NONE == the committed value, u32::MAX) — i.e. BOTH CAS from the
+// same owner value to the SAME target.  Exclusivity is conferred by the FROM
+// value (only one CAS sees `ownerCpu`), not the target.  The winner then does its
+// own `on_cpu` follow-up: the owner keeps `on_cpu = ownerCpu` and runs; the
+// reclaimer re-orphans `on_cpu = PENDING` and re-enqueues for re-dispatch.
+//
+//   INVARIANT: exactly one of {owner runs, reclaimer recovers} happens (no
+//   double, never lost), AND on_cpu ends consistent with whoever won.
+const OWNER_CPU: u32 = 0; // owner cpu id (also the armed dispatch_claim value)
+const CLAIM_DONE: u32 = 0xFFFF_FFFF; // committed / no-owner (kernel: u32::MAX)
+const ON_CPU_PENDING: u32 = 0xFFFF_FFFE; // re-orphaned, dispatchable
+
+fn run_reclaim_followup() {
+    let claim = Arc::new(AtomicU32::new(OWNER_CPU)); // dispatch_claim, armed=owner
+    let on_cpu = Arc::new(AtomicU32::new(OWNER_CPU)); // on_cpu = owner at arm
+    let owner_ran = Arc::new(AtomicBool::new(false));
+    let recovered = Arc::new(AtomicBool::new(false));
+
+    // Owner cpu resumes from the host-pause and tries to commit its claim.
+    let (c1, ow1) = (claim.clone(), owner_ran.clone());
+    let p = thread::spawn(move || {
+        if c1
+            .compare_exchange(OWNER_CPU, CLAIM_DONE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Committed: keep on_cpu = owner and run.  (No on_cpu write needed —
+            // it is already the owner cpu from the arm.)
+            ow1.store(true, Ordering::Release);
+        }
+        // else: a reclaimer stole it — bail (do not run).
+    });
+
+    // Rescue reclaimer on a peer cpu: the owner is host-paused; steal its claim.
+    let (c2, oc2, rc2) = (claim.clone(), on_cpu.clone(), recovered.clone());
+    let r = thread::spawn(move || {
+        if c2
+            .compare_exchange(OWNER_CPU, CLAIM_DONE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Won the stranded claim: re-orphan + (in the kernel) re-enqueue.
+            oc2.store(ON_CPU_PENDING, Ordering::Release);
+            rc2.store(true, Ordering::Release);
+        }
+        // else: the owner committed first — leave it running on the owner.
+    });
+
+    p.join().unwrap();
+    r.join().unwrap();
+
+    let owner_ran = owner_ran.load(Ordering::Acquire);
+    let recovered = recovered.load(Ordering::Acquire);
+    // Exactly one outcome (no double-execution; never lost).
+    assert!(
+        owner_ran ^ recovered,
+        "claim→switch reclaim: exactly one of owner-run / reclaim must occur",
+    );
+    // on_cpu is consistent with the winner.
+    let oc = on_cpu.load(Ordering::Acquire);
+    if owner_ran {
+        assert_eq!(oc, OWNER_CPU, "owner ran ⇒ on_cpu stays the owner cpu");
+    }
+    if recovered {
+        assert_eq!(oc, ON_CPU_PENDING, "reclaimed ⇒ on_cpu re-orphaned to PENDING");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +267,14 @@ mod tests {
     #[test]
     fn cas_commit_is_exclusive() {
         loom::model(|| run(Resume::CasCommit, Reclaim::Cas));
+    }
+
+    /// Step 3 (rescue_host_paused_peers) shape: the owner's resume commit and the
+    /// reclaimer's steal both CAS from the owner cpu to the SAME target (MAX),
+    /// then each does its `on_cpu` follow-up.  Exactly one wins; on_cpu ends
+    /// consistent with the winner; the thread is never double-run nor lost.
+    #[test]
+    fn reclaim_followup_exclusive() {
+        loom::model(run_reclaim_followup);
     }
 }
