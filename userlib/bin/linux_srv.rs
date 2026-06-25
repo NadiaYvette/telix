@@ -6277,6 +6277,12 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return open_virtual_file(pi, content, flags);
     }
 
+    // Virtual /sys files — synthetic content (CPU topology, THP policy).  Served
+    // before VFS so /sys never hits the real filesystem.
+    if let Some(content) = static_sys_content(&path[..pathlen]) {
+        return open_virtual_file(pi, content, flags);
+    }
+
     // Initramfs fast path: many of the .so files Step H and other Linux
     // binaries open (libc.so.6, libxcvt.so.0, ld-linux-x86-64.so.2, etc.)
     // are present in initramfs.cpio AND in the ext2 image.  Reading from
@@ -6496,6 +6502,34 @@ fn static_proc_content(path: &[u8]) -> Option<&'static [u8]> {
         b"/proc/sys/vm/max_map_count" => b"65530\n",
         b"/proc/sys/vm/mmap_min_addr" => b"65536\n",
         b"/proc/sys/fs/file-max" => b"131072\n",
+        b"/proc/sys/fs/nr_open" => b"1048576\n",
+        b"/proc/sys/fs/pipe-max-size" => b"1048576\n",
+        b"/proc/sys/kernel/cap_last_cap" => b"40\n",
+        b"/proc/sys/kernel/yama/ptrace_scope" => b"0\n",
+        b"/proc/sys/net/core/somaxconn" => b"4096\n",
+        _ => return None,
+    })
+}
+
+/// Static synthetic content for /sys pseudo-files.  Mirrors static_proc_content;
+/// used by both open() (-> open_virtual_file) and stat() (-> S_IFREG).  Values are
+/// chosen to stay consistent with the deliberate uniprocessor view (one online CPU,
+/// matching /proc/cpuinfo + sched_getaffinity's single-CPU mask) and a no-THP
+/// memory policy — widening the CPU count here is coupled to #273, not friction-free.
+fn static_sys_content(path: &[u8]) -> Option<&'static [u8]> {
+    Some(match path {
+        // CPU topology — sysconf(_SC_NPROCESSORS_*) / glibc get_nprocs() read these.
+        // "0" = only cpu0 is online/present/possible => one CPU.
+        b"/sys/devices/system/cpu/online" => b"0\n",
+        b"/sys/devices/system/cpu/possible" => b"0\n",
+        b"/sys/devices/system/cpu/present" => b"0\n",
+        // NUMA — a single memory node.
+        b"/sys/devices/system/node/online" => b"0\n",
+        b"/sys/devices/system/node/possible" => b"0\n",
+        // Transparent hugepage — disabled ([never] is the active choice).
+        // jemalloc/tcmalloc/Go/glibc-malloc probe these to choose an arena strategy.
+        b"/sys/kernel/mm/transparent_hugepage/enabled" => b"always madvise [never]\n",
+        b"/sys/kernel/mm/transparent_hugepage/defrag" => b"always defer defer+madvise madvise [never]\n",
         _ => return None,
     })
 }
@@ -7066,6 +7100,9 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
     let is_proc_dir = match &path[..pathlen] {
         b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/"
         | b"/proc/sys" | b"/proc/sys/" | b"/proc/sys/kernel" | b"/proc/sys/kernel/"
+        | b"/proc/sys/kernel/yama" | b"/proc/sys/kernel/yama/"
+        | b"/proc/sys/vm" | b"/proc/sys/vm/" | b"/proc/sys/fs" | b"/proc/sys/fs/"
+        | b"/proc/sys/net" | b"/proc/sys/net/" | b"/proc/sys/net/core" | b"/proc/sys/net/core/"
         | b"/dev" | b"/dev/" | b"/dev/dri" | b"/dev/dri/"
         | b"/dev/input" | b"/dev/input/"
         | b"/dev/shm" | b"/dev/shm/"
@@ -7117,7 +7154,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
     let is_virtual_file = (pathlen >= 11 && &path[..11] == b"/proc/self/")
         || path[..pathlen] == *b"/proc/cpuinfo"
         || path[..pathlen] == *b"/proc/meminfo"
-        || (pathlen >= 17 && &path[..17] == b"/proc/sys/kernel/")
+        || (pathlen >= 10 && &path[..10] == b"/proc/sys/") // any sysctl file (kernel/vm/fs/net)
+        || static_sys_content(&path[..pathlen]).is_some() // /sys CPU topology + THP
         || path[..pathlen] == *b"/etc/passwd"
         || path[..pathlen] == *b"/etc/group"
         || path[..pathlen] == *b"/etc/hosts"
