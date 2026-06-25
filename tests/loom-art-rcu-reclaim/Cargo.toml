@@ -1,0 +1,42 @@
+[package]
+name = "loom-art-rcu-reclaim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# #260 SCHED_THREAD_ART corruption — root-caused (2026-06-25) to an RCU
+# grace-period accounting bug in kernel/src/sync/rcu.rs, NOT in ipc/art.rs.
+#
+# rcu_defer_free stamps a batch's `epoch` ONCE at batch allocation
+# (rcu.rs:221) and never re-stamps it as later callbacks are appended or when
+# the batch is sealed (rcu.rs:244-258). Reclamation frees the whole batch when
+# `b.epoch < min_gen` (rcu.rs:299). So a node deferred LATE into the batch
+# (unlinked at a higher gen) inherits the stale first-entry epoch and is freed
+# before a full grace period has elapsed since ITS unlink — while a lock-free
+# ART reader (for_each / lookup) may still be walking it. The freed node's
+# 64B/256B slab slot is immediately re-handed to a new owner (ART Leaf/Node4/
+# Node16 or a turnstile, all share the class) → use-after-free → scribbled
+# Node4 header + (via a corrupted num_children walked out of bounds) adjacent
+# Thread payload. Same family as the #208 thread_ref→kstack-VA corruption.
+#
+#   INVARIANT: an RCU-deferred object is not reclaimed until every CPU has
+#   passed a quiescent state AFTER the object's unlink — i.e. its reclamation
+#   epoch must be the UNLINK gen, not the batch-allocation gen.
+#
+# Proves: (1) epoch = batch-alloc gen (the current kernel) lets the reclaim
+# fire while a reader still holds a late-unlinked node → the slab recycles it
+# mid-read (UAF); (2) epoch = unlink gen (re-stamp on append) makes the
+# `epoch < min_gen` gate correct → no recycle-under-reader. => the fix is to
+# re-stamp the batch epoch on every append (rcu.rs ~245).
+
+[lib]
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

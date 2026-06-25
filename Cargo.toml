@@ -22,4 +22,5 @@ exclude = [
     "tests/loom-libcache-alloc",
     "tests/loom-orphan-rescue",
     "tests/loom-dispatch-window",
+    "tests/loom-art-rcu-reclaim",
 ]
