@@ -12138,6 +12138,116 @@ fn maybe_deliver_signal(pi: usize, caller_port: u64, result: u64) -> Option<u64>
     }
 }
 
+/// #274 Phase 0: deliver EINTR to Linux callers parked on an *interruptible*
+/// blocking syscall (futex_wait, poll/select/ppoll/pselect6) when a deliverable
+/// interrupting signal is posted to them.  Without this, the async-park reply
+/// paths (#187-191) strand a signal until the syscall completes normally.
+/// Compile-time gated OFF (dormant) until boot-validated — an unvalidated change
+/// to the signal path + the hot recv loop must not be on by default.  Flip to
+/// `true` + rebuild to enable.  See docs/signal-completeness-274-plan.md.
+const SIGNAL_INTERRUPT: bool = false;
+
+/// True iff `caller_port` has a pending signal that should INTERRUPT a blocking
+/// syscall: deliverable past the process sig_mask, and either a custom handler or
+/// a terminating SIG_DFL.  SIG_IGN never interrupts; SIG_DFL for SIGCHLD/SIGURG/
+/// SIGWINCH is ignored by default and so does not interrupt.
+fn has_interrupting_signal(pi: usize, caller_port: u64) -> bool {
+    let peek = syscall::personality_peek_signals(caller_port);
+    if peek == u64::MAX {
+        return false;
+    }
+    let mask = unsafe { PROC_TABLE[pi].sig_mask };
+    let deliverable = peek & !mask;
+    if deliverable == 0 {
+        return false;
+    }
+    let mut sig = 1usize;
+    while sig <= NUM_SIGNALS {
+        if deliverable & (1u64 << (sig - 1)) != 0 {
+            let sa = unsafe { PROC_TABLE[pi].sig_actions[sig - 1] };
+            let ignored_default = sa.handler == 0 && (sig == 17 || sig == 23 || sig == 28);
+            if sa.handler != 1 && !ignored_default {
+                return true; // custom handler or terminating default → interrupts
+            }
+        }
+        sig += 1;
+    }
+    false
+}
+
+/// Complete `caller_port`'s parked syscall early with a signal: deliver the
+/// handler frame (reply EINTR) or take the SIG_DFL-terminate path.  Reuses the
+/// proven synchronous maybe_deliver_signal rewrite-then-reply.  IPC runs UNLOCKED.
+fn interrupt_parked_caller(pi: usize, caller_port: u64) {
+    match maybe_deliver_signal(pi, caller_port, linux_err(EINTR)) {
+        Some(r) => {
+            syscall::personality_reply(caller_port, r);
+        }
+        None => {
+            syscall::kill(caller_port);
+        }
+    }
+}
+
+/// True if any caller is parked on a signal-interruptible syscall (futex/poll).
+/// Cheap presence scan used to decide whether the main recv needs a timeout.
+fn any_signal_pollable_parked() -> bool {
+    unsafe {
+        for i in 0..MAX_FUTEX_WAITERS {
+            if FUTEX_TABLE[i].active {
+                return true;
+            }
+        }
+        for i in 0..MAX_POLL_WAITERS {
+            if POLL_TABLE[i].active {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// #274 Phase 0: sweep FUTEX_TABLE + POLL_TABLE; for each parked caller with an
+/// interrupting signal, complete its park with EINTR + free the slot.  Reads/
+/// frees each slot under its table lock but does the signal-delivery IPC UNLOCKED
+/// (re-checking slot identity before freeing — safe if a worker mutated it).
+fn sweep_parked_for_signals() {
+    let mut i = 0;
+    while i < MAX_FUTEX_WAITERS {
+        let (active, cp, ppi) = {
+            let _g = futex_lock();
+            unsafe { (FUTEX_TABLE[i].active, FUTEX_TABLE[i].caller_port, FUTEX_TABLE[i].pi) }
+        };
+        if active && has_interrupting_signal(ppi, cp) {
+            interrupt_parked_caller(ppi, cp);
+            let _g = futex_lock();
+            unsafe {
+                if FUTEX_TABLE[i].active && FUTEX_TABLE[i].caller_port == cp {
+                    FUTEX_TABLE[i].active = false;
+                }
+            }
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < MAX_POLL_WAITERS {
+        let (active, cp, ppi) = {
+            let _g = poll_lock();
+            unsafe { (POLL_TABLE[j].active, POLL_TABLE[j].caller_port, POLL_TABLE[j].pi) }
+        };
+        if active && has_interrupting_signal(ppi, cp) {
+            interrupt_parked_caller(ppi, cp);
+            let _g = poll_lock();
+            unsafe {
+                if POLL_TABLE[j].active && POLL_TABLE[j].caller_port == cp {
+                    POLL_TABLE[j].active = false;
+                }
+            }
+        }
+        j += 1;
+    }
+}
+
 /// Handle Linux rt_sigreturn: restore the saved exception frame from the
 /// sigframe on the user stack. Called from signal handler restorer.
 ///
@@ -15641,6 +15751,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Phase A5: retire any parked timerfd-read slots whose timer
         // has expired.  Same early-out idiom as wait4.
         poll_timerfd_pending();
+        // #274 Phase 0 (gated OFF): deliver EINTR to callers parked on
+        // futex/poll with a pending interrupting signal.  Runs each iteration so
+        // a busy process's signal lands on its next message; the idle case is
+        // covered by the recv-timeout below.
+        if SIGNAL_INTERRUPT {
+            sweep_parked_for_signals();
+        }
 
         // Lazily register our async-reply port with initramfs_srv.  At
         // linux_srv startup the `initramfs` ns alias may not be published
@@ -15771,6 +15888,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     (sp, m)
                 }
                 None => continue,
+            }
+        } else if SIGNAL_INTERRUPT && any_signal_pollable_parked() {
+            // #274 Phase 0: a caller is parked on an interruptible syscall — poll
+            // with a 50 ms timeout so a signal posted to it is delivered (EINTR)
+            // promptly even with no other traffic; on timeout, sweep then loop.
+            // (Gated OFF → this branch is never taken by default; the indefinite
+            // recv below is the unchanged hot path.)
+            match syscall::port_set_recv_timeout_msg(port_set, 50_000) {
+                Some(x) => x,
+                None => {
+                    sweep_parked_for_signals();
+                    continue;
+                }
             }
         } else {
             match syscall::port_set_recv(port_set) {
