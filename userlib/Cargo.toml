@@ -205,6 +205,10 @@ name = "linux_exit42"
 path = "bin/linux_exit42.rs"
 
 [[bin]]
+name = "procfs_selftest"
+path = "bin/procfs_selftest.rs"
+
+[[bin]]
 name = "fb_srv"
 path = "bin/fb_srv.rs"
 

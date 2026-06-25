@@ -17098,6 +17098,86 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 125b: Linux personality /proc /sys /etc synthetic-file selftest ---
+    // Runs /procfs_selftest as a Linux process; it open()s+read()s each synthetic
+    // node (machine-id, os-release, /sys cpu+THP, /proc/self statm/limits/cgroup/
+    // status/maps, /proc/sys knobs) and exits with the failure count (0 = all OK).
+    // Validates the 2026-06-25 node-coverage work (commits 6c3f678..26d66c0).
+    syscall::debug_puts(b"  init: Phase 125b linux procfs selftest...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // execve("/procfs_selftest", NULL, NULL) → syscall 59
+                        let filename = b"/procfs_selftest\0";
+                        let exec_ret: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => exec_ret,
+                            in("rdi") filename.as_ptr() as u64,
+                            in("rsi") 0u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        let _ = exec_ret;
+                        // execve failed if we reach here.
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        // The selftest uses the x86_64 int 0x80 ABI; on other
+                        // arches it is a no-op exit(0) (the files are arch-neutral).
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                // Parent: set child's personality to Linux.
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 125b linux procfs selftest: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 125b linux procfs selftest: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 125b linux procfs selftest: FAILED (fails=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 125b linux procfs selftest: SKIPPED (linux_srv not found)\n");
+        }
+    }
+
     // --- Phase 126: Linux personality directory operations ---
     syscall::debug_puts(b"  init: Phase 126 linux dir ops...\n");
     {
