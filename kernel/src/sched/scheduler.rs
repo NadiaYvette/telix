@@ -7593,6 +7593,43 @@ pub fn tick(current_sp: u64) -> u64 {
                         frt, cfb, sar, isr, apf, hpd, hps,
                     );
                 }
+                // #173 window-collapse (DISPATCH_WINDOW_RECHECK) telemetry: confirm
+                // the flag state + whether step 2's resume-commit bailed (stolen) or
+                // step 3b's reclaimer engaged (reclaim).  Also surfaces the
+                // long-un-dumped RESCUE_CAS_LOST + HOST_PAUSE_REROUTES.  Emitted
+                // whenever the flag is on (so reclaim=0/stolen=0 is observable, not
+                // just inferred), or whenever any counter is non-zero.
+                let wr_on = DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed);
+                let wr_reclaim = DISPATCH_WINDOW_RECLAIMS.load(Ordering::Relaxed);
+                let wr_stolen = DISPATCH_WINDOW_STOLEN.load(Ordering::Relaxed);
+                let rcl = RESCUE_CAS_LOST.load(Ordering::Relaxed);
+                let hpr = HOST_PAUSE_REROUTES.load(Ordering::Relaxed);
+                if wr_on || (wr_reclaim | wr_stolen | rcl | hpr) != 0 {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::arch::x86_64::serial::{put_byte, put_bytes, put_dec_u64};
+                        let mut buf = [0u8; 160];
+                        let mut k = 0;
+                        let fields: [(&[u8], u64); 5] = [
+                            (b"WINDOW-DIAG: recheck=", wr_on as u64),
+                            (b" reclaim=", wr_reclaim),
+                            (b" stolen=", wr_stolen),
+                            (b" rescue_cas_lost=", rcl),
+                            (b" host_pause_reroute=", hpr),
+                        ];
+                        for (label, val) in fields {
+                            put_bytes(&mut buf, &mut k, label);
+                            put_dec_u64(&mut buf, &mut k, val);
+                        }
+                        put_byte(&mut buf, &mut k, b'\n');
+                        crate::arch::x86_64::serial::handler_write_bytes(&buf[..k.min(buf.len())]);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    crate::println!(
+                        "WINDOW-DIAG: recheck={} reclaim={} stolen={} rescue_cas_lost={} host_pause_reroute={}",
+                        wr_on as u64, wr_reclaim, wr_stolen, rcl, hpr,
+                    );
+                }
                 // #208 B2 RSP0-refresh visibility: total = user-return iretqs
                 // that ran the refresher; fixed = those where it CORRECTED a
                 // stale RSP0 (proves it closes a window other paths missed);
