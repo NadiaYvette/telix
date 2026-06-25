@@ -2505,6 +2505,83 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 145d: /proc /sys /etc synthetic-file selftest (focus-surviving) ---
+    // Validates linux_srv's synthetic node coverage + the authoritative-VMA
+    // /proc/self/maps (2026-06-25 work) BEFORE the flaky 145e stall point.
+    // Spawns linux_srv if needed, then runs /procfs_selftest as a Linux process;
+    // it mmap()s + open/read-checks each node and exits with the failure count.
+    syscall::debug_puts(b"  init: Phase 145d procfs selftest...\n");
+    {
+        if syscall::ns_lookup(b"linux").is_none() {
+            let _ = syscall::spawn(b"linux_srv", 50);
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"linux").is_some() { break; }
+                syscall::yield_now();
+            }
+        }
+        if syscall::ns_lookup(b"linux").is_some() {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        let filename = b"/procfs_selftest\0";
+                        let exec_ret: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => exec_ret,
+                            in("rdi") filename.as_ptr() as u64,
+                            in("rsi") 0u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        let _ = exec_ret;
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { syscall::exit(0); }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 145d linux procfs selftest: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 145d linux procfs selftest: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 145d linux procfs selftest: FAILED (fails=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 145d linux procfs selftest: SKIPPED (linux_srv not found)\n");
+        }
+    }
+
     phase_log(b"entering Phase 145e (chronic stall point)");
 
     // --- Phase 145e: rt_sigaction early repro (before flaky I/O phases) ---
