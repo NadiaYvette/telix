@@ -6585,10 +6585,39 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
             buf[pos..pos + 7].copy_from_slice(b"unknown");
             pos += 7;
         }
-        let rest = b"\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nVmPeak:\t    4096 kB\nVmSize:\t    4096 kB\nVmRSS:\t    4096 kB\nThreads:\t1\n";
-        let nr = rest.len().min(PROCBUF_SIZE - pos);
-        buf[pos..pos + nr].copy_from_slice(&rest[..nr]);
-        pos += nr;
+        // Fixed fields up to Groups (Pid:1 = the textual uniprocess pid view;
+        // getpid(2) returns caller_port separately — reconciling them is a
+        // pid-model follow-up, see project_275_procfs_maps).
+        let pre = b"\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\n";
+        let np = pre.len().min(PROCBUF_SIZE - pos);
+        buf[pos..pos + np].copy_from_slice(&pre[..np]);
+        pos += np;
+        // #275: real memory accounting from the tracked VMAs + heap, plus a live
+        // thread count.  VmRSS is reported equal to VmSize (best-effort: residency
+        // is not tracked separately).  Numbers are in kB.
+        let (total_bytes, heap_bytes) = proc_vm_bytes(pi);
+        let total_kb = total_bytes / 1024;
+        let heap_kb = heap_bytes / 1024;
+        let threads = proc_thread_count(pi);
+        for &(label, val, kb) in &[
+            (&b"VmPeak:\t"[..], total_kb, true),
+            (&b"VmSize:\t"[..], total_kb, true),
+            (&b"VmRSS:\t"[..],  total_kb, true),
+            (&b"VmData:\t"[..], heap_kb,  true),
+            (&b"Threads:\t"[..], threads, false),
+        ] {
+            if pos + label.len() + 24 >= PROCBUF_SIZE { break; }
+            buf[pos..pos + label.len()].copy_from_slice(label);
+            pos += label.len();
+            pos += put_dec(&mut buf[pos..], val);
+            if kb {
+                buf[pos..pos + 4].copy_from_slice(b" kB\n");
+                pos += 4;
+            } else {
+                buf[pos] = b'\n';
+                pos += 1;
+            }
+        }
         len = pos;
     } else if path == b"/proc/self/cmdline" {
         // NUL-separated argv: use stored exe name if available.
@@ -6633,6 +6662,23 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
         let n = content.len().min(PROCBUF_SIZE);
         buf[..n].copy_from_slice(&content[..n]);
         len = n;
+    } else if path == b"/proc/self/statm" {
+        // #275: "size resident shared text lib data dt", in 4 KiB pages.
+        // Best-effort from tracked VMAs + heap; the exe text + stack are untracked
+        // (reported 0) and residency is not separated (resident == size).
+        let (total_bytes, heap_bytes) = proc_vm_bytes(pi);
+        let total_pg = total_bytes / 4096;
+        let heap_pg = heap_bytes / 4096;
+        let mut pos = 0;
+        pos += put_dec(&mut buf[pos..], total_pg); // size
+        buf[pos] = b' '; pos += 1;
+        pos += put_dec(&mut buf[pos..], total_pg); // resident
+        buf[pos..pos + 7].copy_from_slice(b" 0 0 0 "); // shared text lib
+        pos += 7;
+        pos += put_dec(&mut buf[pos..], heap_pg);  // data
+        buf[pos..pos + 3].copy_from_slice(b" 0\n"); // dt
+        pos += 3;
+        len = pos;
     } else if path == b"/proc/cpuinfo" {
         // Minimal /proc/cpuinfo — single core.
         let content = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 142\nmodel name\t: QEMU Virtual CPU\nstepping\t: 1\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 sse3 ssse3 sse4_1 sse4_2\nbogomips\t: 4000.00\n\n";
@@ -8617,6 +8663,51 @@ fn fmt_maps_line(out: &mut [u8], start: usize, end: usize, perms: &[u8; 4], name
     }
     out[pos] = b'\n'; pos += 1;
     pos
+}
+
+/// #275: best-effort process memory accounting from the tracked VMAs + heap,
+/// for /proc/self/{statm,status}.  Returns (total_bytes, heap_bytes).  Does NOT
+/// include the exe text/data or stack (untracked — execve-side, see maps notes),
+/// so it under-counts, but it is far more meaningful than the prior constant.
+fn proc_vm_bytes(pi: usize) -> (usize, usize) {
+    unsafe {
+        let regs = PROC_TABLE[pi].mmap_regions;
+        let mut total = 0usize;
+        for i in 0..MAX_MMAP_REGIONS {
+            if regs[i].start != 0 && regs[i].end > regs[i].start {
+                total += regs[i].end - regs[i].start;
+            }
+        }
+        let brk_base = PROC_TABLE[pi].brk_base;
+        let brk_cur = PROC_TABLE[pi].brk_current;
+        let heap = if brk_base != 0 && brk_cur > brk_base { brk_cur - brk_base } else { 0 };
+        (total + heap, heap)
+    }
+}
+
+/// #275: live thread count = leader + active CLONE_THREAD ports (Phase 174).
+fn proc_thread_count(pi: usize) -> usize {
+    unsafe {
+        let mut n = 1usize; // the leader
+        for i in 0..8 {
+            if PROC_TABLE[pi].thread_ports[i] != 0 { n += 1; }
+        }
+        n
+    }
+}
+
+/// Format `val` as decimal into `out`, returning bytes written (0 if it won't fit).
+fn put_dec(out: &mut [u8], val: usize) -> usize {
+    if out.is_empty() { return 0; }
+    if val == 0 { out[0] = b'0'; return 1; }
+    let mut tmp = [0u8; 20];
+    let mut v = val;
+    let mut i = 20;
+    while v > 0 { i -= 1; tmp[i] = b'0' + (v % 10) as u8; v /= 10; }
+    let n = 20 - i;
+    if out.len() < n { return 0; }
+    out[..n].copy_from_slice(&tmp[i..]);
+    n
 }
 
 /// Supports anonymous and file-backed (MAP_PRIVATE) mappings.
