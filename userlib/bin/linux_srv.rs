@@ -1687,7 +1687,9 @@ static mut MEMFD_TABLE: [MemFdSlot; MAX_MEMFD_INSTANCES] = [const { MemFdSlot::e
 
 // ProcBuf: synthetic /proc pseudo-file content
 const MAX_PROCBUF_INSTANCES: usize = 8;
-const PROCBUF_SIZE: usize = 512;
+// 4 KiB so a real /proc/self/maps (up to 64 kernel VMAs ~56 B each) and an N-CPU
+// /proc/cpuinfo fit without truncation (was 512, which capped maps at ~9 lines).
+const PROCBUF_SIZE: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct ProcBufSlot {
@@ -6269,6 +6271,33 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return open_virtual_file(pi, content, flags);
     }
 
+    // #275 SMP view: when enabled, the CPU range files report "0-(N-1)" instead
+    // of the static "0".  Gated OFF (dead branch) by default → falls through to
+    // static_sys_content ("0").  Node files stay "0" (one NUMA node regardless).
+    if SMP_VIEW {
+        let is_cpu_range = matches!(&path[..pathlen],
+            b"/sys/devices/system/cpu/online"
+            | b"/sys/devices/system/cpu/possible"
+            | b"/sys/devices/system/cpu/present");
+        if is_cpu_range {
+            let n = linux_ncpus();
+            let mut tmp = [0u8; 24];
+            let p = if n <= 1 {
+                tmp[0] = b'0';
+                tmp[1] = b'\n';
+                2
+            } else {
+                tmp[0] = b'0';
+                tmp[1] = b'-';
+                let mut q = 2 + put_dec(&mut tmp[2..], n - 1);
+                tmp[q] = b'\n';
+                q += 1;
+                q
+            };
+            return open_virtual_file(pi, &tmp[..p], flags);
+        }
+    }
+
     // Virtual /sys files — synthetic content (CPU topology, THP policy).  Served
     // before VFS so /sys never hits the real filesystem.
     if let Some(content) = static_sys_content(&path[..pathlen]) {
@@ -6582,6 +6611,28 @@ fn static_etc_content(path: &[u8]) -> Option<&'static [u8]> {
 }
 
 /// Open a /proc pseudo-file by generating content into a ProcBuf slot.
+/// #275 SMP view (gated on #273): present N CPUs to Linux processes across
+/// /proc/cpuinfo, /proc/stat, /sys/devices/system/cpu/{online,possible,present}
+/// and sched_getaffinity, instead of the uniprocessor view.  Compile-time gated
+/// OFF (dormant) until NPTL-on-SMP is validated under real boots — see
+/// docs/smp-view-273-plan.md.  Flip to `true` + rebuild to enable.  With it OFF
+/// every site below keeps its exact current 1-CPU output.
+const SMP_VIEW: bool = false;
+
+/// The CPU count to present to Linux processes: 1 (uniprocessor) unless SMP_VIEW,
+/// in which case the real online count (SYS_CPU_TOPOLOGY), capped to keep N
+/// /proc/cpuinfo blocks within PROCBUF_SIZE.
+fn linux_ncpus() -> usize {
+    if SMP_VIEW {
+        match syscall::cpu_topology(0) {
+            Some((_, _, _, _, count)) => (count as usize).max(1).min(8),
+            None => 1,
+        }
+    } else {
+        1
+    }
+}
+
 fn open_proc_file(pi: usize, caller_port: u64, path: &[u8], flags: u64) -> u64 {
     // Find a free ProcBuf slot.
     let slot = unsafe {
@@ -6805,21 +6856,32 @@ fn open_proc_file(pi: usize, caller_port: u64, path: &[u8], flags: u64) -> u64 {
         pos += 3;
         len = pos;
     } else if path == b"/proc/cpuinfo" {
-        // Minimal per-arch /proc/cpuinfo — single core (uniprocessor view,
-        // consistent with /sys cpu/online + sched_getaffinity).  Previously this
-        // returned x86 "GenuineIntel" content on every arch, which is wrong for
-        // anything reading the arch-specific flag/feature fields.
+        // Per-arch /proc/cpuinfo.  `fields` is everything after the "processor: N"
+        // line (identical per core); the block is emitted once per CPU.  With
+        // SMP_VIEW off, linux_ncpus()==1 → exactly the prior single-core output.
+        // (Previously this returned x86 "GenuineIntel" content on every arch.)
         #[cfg(target_arch = "x86_64")]
-        let content: &[u8] = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 142\nmodel name\t: QEMU Virtual CPU\nstepping\t: 1\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 sse3 ssse3 sse4_1 sse4_2\nbogomips\t: 4000.00\n\n";
+        let fields: &[u8] = b"vendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 142\nmodel name\t: QEMU Virtual CPU\nstepping\t: 1\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 sse3 ssse3 sse4_1 sse4_2\nbogomips\t: 4000.00\n\n";
         #[cfg(target_arch = "aarch64")]
-        let content: &[u8] = b"processor\t: 0\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd08\nCPU revision\t: 0\n\n";
+        let fields: &[u8] = b"BogoMIPS\t: 100.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd08\nCPU revision\t: 0\n\n";
         #[cfg(target_arch = "riscv64")]
-        let content: &[u8] = b"processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv48\n\n";
+        let fields: &[u8] = b"hart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv48\n\n";
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
-        let content: &[u8] = b"processor\t: 0\ncpu cores\t: 1\n\n"; // generic (loongarch64/mips64)
-        let n = content.len().min(PROCBUF_SIZE);
-        buf[..n].copy_from_slice(&content[..n]);
-        len = n;
+        let fields: &[u8] = b"cpu cores\t: 1\n\n"; // generic (loongarch64/mips64)
+        let n = linux_ncpus();
+        let mut pos = 0;
+        let pfx = b"processor\t: ";
+        for i in 0..n {
+            if pos + pfx.len() + 20 + fields.len() > PROCBUF_SIZE { break; }
+            buf[pos..pos + pfx.len()].copy_from_slice(pfx);
+            pos += pfx.len();
+            pos += put_dec(&mut buf[pos..], i);
+            buf[pos] = b'\n';
+            pos += 1;
+            buf[pos..pos + fields.len()].copy_from_slice(fields);
+            pos += fields.len();
+        }
+        len = pos;
     } else if path == b"/proc/meminfo" {
         // Minimal /proc/meminfo — 256MB QEMU.
         let content = b"MemTotal:         262144 kB\nMemFree:          200000 kB\nMemAvailable:     220000 kB\nBuffers:               0 kB\nCached:            32768 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n";
@@ -6836,6 +6898,29 @@ fn open_proc_file(pi: usize, caller_port: u64, path: &[u8], flags: u64) -> u64 {
         let n = content.len().min(PROCBUF_SIZE);
         buf[..n].copy_from_slice(&content[..n]);
         len = n;
+    } else if path == b"/proc/stat" && SMP_VIEW {
+        // #275 SMP view: aggregate "cpu" + per-CPU "cpuN" lines.  Gated OFF, so
+        // when disabled /proc/stat falls through to the single-CPU static below.
+        let n = linux_ncpus();
+        let mut pos = 0;
+        let agg = b"cpu  0 0 0 0 0 0 0 0 0 0\n";
+        buf[..agg.len()].copy_from_slice(agg);
+        pos += agg.len();
+        let suf = b" 0 0 0 0 0 0 0 0 0 0\n";
+        for i in 0..n {
+            if pos + 3 + 20 + suf.len() > PROCBUF_SIZE { break; }
+            buf[pos..pos + 3].copy_from_slice(b"cpu");
+            pos += 3;
+            pos += put_dec(&mut buf[pos..], i);
+            buf[pos..pos + suf.len()].copy_from_slice(suf);
+            pos += suf.len();
+        }
+        let tail = b"intr 0\nctxt 0\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
+        if pos + tail.len() <= PROCBUF_SIZE {
+            buf[pos..pos + tail.len()].copy_from_slice(tail);
+            pos += tail.len();
+        }
+        len = pos;
     } else if let Some(content) = static_proc_content(path) {
         // Static global /proc nodes that real distro roots + glibc read
         // constantly (T2-T1a).  Pure content generation; same shape as the
@@ -7437,7 +7522,15 @@ fn handle_sched_getaffinity(caller_port: u64, args: &[u64; 6]) -> u64 {
     // Fill mask with CPU 0 set (byte 0 = 0x01, rest = 0x00).
     let size = cpusetsize.min(128); // cap at 1024 CPUs
     let mut mask = [0u8; 128];
-    mask[0] = 1; // CPU 0
+    // #275 SMP view: set bits 0..N online CPUs.  With SMP_VIEW off, N==1 → only
+    // bit 0 (CPU 0), identical to the prior uniprocessor mask.
+    let n = linux_ncpus();
+    for cpu in 0..n {
+        let byte = cpu / 8;
+        if byte < mask.len() {
+            mask[byte] |= 1 << (cpu % 8);
+        }
+    }
     let written = syscall::personality_copy_out(caller_port, mask_va, &mask[..size]);
     if written < size { return linux_err(EFAULT); }
     size as u64 // returns number of bytes written
