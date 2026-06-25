@@ -1,9 +1,10 @@
 # #274 — Linux signal completeness (EINTR / ERESTARTSYS / SA_SIGINFO) — plan
 
-Status: **scoped 2026-06-25** (host-independent investigation, verified vs code).
-Not started — this is a multi-phase Linux-personality feature requiring
-boot-validation; banked as a plan. Related: tasks #187-191 (the async-park
-sweep that created the gap), [[project_deferred_reply]].
+Status: **Phase 0 IMPLEMENTED flag-gated 2026-06-25 (commit da36502)** — EINTR for
+futex/poll parked callers behind `const SIGNAL_INTERRUPT=false` (dormant; build-clean
+5-arch). See memory/project_274_signals_phase0.md. Remaining phases below not started.
+Multi-phase Linux-personality feature requiring boot-validation. Related: tasks
+#187-191 (the async-park sweep that created the gap), [[project_deferred_reply]].
 
 ## The gap
 The personality has ONE working synchronous signal hook,
