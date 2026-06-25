@@ -6771,7 +6771,7 @@ fn open_proc_file(pi: usize, caller_port: u64, path: &[u8], flags: u64) -> u64 {
         // #275: real memory accounting from the tracked VMAs + heap, plus a live
         // thread count.  VmRSS is reported equal to VmSize (best-effort: residency
         // is not tracked separately).  Numbers are in kB.
-        let (total_bytes, heap_bytes) = proc_vm_bytes(pi);
+        let (total_bytes, heap_bytes) = proc_vm_bytes(pi, caller_port);
         let total_kb = total_bytes / 1024;
         let heap_kb = heap_bytes / 1024;
         let threads = proc_thread_count(pi);
@@ -6842,7 +6842,7 @@ fn open_proc_file(pi: usize, caller_port: u64, path: &[u8], flags: u64) -> u64 {
         // #275: "size resident shared text lib data dt", in 4 KiB pages.
         // Best-effort from tracked VMAs + heap; the exe text + stack are untracked
         // (reported 0) and residency is not separated (resident == size).
-        let (total_bytes, heap_bytes) = proc_vm_bytes(pi);
+        let (total_bytes, heap_bytes) = proc_vm_bytes(pi, caller_port);
         let total_pg = total_bytes / 4096;
         let heap_pg = heap_bytes / 4096;
         let mut pos = 0;
@@ -8891,24 +8891,59 @@ fn fmt_maps_line(out: &mut [u8], start: usize, end: usize, perms: &[u8; 4], name
     pos
 }
 
-/// #275: best-effort process memory accounting from the tracked VMAs + heap,
-/// for /proc/self/{statm,status}.  Returns (total_bytes, heap_bytes).  Does NOT
-/// include the exe text/data or stack (untracked — execve-side, see maps notes),
-/// so it under-counts, but it is far more meaningful than the prior constant.
-fn proc_vm_bytes(pi: usize) -> (usize, usize) {
-    unsafe {
-        let regs = PROC_TABLE[pi].mmap_regions;
-        let mut total = 0usize;
-        for i in 0..MAX_MMAP_REGIONS {
-            if regs[i].start != 0 && regs[i].end > regs[i].start {
-                total += regs[i].end - regs[i].start;
-            }
-        }
-        let brk_base = PROC_TABLE[pi].brk_base;
-        let brk_cur = PROC_TABLE[pi].brk_current;
-        let heap = if brk_base != 0 && brk_cur > brk_base { brk_cur - brk_base } else { 0 };
-        (total + heap, heap)
+/// #275: total mapped bytes from the authoritative kernel VMA list (the sum of
+/// every VMA: text/data/bss/stack/heap/anon).  None on enumeration error/empty
+/// so callers fall back to the tracked estimate.
+fn proc_vm_total_kernel(caller_port: u64) -> Option<usize> {
+    let mut vbuf = [0u8; 64 * 24];
+    let vcount =
+        syscall::personality_enumerate_vmas(caller_port, vbuf.as_mut_ptr() as u64, vbuf.len() as u64);
+    if (vcount as i64) <= 0 {
+        return None;
     }
+    let n = (vcount as usize).min(64);
+    let mut total = 0usize;
+    for i in 0..n {
+        let off = i * 24;
+        let mut start = 0u64;
+        let mut end = 0u64;
+        let mut k = 0;
+        while k < 8 {
+            start |= (vbuf[off + k] as u64) << (k * 8);
+            end |= (vbuf[off + 8 + k] as u64) << (k * 8);
+            k += 1;
+        }
+        if end > start {
+            total += (end - start) as usize;
+        }
+    }
+    Some(total)
+}
+
+/// #275: process memory accounting for /proc/self/{statm,status}.  Returns
+/// (total_bytes, heap_bytes).  `total` is the authoritative kernel VMA sum (the
+/// COMPLETE layout incl. exe text/data + stack); it falls back to the tracked
+/// mmap_regions + heap (which under-counts exe+stack) if the enumeration is
+/// unavailable.  `heap` is the brk delta (for VmData / statm's data field).
+fn proc_vm_bytes(pi: usize, caller_port: u64) -> (usize, usize) {
+    let (brk_base, brk_cur) = unsafe { (PROC_TABLE[pi].brk_base, PROC_TABLE[pi].brk_current) };
+    let heap = if brk_base != 0 && brk_cur > brk_base { brk_cur - brk_base } else { 0 };
+    let total = match proc_vm_total_kernel(caller_port) {
+        Some(kt) => kt, // authoritative: all VMAs (the heap VMA is already counted)
+        None => {
+            let mut t = 0usize;
+            unsafe {
+                let regs = PROC_TABLE[pi].mmap_regions;
+                for i in 0..MAX_MMAP_REGIONS {
+                    if regs[i].start != 0 && regs[i].end > regs[i].start {
+                        t += regs[i].end - regs[i].start;
+                    }
+                }
+            }
+            t + heap
+        }
+    };
+    (total, heap)
 }
 
 /// #275: live thread count = leader + active CLONE_THREAD ports (Phase 174).
