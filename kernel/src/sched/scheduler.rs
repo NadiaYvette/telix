@@ -5875,10 +5875,21 @@ fn percpu_pick_next_cosched_and_claim(
     if prev_group != 0 && rq.cosched_burst < MAX_COSCHED_BURST {
         if let Some(tid) = rq.pop_for_group(prev_group) {
             thread_ref(tid).in_queue.store(false, Ordering::Release);
+            // #262 fix: bring the cosched helper to parity with
+            // percpu_pick_next_and_claim (fix B) — publish the in-flight claim
+            // (so a concurrent reclaim_stale_on_cpu on a peer doesn't steal our
+            // just-claimed tid) and, on CAS-fail, RECLAIM a stale-real-cpu orphan
+            // instead of dropping it (the cosched helper was missing reclaim
+            // entirely → the rv64 stuck-rescue regression).  reclaim_stale_on_cpu
+            // takes NO rq lock, so it is safe here under the rq lock (unlike
+            // percpu_enqueue — see the deferred re-enqueue follow-up in
+            // project_262_cosched_reclaim_gap).
+            pcpu.dispatching_tid.store(tid as u32, Ordering::Release);
             if thread_ref(tid)
                 .on_cpu
                 .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
+                || reclaim_stale_on_cpu(tid, cpu)
             {
                 record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
                 thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
@@ -5899,6 +5910,7 @@ fn percpu_pick_next_cosched_and_claim(
                 rq.cosched_burst += 1;
                 return tid;
             }
+            pcpu.dispatching_tid.store(0, Ordering::Release); // #262: clear lost claim
             DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -5910,10 +5922,14 @@ fn percpu_pick_next_cosched_and_claim(
             None => break,
         };
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        // #262: publish in-flight claim + reclaim a stale orphan (parity with the
+        // non-cosched helper; safe under the rq lock — reclaim takes no rq lock).
+        pcpu.dispatching_tid.store(tid as u32, Ordering::Release);
         if thread_ref(tid)
             .on_cpu
             .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+            || reclaim_stale_on_cpu(tid, cpu)
         {
             record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
             thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
@@ -5931,16 +5947,21 @@ fn percpu_pick_next_cosched_and_claim(
             DISPATCH_CLAIM_SELF_PICK.fetch_add(1, Ordering::Relaxed);
             return tid;
         }
+        pcpu.dispatching_tid.store(0, Ordering::Release); // #262: clear lost claim
         DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
     }
     drop(rq);
     // try_steal fallback.
     if let Some(tid) = try_steal(cpu) {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        // #262: publish in-flight claim + reclaim a stale orphan (parity; the rq
+        // lock is already dropped here, so this is plain).
+        pcpu.dispatching_tid.store(tid as u32, Ordering::Release);
         if thread_ref(tid)
             .on_cpu
             .compare_exchange(ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+            || reclaim_stale_on_cpu(tid, cpu)
         {
             record_trans(tid as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
             thread_ref(tid).on_cpu_set_by.store(set_by, Ordering::Relaxed);
@@ -5959,6 +5980,7 @@ fn percpu_pick_next_cosched_and_claim(
             DISPATCH_CLAIM_SELF_PICK.fetch_add(1, Ordering::Relaxed);
             return tid;
         }
+        pcpu.dispatching_tid.store(0, Ordering::Release); // #262: clear lost claim
         DISPATCH_CLAIM_FAIL.fetch_add(1, Ordering::Relaxed);
     }
     idle_id
