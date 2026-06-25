@@ -1,7 +1,8 @@
 # #173 dispatch-protocol window-collapse refactor — design
 
-Status: **steps 1, 2, 3b, and 4 landed (flag-gated, dormant); step 3 residuals +
-step 5 (validation boot) pending.** Step 1 (loom) DONE 2026-06-24 —
+Status: **steps 1–4 + telemetry landed (flag-gated, default OFF); VALIDATED
+2026-06-25 — SAFE but does NOT fix the 145e stall (it targets the wrong window).
+See "Step 5 — validation result" below.** Step 1 (loom) DONE 2026-06-24 —
 `tests/loom-dispatch-window` **5/5**,
 and it REFINED the design: the resume-side re-check must be a **CAS-commit, not a
 load** (a load is TOCTOU; see Proposed design §2 + Loom plan). Step 2 (resume-side
@@ -153,9 +154,45 @@ the CAS-vs-CAS exclusivity, not the word it lives in.
    x86_64 + aarch64. EVERY dispatch path is now window-protected when the flag is
    on. (arm-without-commit would be unsafe — a reclaimer could steal a claim the
    tail still switches to — so each tail got the full arm+commit.)
-5. Flip the flag on; validate at 145e under isolation (does the systemic stall
-   clear? watch the orphan-tid count + RESCUE/HOST_PAUSE counters) + a no-burner
-   control + a stress fleet.
+5. **DONE 2026-06-25 — see "Step 5 — validation result" below.** Flag-on boots at
+   145e under core-isolation; WINDOW-DIAG telemetry added to read the counters.
+
+## Step 5 — validation result (2026-06-25): SAFE, but WRONG WINDOW
+Two flag-on boots (`dispatch_window_recheck=1`, telix pinned to cores 16-19, pgcl
+pinned 0-15, KVM) under heavy host memory pressure (pgcl MM/swap torture →
+host-pause storm):
+- **wc173a** — 600s, `host_pause_peers=1277`, **0 crashes**, stalled at 145e
+  (`PICK-LOCATE: stuck tid=16`).
+- **wc173b** — 360s, reached Phase 5v + Linux personality, `host_pause_peers=453`,
+  **0 crashes**, stalled at 145e (`PENDING-STUCK-LOW tid=20`, `stuck tid=13`).
+- Both, full-boot `WINDOW-DIAG`: **`recheck=1 reclaim=0 stolen=0`** — flag genuinely
+  ON, yet step 2's resume-commit NEVER bailed and step 3b's reclaimer NEVER engaged.
+
+**Conclusions:**
+1. **SAFE** — first runtime exercise of the flag-on path under an extreme
+   host-pause storm: 0 double-dispatch / #GP / #PF / #UD. The #208-family fear is
+   refuted; the loom-proven primitive holds.
+2. **Does NOT fix 145e — it targets the wrong window.** The stuck threads are
+   stranded at `on_cpu = ON_CPU_PENDING` (the `PENDING-STUCK-LOW` signature, last
+   trace `evt=3`) — the **phantom-pending window** (pick → set_pending → the claim
+   CAS never succeeds), which is *before* the claim. `dispatch_claim` is only armed
+   *after* a successful claim CAS, so a pre-claim-stuck thread is structurally
+   invisible to it → `reclaim=0/stolen=0` by construction.
+3. **Why the design doc was wrong:** it assumed "pop→stamp(PENDING)→CAS is already
+   collapsed by the `_and_claim` helpers" — but those run only under
+   `DISPATCH_USE_CLAIM_HELPER`, which is OFF (the 2026-06-18 dead-end). In the
+   production legacy path that window is OPEN, and *that* is where 145e stalls — the
+   claim→switch window this refactor closes is a different, narrower, and
+   (empirically, reclaim=0) non-binding window.
+
+**Disposition:** keep the refactor (steps 1–4 + WINDOW-DIAG) — flag-gated **default
+OFF** — as loom-proven, safe latent hardening for the claim→switch window (same
+status as the rescue-CAS / Tier-0 increments: correct, kept, not the gate-opener).
+The real 145e fix is the **phantom-pending (pre-claim) window** = the original #173
+"collapse pick→set_pending→CAS atomic" goal, whose only implementation so far (the
+claim helper) is a deep-boot-regressing dead-end. So 145e needs a NEW approach to
+the pre-claim window (or host-side pause elimination), tracked separately. This
+refactor is complete and dispositioned; it is not that fix.
 
 ## Risk
 HIGHEST in the codebase — this is the #208 double-dispatch family's home. The
