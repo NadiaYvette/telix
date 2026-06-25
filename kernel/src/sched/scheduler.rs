@@ -5793,6 +5793,55 @@ pub static DISPATCH_WINDOW_RECLAIMS: core::sync::atomic::AtomicU64 =
 /// `dispatch_claim` "no owner" sentinel (mirrors on_cpu's u32::MAX = none).
 const DISPATCH_CLAIM_NONE: u32 = u32::MAX;
 
+/// #173 step 4: ARM the claim→switch arbiter for `next_id` on `cpu`.  Call right
+/// after `set_current_thread(next)` at a dispatch tail, ONLY for non-idle next.
+/// Mirrors try_switch's inlined arm.  Inert unless DISPATCH_WINDOW_RECHECK.
+#[inline]
+fn dispatch_window_arm(next_id: ThreadId, cpu: u32) {
+    if DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+        thread_ref(next_id).dispatch_claim.store(cpu, Ordering::Release);
+    }
+}
+
+/// #173 step 4: resume-side CAS-commit of the claim, immediately before the asm
+/// switch.  Returns `true` if `next_id` may be switched to; `false` if a
+/// host-pause-exempt reclaimer (step 3) stole the claim while this CPU was paused
+/// since the arm — in which case the caller MUST bail (do NOT switch to next, or
+/// it double-executes; the #208 family).  MUST be paired with a prior
+/// `dispatch_window_arm` for the same `(next_id, cpu)` and called ONLY for
+/// non-idle next (an un-armed thread reads `dispatch_claim == MAX`, which is
+/// indistinguishable from "stolen").  loom-dispatch-window:
+/// `cas_commit_is_exclusive`.  Inert (always `true`) unless DISPATCH_WINDOW_RECHECK.
+#[inline]
+#[must_use]
+fn dispatch_window_commit(next_id: ThreadId, cpu: u32) -> bool {
+    if !DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+        return true;
+    }
+    if thread_ref(next_id)
+        .dispatch_claim
+        .compare_exchange(cpu, DISPATCH_CLAIM_NONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        true
+    } else {
+        DISPATCH_WINDOW_STOLEN.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// #173 step 4: RELEASE the arbiter when a dispatch tail abandons a switch to an
+/// already-armed `next_id` via a post-arm bail that does NOT reach the commit.
+/// Inert unless DISPATCH_WINDOW_RECHECK.
+#[inline]
+fn dispatch_window_release(next_id: ThreadId) {
+    if DISPATCH_WINDOW_RECHECK.load(Ordering::Relaxed) {
+        thread_ref(next_id)
+            .dispatch_claim
+            .store(DISPATCH_CLAIM_NONE, Ordering::Release);
+    }
+}
+
 /// #173 Phase 3c: cosched-aware variant of `percpu_pick_next_and_claim`.
 ///
 /// Mirrors `percpu_pick_next_cosched`'s prev-group preference and adds
@@ -8902,12 +8951,24 @@ pub fn voluntary_reschedule() {
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     }
 
-    let next_t = unsafe { thread_mut_from_ref(next_id) };
     set_current_thread(pcpu, next_id);
     if next_id != idle_id {
         pcpu.dispatching_tid.store(0, Ordering::Release);
+        // #173 step 4: ARM the claim→switch arbiter while we still hold the claim.
+        dispatch_window_arm(next_id, cpu);
     }
-    let next_sp = next_t.saved_sp;
+    let mut next_sp = thread_ref(next_id).saved_sp;
+
+    // #173 step 4: resume-side CAS-commit before the asm switch (the
+    // pending_switch_sp store below is the handoff the exception return consumes).
+    // If a step-3 host-pause-exempt reclaimer stole next's claim while this CPU
+    // was paused since the arm, switch to idle instead of double-executing next
+    // (which now runs on the reclaimer's CPU).  cur is released either way.
+    if next_id != idle_id && !dispatch_window_commit(next_id, cpu) {
+        set_current_thread(pcpu, idle_id);
+        unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+        next_sp = thread_ref(idle_id).saved_sp;
+    }
 
     // #208/DD fix: commit path only (the bail above returns without switching and
     // restores cur.on_cpu=cpu).  Stash cur for the off-kstack RELEASING→PENDING
@@ -12365,6 +12426,10 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     set_current_thread(pcpu, next_id);
+    // #173 step 4: ARM the claim→switch arbiter while we hold the claim.
+    if next_id != idle_id {
+        dispatch_window_arm(next_id, cpu_idx);
+    }
     let next_sp = next_t.saved_sp;
 
     // Sanity check: saved_sp must be within the thread's kstack.
@@ -12399,6 +12464,8 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             );
             // Kill this thread and switch to idle instead.
             thread_ref(next_id).killed.store(true, Ordering::Release);
+            // #173 step 4: not switching to next_id — release its claim arbiter.
+            dispatch_window_release(next_id);
             let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
@@ -12424,7 +12491,18 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // With preemptive syscalls, a timer between current_thread update and
     // the exception handler consuming pending_switch would corrupt state:
     // try_switch would see the wrong current_thread on the old thread's stack.
-    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
+    // #173 step 4: resume-side CAS-commit before the asm-switch handoff.  If a
+    // step-3 host-pause-exempt reclaimer stole next's claim while this CPU was
+    // paused since the arm, switch to idle instead of double-executing next (the
+    // parked thread is already COMMITTED to parking and will be woken normally).
+    let switch_sp = if next_id != idle_id && !dispatch_window_commit(next_id, cpu_idx) {
+        set_current_thread(pcpu, idle_id);
+        unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+        thread_ref(idle_id).saved_sp
+    } else {
+        next_sp
+    };
+    pending_switch_sp()[cpu].store(switch_sp, Ordering::Release);
 
     // Scheduler activation: notify userspace that a kthread blocked.
     if sa_enabled {
@@ -12593,7 +12671,22 @@ pub fn park_faulting_from_ist(frame_sp: u64) -> u64 {
     }
 
     set_current_thread(pcpu, next_id);
-    let next_sp = thread_ref(next_id).saved_sp;
+    // #173 step 4: ARM the claim→switch arbiter while we hold the claim.
+    if next_id != idle_id {
+        dispatch_window_arm(next_id, cpu);
+    }
+    // #173 step 4: resume-side CAS-commit before returning the sp the caller
+    // switches to.  If a step-3 host-pause-exempt reclaimer stole next's claim
+    // while this CPU was paused since the arm, return idle's sp instead of
+    // double-executing next (the faulting thread is parked on PagerWait and will
+    // be woken by async_pf_wake).
+    let next_sp = if next_id != idle_id && !dispatch_window_commit(next_id, cpu) {
+        unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+        set_current_thread(pcpu, idle_id);
+        thread_ref(idle_id).saved_sp
+    } else {
+        thread_ref(next_id).saved_sp
+    };
     let _ = irq_saved;
     next_sp
 }
@@ -14469,6 +14562,10 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     set_current_thread(pcpu, next_id);
+    // #173 step 4: ARM the claim→switch arbiter while we hold the claim.
+    if next_id != idle_id {
+        dispatch_window_arm(next_id, cpu_idx);
+    }
     let next_sp = next_t.saved_sp;
 
     // Reprogram the one-shot timer so this CPU wakes at the sleep deadline.
@@ -14480,8 +14577,19 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     // Mark park-switch-pending (see park_current_for_ipc for explanation).
     park_switch_pending()[cpu].store(true, Ordering::Release);
 
+    // #173 step 4: resume-side CAS-commit before the asm-switch handoff.  If a
+    // step-3 host-pause-exempt reclaimer stole next's claim while this CPU was
+    // paused since the arm, switch to idle instead of double-executing next (the
+    // sleeping thread is sleep-queue-inserted and will be woken at its deadline).
+    let switch_sp = if next_id != idle_id && !dispatch_window_commit(next_id, cpu_idx) {
+        set_current_thread(pcpu, idle_id);
+        unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+        thread_ref(idle_id).saved_sp
+    } else {
+        next_sp
+    };
     // Store pending_switch before restoring IRQs — see park_current_for_ipc.
-    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
+    pending_switch_sp()[cpu].store(switch_sp, Ordering::Release);
 
     if sa_enabled {
         let tptr = TASK_TABLE.get(parked_task_id) as *mut Task;

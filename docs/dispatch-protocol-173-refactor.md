@@ -1,7 +1,8 @@
 # #173 dispatch-protocol window-collapse refactor — design
 
-Status: **steps 1, 2, and 3b landed (flag-gated, dormant); step 3 residuals + 4 +
-5 pending.** Step 1 (loom) DONE 2026-06-24 — `tests/loom-dispatch-window` **5/5**,
+Status: **steps 1, 2, 3b, and 4 landed (flag-gated, dormant); step 3 residuals +
+step 5 (validation boot) pending.** Step 1 (loom) DONE 2026-06-24 —
+`tests/loom-dispatch-window` **5/5**,
 and it REFINED the design: the resume-side re-check must be a **CAS-commit, not a
 load** (a load is TOCTOU; see Proposed design §2 + Loom plan). Step 2 (resume-side
 CAS-commit via a `dispatch_claim` word, behind `DISPATCH_WINDOW_RECHECK`, default
@@ -142,10 +143,16 @@ the CAS-vs-CAS exclusivity, not the word it lives in.
    (b) `set_on_cpu_pending`'s RUN_CLAIM_VIOLATION re-stamp is a latent arbiter-bypass
    in principle, but the audit found no live caller hits it on a claimed thread —
    noted, not wired (would want the step-0 boot probe to justify touching it).
-4. **PARTIAL** — ARM/COMMIT live in `try_switch` only. Extend to the other dispatch
-   tails (`voluntary_reschedule`, `park_current_for_*` pick tails). SAFE to defer:
-   those tails leave `dispatch_claim == MAX`, so 3b correctly skips threads they
-   dispatch — it's missing *coverage*, not a safety gap.
+4. **DONE 2026-06-25** — factored the dance into helpers (`dispatch_window_arm` /
+   `dispatch_window_commit` / `dispatch_window_release`) and wired all four
+   remaining dispatch tails: `voluntary_reschedule`, `park_current_for_ipc`
+   (+ release on its corrupt-frame kill bail), `park_faulting_from_ist`,
+   `park_current_for_sleep`. Each ARMs after its `set_current_thread(next)` and
+   COMMITs (bail to idle on steal) right before its asm-switch handoff (the
+   `pending_switch_sp` store, or the returned sp for park_faulting). Build-clean
+   x86_64 + aarch64. EVERY dispatch path is now window-protected when the flag is
+   on. (arm-without-commit would be unsafe — a reclaimer could steal a claim the
+   tail still switches to — so each tail got the full arm+commit.)
 5. Flip the flag on; validate at 145e under isolation (does the systemic stall
    clear? watch the orphan-tid count + RESCUE/HOST_PAUSE counters) + a no-burner
    control + a stress fleet.
