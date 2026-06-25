@@ -664,6 +664,28 @@ impl SigAction {
     }
 }
 
+/// #275: a tracked mmap VMA, used to generate a real /proc/self/maps.
+/// `start == 0` marks a free slot (mmap never returns NULL).  Recorded on a
+/// successful mmap(2), removed/trimmed on munmap(2).  Best-effort: mprotect
+/// prot-updates and the ELF text/data/bss + stack segments are not yet tracked
+/// (those remain placeholders in the maps output) — follow-ups under #275.
+/// `flags`: bit0 = file-backed, bit1 = MAP_SHARED.
+#[derive(Clone, Copy)]
+struct MmapRegion {
+    start: usize,
+    end: usize,
+    prot: u8,
+    flags: u8,
+}
+impl MmapRegion {
+    const fn empty() -> Self { Self { start: 0, end: 0, prot: 0, flags: 0 } }
+}
+/// Per-process cap on tracked VMAs.  A glibc process maps ld.so + libc + a few
+/// libs + anon arenas (~20-30 segments); 48 leaves headroom.  On overflow the
+/// table records what fits and the maps output is honestly incomplete (rather
+/// than unbounded static memory on the swap-tight host).
+const MAX_MMAP_REGIONS: usize = 48;
+
 #[derive(Clone, Copy)]
 struct ProcessState {
     active: bool,
@@ -692,6 +714,8 @@ struct ProcessState {
     // process-wide `clear_child_tid` field above is the leader's only.
     // Index parallels `thread_ports`. 0 means "not set / inactive".
     thread_clear_child_tid: [usize; 8],
+    // #275: tracked mmap VMAs for a real /proc/self/maps (see MmapRegion).
+    mmap_regions: [MmapRegion; MAX_MMAP_REGIONS],
 }
 
 impl ProcessState {
@@ -716,6 +740,7 @@ impl ProcessState {
             sig_altstack_flags: 0,
             thread_ports: [0u64; 8],
             thread_clear_child_tid: [0usize; 8],
+            mmap_regions: [const { MmapRegion::empty() }; MAX_MMAP_REGIONS],
         }
     }
 }
@@ -6493,43 +6518,50 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
     let len: usize;
 
     if path == b"/proc/self/maps" {
-        // Generate maps with text region + heap (if brk is set).
+        // #275: emit the real tracked mmap VMAs (address-sorted) + the heap (real,
+        // from brk) + a best-effort stack placeholder.  The main exe's text/data
+        // segments (loaded by execve, not via mmap) and the exact stack bounds are
+        // not yet tracked, so the prior fabricated "[text]" line is dropped (it was
+        // wrong for every PIE binary) and the stack stays an approximate placeholder
+        // — both are follow-ups (need execve load-base + stack-base tracking).
+        // Anonymous mappings carry no name, matching Linux.
         let mut pos = 0;
-        // Text segment placeholder.
-        let line1 = b"00400000-00401000 r-xp 00000000 00:00 0  [text]\n";
-        let n1 = line1.len().min(PROCBUF_SIZE - pos);
-        buf[pos..pos + n1].copy_from_slice(&line1[..n1]);
-        pos += n1;
-        // Heap region if brk is active.
         unsafe {
-            let brk_base = PROC_TABLE[pi].brk_base;
-            let brk_cur = PROC_TABLE[pi].brk_current;
-            if brk_base != 0 && brk_cur > brk_base && pos + 60 < PROCBUF_SIZE {
-                // Format: "XXXXXXXX-YYYYYYYY rw-p 00000000 00:00 0  [heap]\n"
-                fn hex8(val: usize, out: &mut [u8]) {
-                    for i in 0..8 {
-                        let nib = (val >> (28 - i * 4)) & 0xF;
-                        out[i] = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
+            let regs = PROC_TABLE[pi].mmap_regions;
+            // Selection-emit lowest-base-first so the output is address-ordered
+            // (some maps parsers assume sorted entries).  N <= MAX_MMAP_REGIONS.
+            let mut emitted = [false; MAX_MMAP_REGIONS];
+            loop {
+                let mut best = usize::MAX;
+                let mut best_start = usize::MAX;
+                for i in 0..MAX_MMAP_REGIONS {
+                    if regs[i].start != 0 && !emitted[i] && regs[i].start < best_start {
+                        best = i;
+                        best_start = regs[i].start;
                     }
                 }
-                hex8(brk_base, &mut buf[pos..]);
-                pos += 8;
-                buf[pos] = b'-'; pos += 1;
-                hex8(brk_cur, &mut buf[pos..]);
-                pos += 8;
-                let suffix = b" rw-p 00000000 00:00 0  [heap]\n";
-                let n2 = suffix.len().min(PROCBUF_SIZE - pos);
-                buf[pos..pos + n2].copy_from_slice(&suffix[..n2]);
-                pos += n2;
+                if best == usize::MAX { break; }
+                emitted[best] = true;
+                let r = regs[best];
+                let perms = [
+                    if r.prot & 0x1 != 0 { b'r' } else { b'-' },
+                    if r.prot & 0x2 != 0 { b'w' } else { b'-' },
+                    if r.prot & 0x4 != 0 { b'x' } else { b'-' },
+                    if r.flags & 0x2 != 0 { b's' } else { b'p' }, // MAP_SHARED → 's'
+                ];
+                let w = fmt_maps_line(&mut buf[pos..], r.start, r.end, &perms, b"");
+                if w == 0 { break; } // buffer full
+                pos += w;
+            }
+            // Heap (real, from brk).
+            let brk_base = PROC_TABLE[pi].brk_base;
+            let brk_cur = PROC_TABLE[pi].brk_current;
+            if brk_base != 0 && brk_cur > brk_base {
+                pos += fmt_maps_line(&mut buf[pos..], brk_base, brk_cur, b"rw-p", b"[heap]");
             }
         }
-        // Stack placeholder.
-        if pos + 60 < PROCBUF_SIZE {
-            let stack = b"7fff00000000-7fff00010000 rw-p 00000000 00:00 0  [stack]\n";
-            let n3 = stack.len().min(PROCBUF_SIZE - pos);
-            buf[pos..pos + n3].copy_from_slice(&stack[..n3]);
-            pos += n3;
-        }
+        // Stack: best-effort placeholder (exact bounds not yet tracked).
+        pos += fmt_maps_line(&mut buf[pos..], 0x7fff_0000_0000, 0x7fff_0001_0000, b"rw-p", b"[stack]");
         len = pos;
     } else if path == b"/proc/self/status" {
         // Minimal /proc/self/status with fields glibc checks.
@@ -8485,6 +8517,108 @@ fn linux_prot_to_kernel(lprot: u64) -> u64 {
 }
 
 /// Handle Linux mmap(addr, length, prot, flags, fd, offset).
+/// #275: record a successful mmap(2) as a tracked VMA for /proc/self/maps.
+/// `lin_prot`/`lin_flags` are the raw Linux mmap args; `file_backed` is fd >= 0.
+/// Best-effort: a re-map of the same base overwrites the slot; on table overflow
+/// it silently drops the record (the maps output is then honestly incomplete).
+fn mmap_region_record(pi: usize, start: usize, len: usize, lin_prot: u64, lin_flags: u64, file_backed: bool) {
+    if start == 0 || len == 0 { return; }
+    // mmap is page-granular; round the length up to a 4 KiB page so `end` is
+    // page-aligned even if the caller passed an unaligned length.
+    let end = start.wrapping_add((len + 0xFFF) & !0xFFF);
+    if end <= start { return; }
+    let prot = (lin_prot & 0x7) as u8; // PROT_READ | PROT_WRITE | PROT_EXEC
+    let mut flags = 0u8;
+    if file_backed { flags |= 1; }
+    if lin_flags & 0x1 != 0 { flags |= 2; } // MAP_SHARED
+    unsafe {
+        let regs = &mut PROC_TABLE[pi].mmap_regions;
+        let mut slot = usize::MAX;
+        for i in 0..MAX_MMAP_REGIONS {
+            if regs[i].start == start { slot = i; break; }          // overwrite same-base remap
+            if slot == usize::MAX && regs[i].start == 0 { slot = i; } // else first free slot
+        }
+        if slot != usize::MAX {
+            regs[slot] = MmapRegion { start, end, prot, flags };
+        }
+        // else: table full — drop (best-effort; the maps view is then incomplete).
+    }
+}
+
+/// #275: drop/trim the tracked VMA at `addr` on munmap(2).  Telix's
+/// personality_munmap takes only the base address (whole-region unmap), so an
+/// exact base match frees the slot; an address inside a region trims its tail
+/// (best-effort partial unmap — a mid-region punch leaves the lower part).
+fn mmap_region_remove(pi: usize, addr: usize) {
+    if addr == 0 { return; }
+    unsafe {
+        let regs = &mut PROC_TABLE[pi].mmap_regions;
+        for i in 0..MAX_MMAP_REGIONS {
+            let r = regs[i];
+            if r.start == 0 { continue; }
+            if r.start == addr {
+                regs[i].start = 0; // free the slot (whole-region unmap)
+            } else if addr > r.start && addr < r.end {
+                regs[i].end = addr; // tail-trim (partial unmap)
+            }
+        }
+    }
+}
+
+/// #275: update the tracked prot of VMA(s) on mprotect(2).  Best-effort: updates
+/// regions fully covered by [addr, addr+len) — this catches the common ld.so
+/// "mmap a segment, then mprotect it to its final perms" pattern.  A partial
+/// mprotect that would split a region is left as-is (splitting is a follow-up).
+fn mmap_region_chprot(pi: usize, addr: usize, len: usize, lin_prot: u64) {
+    if addr == 0 || len == 0 { return; }
+    let end = addr.wrapping_add((len + 0xFFF) & !0xFFF);
+    let prot = (lin_prot & 0x7) as u8;
+    unsafe {
+        let regs = &mut PROC_TABLE[pi].mmap_regions;
+        for i in 0..MAX_MMAP_REGIONS {
+            let r = regs[i];
+            if r.start != 0 && r.start >= addr && r.end <= end {
+                regs[i].prot = prot; // fully covered → update prot
+            }
+        }
+    }
+}
+
+/// #275: format one /proc/self/maps line into `out`, returning bytes written
+/// (0 if it would not fit).  Matches the Linux kernel layout
+/// "start-end perms offset dev inode  path\n" with minimal-width lowercase-hex
+/// addresses.  offset/dev/inode are zeroed (we do not track them); `name` is
+/// empty for anonymous mappings.
+fn fmt_maps_line(out: &mut [u8], start: usize, end: usize, perms: &[u8; 4], name: &[u8]) -> usize {
+    // Worst case: 16 hex + '-' + 16 hex + ' ' + 4 perms + 18-byte middle + name + '\n'.
+    if out.len() < 58 + name.len() { return 0; }
+    fn put_hex(out: &mut [u8], mut pos: usize, val: usize) -> usize {
+        if val == 0 { out[pos] = b'0'; return pos + 1; }
+        let mut shift: i32 = 60;
+        while shift >= 0 && ((val >> shift) & 0xF) == 0 { shift -= 4; }
+        while shift >= 0 {
+            let nib = ((val >> shift) & 0xF) as u8;
+            out[pos] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+            pos += 1;
+            shift -= 4;
+        }
+        pos
+    }
+    let mut pos = 0;
+    pos = put_hex(out, pos, start);
+    out[pos] = b'-'; pos += 1;
+    pos = put_hex(out, pos, end);
+    out[pos] = b' '; pos += 1;
+    out[pos..pos + 4].copy_from_slice(perms); pos += 4;
+    let mid = b" 00000000 00:00 0 ";
+    out[pos..pos + mid.len()].copy_from_slice(mid); pos += mid.len();
+    if !name.is_empty() {
+        out[pos..pos + name.len()].copy_from_slice(name); pos += name.len();
+    }
+    out[pos] = b'\n'; pos += 1;
+    pos
+}
+
 /// Supports anonymous and file-backed (MAP_PRIVATE) mappings.
 fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let addr = args[0];
@@ -15573,16 +15707,32 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_CLONE3 => handle_clone3(pi, caller_port, &msg.data),
 
             // mmap: anonymous or file-backed mapping in caller's address space.
-            __NR_MMAP => handle_mmap(pi, caller_port, &msg.data),
+            __NR_MMAP => {
+                let r = handle_mmap(pi, caller_port, &msg.data);
+                // #275: on success, record the VMA for /proc/self/maps. handle_mmap
+                // returns the mapped base (positive) or linux_err (negative-as-u64);
+                // msg.data: [1]=len, [2]=prot, [3]=flags, [4]=fd (file-backed if >= 0).
+                if (r as i64) >= 0 {
+                    mmap_region_record(pi, r as usize, msg.data[1] as usize,
+                                       msg.data[2], msg.data[3], (msg.data[4] as i64) >= 0);
+                }
+                r
+            }
             __NR_MPROTECT => {
                 let addr = msg.data[0] as usize;
                 let len = msg.data[1] as usize;
                 let kprot = linux_prot_to_kernel(msg.data[2]) as u8;
-                if syscall::personality_mprotect(caller_port, addr, len, kprot) { 0 } else { linux_err(ENOSYS) }
+                if syscall::personality_mprotect(caller_port, addr, len, kprot) {
+                    mmap_region_chprot(pi, addr, len, msg.data[2]); // #275: keep maps prot current
+                    0
+                } else { linux_err(ENOSYS) }
             }
             __NR_MUNMAP => {
                 let addr = msg.data[0] as usize;
-                if syscall::personality_munmap(caller_port, addr) { 0 } else { linux_err(ENOSYS) }
+                if syscall::personality_munmap(caller_port, addr) {
+                    mmap_region_remove(pi, addr); // #275: drop the tracked VMA
+                    0
+                } else { linux_err(ENOSYS) }
             }
             __NR_MREMAP => {
                 let old_addr = msg.data[0] as usize;
