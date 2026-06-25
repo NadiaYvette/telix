@@ -6492,6 +6492,33 @@ fn static_proc_content(path: &[u8]) -> Option<&'static [u8]> {
         b"/proc/filesystems" => b"nodev\tproc\nnodev\tsysfs\nnodev\ttmpfs\nnodev\tdevtmpfs\n\text4\n\tbtrfs\n",
         b"/proc/mounts" => b"rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\ndevtmpfs /dev devtmpfs rw,nosuid 0 0\ntmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n",
         b"/proc/self/mountinfo" => b"21 1 0:1 / / rw - rootfs rootfs rw\n22 21 0:2 / /proc rw - proc proc rw\n23 21 0:3 / /dev rw - devtmpfs devtmpfs rw\n24 21 0:4 / /tmp rw - tmpfs tmpfs rw\n",
+        // cgroup v2 unified hierarchy, root group — "not in a special cgroup".
+        // Container/cgroup detection (systemd, runtimes) reads this.
+        b"/proc/self/cgroup" => b"0::/\n",
+        // I/O accounting — zeros (no per-process I/O stats tracked).
+        b"/proc/self/io" => b"rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n",
+        b"/proc/self/wchan" => b"0\n",
+        // Resource limits table.  The getrlimit/prlimit64 syscalls are the
+        // authoritative source; this textual view mirrors them for tools that
+        // parse the file (esp. the "Max open files" RLIMIT_NOFILE line).
+        b"/proc/self/limits" =>
+            b"Limit                     Soft Limit           Hard Limit           Units\n\
+              Max cpu time              unlimited            unlimited            seconds\n\
+              Max file size             unlimited            unlimited            bytes\n\
+              Max data size             unlimited            unlimited            bytes\n\
+              Max stack size            8388608              unlimited            bytes\n\
+              Max core file size        0                    unlimited            bytes\n\
+              Max resident set          unlimited            unlimited            bytes\n\
+              Max processes             unlimited            unlimited            processes\n\
+              Max open files            1024                 1048576              files\n\
+              Max locked memory         65536                65536                bytes\n\
+              Max address space         unlimited            unlimited            bytes\n\
+              Max file locks            unlimited            unlimited            locks\n\
+              Max pending signals       8192                 8192                 signals\n\
+              Max msgqueue size         819200               819200               bytes\n\
+              Max nice priority         0                    0                    \n\
+              Max realtime priority     0                    0                    \n\
+              Max realtime timeout      unlimited            unlimited            us\n",
         b"/proc/sys/kernel/ostype" => b"Linux\n",
         b"/proc/sys/kernel/hostname" => b"telix\n",
         b"/proc/sys/kernel/pid_max" => b"32768\n",
