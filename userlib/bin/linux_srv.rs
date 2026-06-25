@@ -6262,18 +6262,9 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     }
 
     // Virtual /etc files — synthetic content for common config files.
-    let etc_content: Option<&[u8]> = match &path[..pathlen] {
-        b"/etc/passwd" => Some(b"root:x:0:0:root:/root:/bin/sh\n"),
-        b"/etc/group" => Some(b"root:x:0:\n"),
-        b"/etc/hosts" => Some(b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n"),
-        b"/etc/resolv.conf" => Some(b"nameserver 10.0.2.3\n"),
-        b"/etc/hostname" => Some(b"telix\n"),
-        b"/etc/nsswitch.conf" => Some(b"passwd: files\ngroup: files\nhosts: files dns\n"),
-        b"/etc/localtime" => None, // let VFS handle this (real zoneinfo file)
-        b"/etc/ld.so.cache" => Some(b""), // empty — no shared library cache
-        _ => None,
-    };
-    if let Some(content) = etc_content {
+    // (/etc/localtime is absent from the helper => falls through to the real VFS
+    // zoneinfo file, as before.)
+    if let Some(content) = static_etc_content(&path[..pathlen]) {
         return open_virtual_file(pi, content, flags);
     }
 
@@ -6557,6 +6548,31 @@ fn static_sys_content(path: &[u8]) -> Option<&'static [u8]> {
         // jemalloc/tcmalloc/Go/glibc-malloc probe these to choose an arena strategy.
         b"/sys/kernel/mm/transparent_hugepage/enabled" => b"always madvise [never]\n",
         b"/sys/kernel/mm/transparent_hugepage/defrag" => b"always defer defer+madvise madvise [never]\n",
+        _ => return None,
+    })
+}
+
+/// Static synthetic content for /etc config files.  Mirrors static_proc/sys_content;
+/// used by open() (-> open_virtual_file), stat() (-> S_IFREG), and access() (exists).
+/// /etc/localtime is intentionally absent so it falls through to the real VFS
+/// zoneinfo file.
+fn static_etc_content(path: &[u8]) -> Option<&'static [u8]> {
+    Some(match path {
+        b"/etc/passwd" => b"root:x:0:0:root:/root:/bin/sh\n",
+        b"/etc/group" => b"root:x:0:\n",
+        b"/etc/hosts" => b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n",
+        b"/etc/resolv.conf" => b"nameserver 10.0.2.3\n",
+        b"/etc/hostname" => b"telix\n",
+        b"/etc/nsswitch.conf" => b"passwd: files\ngroup: files\nhosts: files dns\n",
+        b"/etc/ld.so.cache" => b"", // empty — no shared library cache
+        // OS identity — read by systemd, D-Bus, GNOME, browsers, lsb_release.
+        b"/etc/os-release" => b"NAME=\"Telix\"\nID=telix\nVERSION=\"1.0\"\nVERSION_ID=\"1.0\"\nPRETTY_NAME=\"Telix 1.0\"\nHOME_URL=\"https://telix\"\n",
+        // Machine identity — D-Bus REQUIRES a 32-hex-char machine-id; GNOME,
+        // PulseAudio, systemd read it.  A fixed value is fine for one instance.
+        b"/etc/machine-id" => b"7e1a9c0b3d5f4286a1c8e0f24b6d8a13\n",
+        // Minimal getservbyname / getprotobyname databases.
+        b"/etc/services" => b"ftp\t21/tcp\nssh\t22/tcp\ntelnet\t23/tcp\nsmtp\t25/tcp\ndomain\t53/tcp\ndomain\t53/udp\nhttp\t80/tcp\nntp\t123/udp\nhttps\t443/tcp\n",
+        b"/etc/protocols" => b"ip\t0\tIP\nicmp\t1\tICMP\ntcp\t6\tTCP\nudp\t17\tUDP\nipv6\t41\tIPv6\n",
         _ => return None,
     })
 }
@@ -7183,13 +7199,7 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         || path[..pathlen] == *b"/proc/meminfo"
         || (pathlen >= 10 && &path[..10] == b"/proc/sys/") // any sysctl file (kernel/vm/fs/net)
         || static_sys_content(&path[..pathlen]).is_some() // /sys CPU topology + THP
-        || path[..pathlen] == *b"/etc/passwd"
-        || path[..pathlen] == *b"/etc/group"
-        || path[..pathlen] == *b"/etc/hosts"
-        || path[..pathlen] == *b"/etc/resolv.conf"
-        || path[..pathlen] == *b"/etc/hostname"
-        || path[..pathlen] == *b"/etc/nsswitch.conf"
-        || path[..pathlen] == *b"/etc/ld.so.cache";
+        || static_etc_content(&path[..pathlen]).is_some(); // /etc virtual config files
     if is_virtual_file {
         let mut stat_buf = [0u8; 144];
         let mode: u32 = 0o100444; // S_IFREG | 0444
@@ -7743,9 +7753,8 @@ fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // Virtual paths always exist.
     if (pathlen >= 5 && &path[..5] == b"/proc") || (pathlen >= 4 && &path[..4] == b"/dev/")
         || (pathlen >= 4 && &path[..4] == b"/run") || (pathlen >= 4 && &path[..4] == b"/tmp")
-        || path[..pathlen] == *b"/etc/passwd" || path[..pathlen] == *b"/etc/group"
-        || path[..pathlen] == *b"/etc/hosts" || path[..pathlen] == *b"/etc/resolv.conf"
-        || path[..pathlen] == *b"/etc/hostname" || path[..pathlen] == *b"/etc/nsswitch.conf"
+        || static_etc_content(&path[..pathlen]).is_some()  // /etc virtual config files
+        || static_sys_content(&path[..pathlen]).is_some()  // /sys (was missing here)
     {
         return 0;
     }
