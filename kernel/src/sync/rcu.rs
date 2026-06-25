@@ -244,6 +244,21 @@ pub fn rcu_defer_free(ptr: usize, free_fn: fn(usize)) {
     batch.entries[batch.len] = RcuCallback { ptr, free_fn };
     batch.len += 1;
     state.pending_count += 1;
+    // #260 FIX: re-stamp the batch epoch to THIS callback's generation (its
+    // unlink gen).  The epoch is set once at batch ALLOCATION (above); without
+    // re-stamping on append, a callback deferred LATE into the batch — unlinked
+    // at a higher gen than the batch's first entry — inherits the stale
+    // alloc-time epoch, and rcu_process_callbacks frees the whole batch when
+    // `b.epoch < min_gen` (line ~299) before a full grace period has elapsed
+    // since that late unlink.  A lock-free reader (e.g. Art::for_each/lookup)
+    // still walking the late-unlinked node then has its slab slot recycled out
+    // from under it = use-after-free (the #260 SCHED_THREAD_ART corruption / the
+    // #208 family).  Re-stamping on every append makes `epoch` the LATEST unlink
+    // gen in the batch, so the free gate waits a full grace period after the last
+    // unlink — covering every entry.  Strictly MORE conservative (frees later,
+    // never earlier) ⇒ cannot introduce a UAF, only hold a batch slightly longer.
+    // Loom-proven in tests/loom-art-rcu-reclaim (epoch_at_unlink_is_safe).
+    batch.epoch = rcu_gen()[cpu].load(Ordering::Relaxed);
 
     // If batch is full, move to pending list and start a new one. Use the
     // runtime page-fitted cap, NOT the static `BATCH_CAP` (which is sized
