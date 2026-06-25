@@ -126,6 +126,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             (b"/proc/self/maps\0", b"-"),                  // address ranges "start-end"
             (b"/proc/sys/kernel/cap_last_cap\0", b"40"),
             (b"/proc/sys/fs/nr_open\0", b"1048576"),
+            (b"/proc/cpuinfo\0", b"processor"),
+            (b"/proc/vmstat\0", b"pgfault"),
         ];
 
         let mut buf = [0u8; 4096];

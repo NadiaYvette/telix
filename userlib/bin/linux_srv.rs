@@ -155,6 +155,7 @@ const __NR_STATX: u64 = 332;
 const __NR_CLONE3: u64 = 435;
 const __NR_FSYNC: u64 = 74;
 const __NR_FDATASYNC: u64 = 75;
+const __NR_SYNC_FILE_RANGE: u64 = 277;
 const __NR_SYMLINK: u64 = 88;
 const __NR_LINK: u64 = 86;
 const __NR_SYMLINKAT: u64 = 266;
@@ -6476,6 +6477,9 @@ fn static_proc_content(path: &[u8]) -> Option<&'static [u8]> {
     Some(match path {
         b"/proc/uptime" => b"100.00 100.00\n",
         b"/proc/loadavg" => b"0.00 0.00 0.00 1/1 1\n",
+        // Minimal /proc/vmstat — common fields some memory monitors / runtimes read.
+        b"/proc/vmstat" => b"nr_free_pages 50000\nnr_anon_pages 0\nnr_mapped 0\nnr_file_pages 0\npgpgin 0\npgpgout 0\npswpin 0\npswpout 0\npgfault 0\npgmajfault 0\n",
+        b"/proc/swaps" => b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n",
         // One aggregate `cpu` line + one `cpu0` line (uniprocessor view).
         b"/proc/stat" => b"cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n",
         b"/proc/version" => b"Linux version 6.1.0-telix (telix@telix) (rustc) #1 SMP Telix\n",
@@ -6757,8 +6761,18 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
         pos += 3;
         len = pos;
     } else if path == b"/proc/cpuinfo" {
-        // Minimal /proc/cpuinfo — single core.
-        let content = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 142\nmodel name\t: QEMU Virtual CPU\nstepping\t: 1\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 sse3 ssse3 sse4_1 sse4_2\nbogomips\t: 4000.00\n\n";
+        // Minimal per-arch /proc/cpuinfo — single core (uniprocessor view,
+        // consistent with /sys cpu/online + sched_getaffinity).  Previously this
+        // returned x86 "GenuineIntel" content on every arch, which is wrong for
+        // anything reading the arch-specific flag/feature fields.
+        #[cfg(target_arch = "x86_64")]
+        let content: &[u8] = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 142\nmodel name\t: QEMU Virtual CPU\nstepping\t: 1\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 sse3 ssse3 sse4_1 sse4_2\nbogomips\t: 4000.00\n\n";
+        #[cfg(target_arch = "aarch64")]
+        let content: &[u8] = b"processor\t: 0\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd08\nCPU revision\t: 0\n\n";
+        #[cfg(target_arch = "riscv64")]
+        let content: &[u8] = b"processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv48\n\n";
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+        let content: &[u8] = b"processor\t: 0\ncpu cores\t: 1\n\n"; // generic (loongarch64/mips64)
         let n = content.len().min(PROCBUF_SIZE);
         buf[..n].copy_from_slice(&content[..n]);
         len = n;
@@ -7199,7 +7213,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         || path[..pathlen] == *b"/proc/meminfo"
         || (pathlen >= 10 && &path[..10] == b"/proc/sys/") // any sysctl file (kernel/vm/fs/net)
         || static_sys_content(&path[..pathlen]).is_some() // /sys CPU topology + THP
-        || static_etc_content(&path[..pathlen]).is_some(); // /etc virtual config files
+        || static_etc_content(&path[..pathlen]).is_some() // /etc virtual config files
+        || static_proc_content(&path[..pathlen]).is_some(); // static /proc files (uptime, stat, vmstat, ...)
     if is_virtual_file {
         let mut stat_buf = [0u8; 144];
         let mode: u32 = 0o100444; // S_IFREG | 0444
@@ -15925,7 +15940,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_TRUNCATE => do_truncate(pi, caller_port, msg.data[0] as usize, msg.data[1]),
 
             // Phase 151: sync/persistence stubs + misc.
-            __NR_FSYNC | __NR_FDATASYNC => 0, // no durable storage, always "synced"
+            // no durable storage, always "synced" (sync_file_range too — a
+            // range flush is a no-op when there is nothing to write back).
+            __NR_FSYNC | __NR_FDATASYNC | __NR_SYNC_FILE_RANGE => 0,
             __NR_FALLOCATE => 0, // no-op: space is allocated on write
             __NR_UTIMENSAT => {
                 // utimensat(dirfd, path, struct timespec times[2], flags).
