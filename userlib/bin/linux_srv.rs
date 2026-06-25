@@ -12192,6 +12192,9 @@ fn interrupt_parked_caller(pi: usize, caller_port: u64) {
 /// True if any caller is parked on a signal-interruptible syscall (futex/poll).
 /// Cheap presence scan used to decide whether the main recv needs a timeout.
 fn any_signal_pollable_parked() -> bool {
+    if WAIT4_PENDING_COUNT.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return true;
+    }
     unsafe {
         for i in 0..MAX_FUTEX_WAITERS {
             if FUTEX_TABLE[i].active {
@@ -12245,6 +12248,31 @@ fn sweep_parked_for_signals() {
             }
         }
         j += 1;
+    }
+    // wait4 parked callers (PENDING_ASYNC kind Wait4).  wait4 is local-poll (no
+    // in-flight backend request → clean to interrupt, like futex/poll).  Mirrors
+    // poll_wait4_pending's atomic-kind + WAIT4_PENDING_COUNT idiom; frees via the
+    // worker-safe async_free_slot after re-checking slot identity.  The other
+    // interruptible PENDING_ASYNC kinds (accept/recv/uds/pipe = backend-request,
+    // need finish-path late-reply tolerance; eventfd/timerfd) are deferred.
+    if WAIT4_PENDING_COUNT.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        let mut s = 0;
+        while s < MAX_PENDING_ASYNC {
+            let k = pending_kind_atomic(s);
+            if k.load(core::sync::atomic::Ordering::Acquire) == PendingAsyncKind::Wait4 as u8 {
+                let (cp, ppi) = unsafe { (PENDING_ASYNC[s].caller_task_port, PENDING_ASYNC[s].pi) };
+                if cp != 0 && has_interrupting_signal(ppi, cp) {
+                    interrupt_parked_caller(ppi, cp);
+                    if k.load(core::sync::atomic::Ordering::Acquire) == PendingAsyncKind::Wait4 as u8
+                        && unsafe { PENDING_ASYNC[s].caller_task_port } == cp
+                    {
+                        async_free_slot(s);
+                        WAIT4_PENDING_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            s += 1;
+        }
     }
 }
 
