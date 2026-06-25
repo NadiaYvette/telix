@@ -9,8 +9,10 @@
 //! stale alloc-time epoch and is freed before a full grace period has elapsed
 //! since ITS unlink, while a lock-free ART reader (for_each / lookup) may still
 //! be walking it. Its 64B/256B slab slot is then re-handed to a new owner →
-//! use-after-free (the "Node4 header + Thread payload scribbled" #260 / #208
-//! corruption).
+//! use-after-free (the #260 SCHED_THREAD_ART corruption). NOTE (2026-06-25
+//! verdict): a real but NARROW IPC-metadata UAF — NOT the root of the #208
+//! Thread/kstack family (Thread/kstack/THREAD_TABLE aren't slab-allocated nor
+//! RCU-freed); see memory project_260_rcu_premature_reclaim.
 //!
 //! The model captures the essential grace-period race:
 //!   - A node O is unlinked at generation 2 (the writer's gen at defer time).

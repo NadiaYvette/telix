@@ -16,8 +16,14 @@ publish = false
 # ART reader (for_each / lookup) may still be walking it. The freed node's
 # 64B/256B slab slot is immediately re-handed to a new owner (ART Leaf/Node4/
 # Node16 or a turnstile, all share the class) → use-after-free → scribbled
-# Node4 header + (via a corrupted num_children walked out of bounds) adjacent
-# Thread payload. Same family as the #208 thread_ref→kstack-VA corruption.
+# Node4 header + adjacent IPC/MM metadata (another same-class slab object).
+# NOTE (2026-06-25 verdict): this is a real but NARROW IPC-metadata UAF. It is
+# NOT the root of the #208 Thread/kstack corruption family — Thread structs,
+# kstacks and THREAD_TABLE (append-only RadixTable) are NOT slab-allocated and are
+# never RCU-freed, so a recycled ART/Port slot cannot reach Thread/kstack memory;
+# the #208 signatures are otherwise-explained (RSP0 / kstack-zeroing / tid=0 /
+# #155 phys-chunk) and the LIVE #208 crash is DOUBLE-DISPATCH. See memory
+# project_260_rcu_premature_reclaim.
 #
 #   INVARIANT: an RCU-deferred object is not reclaimed until every CPU has
 #   passed a quiescent state AFTER the object's unlink — i.e. its reclamation
