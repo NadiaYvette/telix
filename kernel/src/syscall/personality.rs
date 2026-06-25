@@ -813,6 +813,60 @@ fn resolve_personality_target(target_port: u64) -> Option<(u32, u64)> {
     Some((target_task_id, aspace_id))
 }
 
+/// #275: enumerate a target task's VMAs into the CALLER's buffer, for a real,
+/// authoritative /proc/self/maps.  Each entry is 24 bytes: [0..8] va_start LE,
+/// [8..16] va_end LE, [16] prot (VmaProt as u8: 0=r-- 1=rw- 2=r-x 3=rwx 4=---),
+/// [17..24] reserved.  Entries are VA-ordered (the VMA B+ tree iterates in
+/// address order).  Returns the number of entries written, or u64::MAX on error.
+///
+/// Iterates into a kernel-stack buffer UNDER the aspace lock (no user access
+/// while locked → no fault-deadlock), then copies out after releasing the lock.
+pub fn personality_enumerate_vmas(target_port: u64, buf_va: u64, buf_len: u64) -> u64 {
+    let caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let (_target_task_id, aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+    const MAX_VMAS: usize = 64;
+    const ENTRY: usize = 24;
+    let cap = ((buf_len as usize) / ENTRY).min(MAX_VMAS);
+    if cap == 0 || buf_va == 0 {
+        return 0;
+    }
+    let mut kbuf = [0u8; MAX_VMAS * ENTRY];
+    let n = crate::mm::aspace::with_aspace_mut(aspace_id, |aspace| {
+        let mut nn = 0usize;
+        let mut it = aspace.vmas.iter();
+        while let Some(vma) = it.next() {
+            if !vma.active {
+                continue;
+            }
+            if nn >= cap {
+                break;
+            }
+            let off = nn * ENTRY;
+            kbuf[off..off + 8].copy_from_slice(&(vma.va_start as u64).to_le_bytes());
+            kbuf[off + 8..off + 16]
+                .copy_from_slice(&((vma.va_start + vma.va_len) as u64).to_le_bytes());
+            kbuf[off + 16] = vma.prot as u8;
+            nn += 1;
+        }
+        nn
+    })
+    .unwrap_or(0);
+    if n == 0 {
+        return 0;
+    }
+    let pt_root = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+    if !crate::syscall::handlers::copy_to_user(pt_root, buf_va as usize, &kbuf[..n * ENTRY]) {
+        return u64::MAX;
+    }
+    n as u64
+}
+
 /// Map anonymous pages in a target task's address space.
 /// Equivalent to sys_mmap_anon but targeting a specified task.
 pub fn personality_mmap_anon(target_port: u64, va_hint: u64, page_count: u64, prot: u64) -> u64 {

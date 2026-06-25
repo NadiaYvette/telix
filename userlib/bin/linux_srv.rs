@@ -6582,7 +6582,7 @@ fn static_etc_content(path: &[u8]) -> Option<&'static [u8]> {
 }
 
 /// Open a /proc pseudo-file by generating content into a ProcBuf slot.
-fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 {
+fn open_proc_file(pi: usize, caller_port: u64, path: &[u8], flags: u64) -> u64 {
     // Find a free ProcBuf slot.
     let slot = unsafe {
         let mut found = None;
@@ -6607,42 +6607,86 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
         // — both are follow-ups (need execve load-base + stack-base tracking).
         // Anonymous mappings carry no name, matching Linux.
         let mut pos = 0;
-        unsafe {
-            let regs = PROC_TABLE[pi].mmap_regions;
-            // Selection-emit lowest-base-first so the output is address-ordered
-            // (some maps parsers assume sorted entries).  N <= MAX_MMAP_REGIONS.
-            let mut emitted = [false; MAX_MMAP_REGIONS];
-            loop {
-                let mut best = usize::MAX;
-                let mut best_start = usize::MAX;
-                for i in 0..MAX_MMAP_REGIONS {
-                    if regs[i].start != 0 && !emitted[i] && regs[i].start < best_start {
-                        best = i;
-                        best_start = regs[i].start;
-                    }
+        // Authoritative path: enumerate the kernel's VMAs for this process — real
+        // text/data/bss/stack/heap/anon, the complete layout (not just the mmaps
+        // linux_srv tracks).  Each entry is 24 bytes: va_start LE, va_end LE,
+        // prot u8 (0=r-- 1=rw- 2=r-x 3=rwx 4=---).  VA-ordered.  Falls back to the
+        // linux_srv-tracked view on error/empty so maps never regresses.
+        let mut vbuf = [0u8; 64 * 24];
+        let vcount =
+            syscall::personality_enumerate_vmas(caller_port, vbuf.as_mut_ptr() as u64, vbuf.len() as u64);
+        if (vcount as i64) > 0 {
+            fn rd_u64(b: &[u8]) -> u64 {
+                let mut v = 0u64;
+                let mut i = 0;
+                while i < 8 {
+                    v |= (b[i] as u64) << (i * 8);
+                    i += 1;
                 }
-                if best == usize::MAX { break; }
-                emitted[best] = true;
-                let r = regs[best];
+                v
+            }
+            let brk_base = unsafe { PROC_TABLE[pi].brk_base };
+            let n = (vcount as usize).min(64);
+            for i in 0..n {
+                let off = i * 24;
+                let start = rd_u64(&vbuf[off..off + 8]) as usize;
+                let end = rd_u64(&vbuf[off + 8..off + 16]) as usize;
+                let prot = vbuf[off + 16];
                 let perms = [
-                    if r.prot & 0x1 != 0 { b'r' } else { b'-' },
-                    if r.prot & 0x2 != 0 { b'w' } else { b'-' },
-                    if r.prot & 0x4 != 0 { b'x' } else { b'-' },
-                    if r.flags & 0x2 != 0 { b's' } else { b'p' }, // MAP_SHARED → 's'
+                    if prot != 4 { b'r' } else { b'-' },           // readable unless None
+                    if prot == 1 || prot == 3 { b'w' } else { b'-' },
+                    if prot == 2 || prot == 3 { b'x' } else { b'-' },
+                    b'p',
                 ];
-                let w = fmt_maps_line(&mut buf[pos..], r.start, r.end, &perms, b"");
+                // Infer the well-known region names from VAs linux_srv knows.
+                let name: &[u8] = if brk_base != 0 && start == brk_base {
+                    b"[heap]"
+                } else if start >= 0x7fff_0000_0000 {
+                    b"[stack]"
+                } else {
+                    b""
+                };
+                let w = fmt_maps_line(&mut buf[pos..], start, end, &perms, name);
                 if w == 0 { break; } // buffer full
                 pos += w;
             }
-            // Heap (real, from brk).
-            let brk_base = PROC_TABLE[pi].brk_base;
-            let brk_cur = PROC_TABLE[pi].brk_current;
-            if brk_base != 0 && brk_cur > brk_base {
-                pos += fmt_maps_line(&mut buf[pos..], brk_base, brk_cur, b"rw-p", b"[heap]");
+        } else {
+            // Fallback: the linux_srv-tracked mmap regions (address-sorted) + heap
+            // (from brk) + a best-effort stack placeholder.  Used only if the
+            // kernel enumeration syscall is unavailable/failed.
+            unsafe {
+                let regs = PROC_TABLE[pi].mmap_regions;
+                let mut emitted = [false; MAX_MMAP_REGIONS];
+                loop {
+                    let mut best = usize::MAX;
+                    let mut best_start = usize::MAX;
+                    for i in 0..MAX_MMAP_REGIONS {
+                        if regs[i].start != 0 && !emitted[i] && regs[i].start < best_start {
+                            best = i;
+                            best_start = regs[i].start;
+                        }
+                    }
+                    if best == usize::MAX { break; }
+                    emitted[best] = true;
+                    let r = regs[best];
+                    let perms = [
+                        if r.prot & 0x1 != 0 { b'r' } else { b'-' },
+                        if r.prot & 0x2 != 0 { b'w' } else { b'-' },
+                        if r.prot & 0x4 != 0 { b'x' } else { b'-' },
+                        if r.flags & 0x2 != 0 { b's' } else { b'p' },
+                    ];
+                    let w = fmt_maps_line(&mut buf[pos..], r.start, r.end, &perms, b"");
+                    if w == 0 { break; }
+                    pos += w;
+                }
+                let brk_base = PROC_TABLE[pi].brk_base;
+                let brk_cur = PROC_TABLE[pi].brk_current;
+                if brk_base != 0 && brk_cur > brk_base {
+                    pos += fmt_maps_line(&mut buf[pos..], brk_base, brk_cur, b"rw-p", b"[heap]");
+                }
             }
+            pos += fmt_maps_line(&mut buf[pos..], 0x7fff_0000_0000, 0x7fff_0001_0000, b"rw-p", b"[stack]");
         }
-        // Stack: best-effort placeholder (exact bounds not yet tracked).
-        pos += fmt_maps_line(&mut buf[pos..], 0x7fff_0000_0000, 0x7fff_0001_0000, b"rw-p", b"[stack]");
         len = pos;
     } else if path == b"/proc/self/status" {
         // Minimal /proc/self/status with fields glibc checks.

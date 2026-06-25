@@ -91,6 +91,7 @@ const SYS_PERSONALITY_MMAP_ANON: u64 = 0xF00A;
 const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
 const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
 const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
+const SYS_PERSONALITY_ENUMERATE_VMAS: u64 = 0xF018;
 const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
 const SYS_PERSONALITY_THREAD_CREATE: u64 = 0xF00F;
 const SYS_PERSONALITY_MMAP_FIXED: u64 = 0xF010;
@@ -247,6 +248,14 @@ pub fn personality_mmap_fixed(target_port: u64, va: u64, page_count: u64, prot: 
 /// Unmap a VMA in a target task's address space (personality server only).
 pub fn personality_munmap(target_port: u64, va: usize) -> bool {
     unsafe { arch::syscall2(SYS_PERSONALITY_MUNMAP, target_port, va as u64) == 0 }
+}
+
+/// #275: enumerate the target task's VMAs into `buf` for a real /proc/self/maps.
+/// Each entry is 24 bytes: va_start LE u64, va_end LE u64, prot u8 (0=r-- 1=rw-
+/// 2=r-x 3=rwx 4=---), then padding.  Entries are VA-ordered.  Returns the entry
+/// count, or u64::MAX on error.
+pub fn personality_enumerate_vmas(target_port: u64, buf_va: u64, buf_len: u64) -> u64 {
+    unsafe { arch::syscall3(SYS_PERSONALITY_ENUMERATE_VMAS, target_port, buf_va, buf_len) }
 }
 
 /// Change protection on a mapping in a target task's address space.

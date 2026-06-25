@@ -134,6 +134,7 @@ pub const SYS_PERSONALITY_MMAP_ANON: u64 = 0xF00A;
 pub const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
 pub const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
 pub const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
+pub const SYS_PERSONALITY_ENUMERATE_VMAS: u64 = 0xF018; // #275: real /proc/self/maps
 pub const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
 pub const SYS_PERSONALITY_THREAD_CREATE: u64 = 0xF00F;
 pub const SYS_PERSONALITY_MMAP_FIXED: u64 = 0xF010;
@@ -330,6 +331,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         && nr != SYS_PERSONALITY_EXECVE
         && nr != SYS_PERSONALITY_MMAP_ANON && nr != SYS_PERSONALITY_MUNMAP
         && nr != SYS_PERSONALITY_MPROTECT && nr != SYS_PERSONALITY_MREMAP
+        && nr != SYS_PERSONALITY_ENUMERATE_VMAS
         && nr != SYS_PERSONALITY_SET_TLS
         && nr != SYS_PERSONALITY_THREAD_CREATE
         && nr != SYS_PERSONALITY_MMAP_FIXED
@@ -656,6 +658,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_MREMAP => {
             crate::syscall::personality::personality_mremap(a0, a1, a2, a3)
+        }
+        SYS_PERSONALITY_ENUMERATE_VMAS => {
+            crate::syscall::personality::personality_enumerate_vmas(a0, a1, a2)
         }
         SYS_PERSONALITY_SET_TLS => {
             crate::syscall::personality::personality_set_tls(a0, a1)
