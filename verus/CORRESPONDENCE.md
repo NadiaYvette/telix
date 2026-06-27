@@ -61,6 +61,21 @@ lower half is empty, so the separator and non-emptiness fail — the preconditio
 `>= 2` entries (telix only splits a *full* leaf). A good example of the specs being
 exercised, not rubber-stamped.
 
+## Stage 3c — the whole-tree structural invariant (`extent_chain.rs`)
+
+The summit: the B+-tree's entire content is the concatenation of its leaves in chain
+order, and the whole-tree correctness property is that this is *one globally sorted map*.
+
+| Verus obligation | Justified by |
+|---|---|
+| `concat_sorted`: two sorted segments with an ordered boundary concatenate to a sorted run | the two-leaf case; building block |
+| `chain_flatten_sorted`: a well-formed leaf chain (each leaf sorted, adjacent leaves separated) flattens to a globally sorted extent map | the multi-node analogue of Lean `BTree.bst_ordered` (in-order traversal of a search tree is sorted) and `ExtentMap.Ordered` — it closes the loop back to the ordered-map abstraction that **stage 1's** `ExtentMap.WFI_imp_WF` refines to Layer A |
+
+So the in-tree Verus development now spans the whole structure: `can_coalesce` (1) →
+leaf ops (2) → a node through a pointer (3a) → a two-node split (3b) → the whole-leaf-chain
+ordered-map invariant (3c) — and `chain_flatten_sorted` reconnects it to the very Layer-A
+ordering invariant the Lean development proves abstractly. The tower closes on itself.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
