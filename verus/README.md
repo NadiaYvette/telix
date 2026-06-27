@@ -98,8 +98,15 @@ leaf ops → a node through a pointer → a two-node split → the whole-chain o
       (`freed_while_mapped_breaks_wf`). The **sequential (∀-state) complement** of the Iris
       ∀-interleaving proof `tessera/property2/coq/rmap_defer.v` — the #143 fix obligation,
       machine-checked from both sides.
-- [ ] **next/prev exec linking** — the executable doubly-linked-leaf-list maintenance
-      (the back-pointer invariant `a.next.prev == a`), completing the chain story.
+- [x] **next/prev exec linking** — `extent_link.rs` (`3 verified`, bounded sibling splice) +
+      **`extent_ptr_list.rs` (`6 verified`, the UNBOUNDED chain)**: an arbitrary-length
+      doubly-linked leaf chain through raw pointers, owned *forward* by a recursive permission
+      collection (`ListPerm`) with each node's `prev` validated against its structural predecessor
+      — so `wf` *is* the chain-wide `a.next.prev == a` (`back_pointer_holds` extracts it). A
+      recursive traversal (`last_ptr`) walks the unbounded `*mut` chain soundly, and `push_front`
+      maintains the invariant across the back-pointer write that silently corrupts if dropped.
+      This is the piece `extent_link.rs` explicitly deferred ("needs a heap/ghost-map model of all
+      permissions at once") — now done. The chain story, completed.
 - [x] **recursive B+-tree, structural + insert** (`extent_tree.rs`, `8 verified`): an
       arbitrary-depth search tree's in-order traversal is one globally sorted extent map
       (`bst_sorted`); the **recursive insert preserves the invariant** (`insert_preserves_bst`)

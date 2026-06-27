@@ -142,6 +142,22 @@ pointers) → 3c/3d (whole structure, datatype) → **3e (whole structure, throu
 unbounded, with mutation)**. The `bst`/ordered-map invariant the Lean development proves
 abstractly is now also proved on the actual heap-pointer representation telix runs.
 
+## The unbounded doubly-linked chain (`extent_ptr_list.rs`)
+
+`extent_link.rs` proved back-pointer consistency for ONE adjacency (the bounded sibling splice)
+and deferred the chain-wide version. `extent_ptr_list.rs` closes it with the same recursive-
+permission technique as the pointer tree, specialized to a list: own the chain *forward*
+(`ListPerm` = a node's `PointsTo` + the tail's `ListPerm`), and validate each node's `prev`
+field against its structural predecessor (threaded as a parameter) rather than owning it — which
+sidesteps the doubly-linked aliasing.
+
+| Verus obligation | Justified by |
+|---|---|
+| `ListPerm::wf(head, prev)`: the chain-wide doubly-linked invariant — each node initialized, `prev` equals its predecessor, tail wf for `next` with this node as predecessor | the unbounded generalization of `extent_link.rs` `linked_consistent` (one adjacency → all adjacencies); the recursive-permission analogue used for `extent_ptr_tree.rs` |
+| `back_pointer_holds`: from the global `wf`, every successor's `prev` points back — `a.next.prev == a` | the corruption `extent_link.rs` guards one node at a time, here a theorem about the whole unbounded chain |
+| `last_ptr`: a recursive walk over the unbounded `*mut` chain (sound per-node via the permission slice), returning `to_seq().last()` | the list analogue of the tree's `contains`; Lean/Kani cannot state it (no heap) |
+| `push_front`: prepend, re-establishing `wf` across the old-head back-pointer write, prepending exactly the new node to `to_seq()` | the maintenance operation; the back-pointer write is exactly telix's splice write that silently desynchronizes a doubly-linked list if dropped |
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
