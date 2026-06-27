@@ -121,6 +121,12 @@ leaf ops → a node through a pointer → a two-node split → the whole-chain o
       kernel` (the #208 bug), `user_pml4_safe`/`fork_preserves_safe`/`fork_buggy_breaks_safe` (the
       `USER-CR3-BAD` probe's invariant, proved). The PML4-entry-level instance of tessera
       `Fork.forkKernel_breaks_userSafe`.
+- [x] **LLFree per-chunk allocator invariant** (`phys_chunk.rs`, `5 verified`): telix `mm::phys`
+      (Embedded Sparse LLFree) — 64-page chunks caching `free_count` over a bitmap. The core
+      correctness `free_count == bitmap popcount` (the allocator twin of `rmap.rs`
+      `mapcount == |rmap|`): `alloc_preserves_wf`/`free_preserves_wf`, `alloc_no_double_issue` (the
+      #228 PA-ALIAS / double-issue invariant), `double_free_breaks_wf` (what `DI_SHADOW` catches),
+      `alloc_conserves`. The per-CPU-reservation concurrency is the unbounded complement.
 - [x] **next/prev exec linking** — `extent_link.rs` (`3 verified`, bounded sibling splice) +
       **`extent_ptr_list.rs` (`6 verified`, the UNBOUNDED chain)**: an arbitrary-length
       doubly-linked leaf chain through raw pointers, owned *forward* by a recursive permission

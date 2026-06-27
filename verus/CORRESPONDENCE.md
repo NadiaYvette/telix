@@ -193,6 +193,24 @@ mappings → the "5f silent triple". The PML4-entry-level instantiation of `Fork
 An invariant-level guard (not a verbatim mirror of a single function), so no drift-guard marker; it
 pins the property the `USER-CR3-BAD` probe enforces dynamically.
 
+## The LLFree per-chunk allocator invariant (`phys_chunk.rs`)
+
+telix `mm::phys` (Embedded Sparse LLFree): 64-page chunks, each a packed `AtomicU64` caching
+`free_count` over a per-page bitmap, per-CPU reserved. The core correctness — what the #228 PA-ALIAS
+"double-issue" violates and `DI_SHADOW` catches — is `free_count == bitmap popcount`. The allocator
+analogue of `rmap.rs` (`mapcount == |rmap|`).
+
+| Verus obligation (`phys_chunk.rs`) | Justified by |
+|---|---|
+| `alloc_preserves_wf` / `free_preserves_wf`: correct alloc/free keep `free_count == |free set|` | `rmap.rs` `map_preserves_wf`/`unmap_preserves_wf`; the cached-count discipline |
+| `alloc_no_double_issue`: an allocated page leaves the free set, so it cannot be re-issued | the #228 invariant the per-CPU CAS path must preserve atomically (the sequential core of the double-issue race) |
+| `double_free_breaks_wf`: freeing an already-free page bumps the count without changing the bitmap — provable error | `rmap.rs` `under_remove_breaks_wf`; what `DI_SHADOW` detects at runtime |
+| `alloc_conserves`: alloc moves exactly one page free→allocated | conservation — no page lost or duplicated |
+
+Modeled on a `Set` of free indices, so the inline/bitmap `ChunkNode` encoding is abstracted to the
+logical state. The per-CPU-reservation concurrency (the CAS races) is the unbounded complement, the
+allocator's Property-2 analogue — this is the sequential invariant those races must preserve.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
