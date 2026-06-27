@@ -1,0 +1,2 @@
+extent_entry_coalesce  4346e23b1f3c88477524606e0be8913b00da0098408cbcfef97c33f993f7de40  kernel/src/mm/extent.rs
+extent_flags  25c0cb51ce21996d7dc5e9d858160a800d3c1a0a620c7e355b63543a8b0df983  kernel/src/mm/extent.rs

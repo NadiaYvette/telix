@@ -1,0 +1,40 @@
+# Example CI wiring for telix — two INDEPENDENT jobs on the same checkout.
+# Drop into .github/workflows/ (or translate to telix's CI of choice). See verus/INTEGRATION.md.
+#
+# The point: the kernel build and the Verus verification share NO toolchain. A Verus bump never
+# blocks a kernel-Rust bump and vice versa (verus/TOOLCHAIN.md).
+name: telix
+
+on: [push, pull_request]
+
+jobs:
+  # ── the real kernel: telix's own up-to-date nightly, unconstrained by Verus ──────────────
+  kernel-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly (rust-toolchain.toml drives this)
+        run: rustup show
+      - name: Build kernel
+        run: cargo build -p telix-kernel --target x86_64-unknown-none
+      - name: Clippy
+        run: cargo clippy -p telix-kernel --target x86_64-unknown-none -- -D warnings
+
+  # ── the proofs: Verus's PINNED toolchain, standalone (verus/INTEGRATION.md) ───────────────
+  verus-verify:
+    runs-on: ubuntu-latest
+    env:
+      # Pin the Verus release (verus/TOOLCHAIN.md). Vendor it or fetch a fixed tag — never "latest".
+      VERUS_VERSION: "0.2026.06.20"
+      VERUS: ${{ github.workspace }}/.verus/verus-x86-linux/verus
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned Verus release (binary + vstd + z3 + its rustc)
+        run: |
+          mkdir -p .verus && cd .verus
+          # Replace with the vendored artifact / a release asset for $VERUS_VERSION.
+          # The release bundles its own pinned rustc (1.96.0) — do NOT use the host toolchain here.
+          curl -fsSL "https://github.com/verus-lang/verus/releases/download/release%2F${VERUS_VERSION}/verus-${VERUS_VERSION}-x86-linux.zip" -o verus.zip
+          unzip -q verus.zip
+      - name: Verify proofs + drift-guard
+        run: verus/verify-intree.sh

@@ -23,6 +23,7 @@ use core::ptr;
 // ---------------------------------------------------------------------------
 
 /// Flags describing the state of a physical memory extent.
+// VERUS-MIRROR-BEGIN extent_flags  (proved in verus/extent_coalesce.rs — see verus/INTEGRATION.md)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
 pub struct ExtentFlags(pub u16);
@@ -44,7 +45,9 @@ impl ExtentFlags {
         Self(self.0 | other.0)
     }
 }
+// VERUS-MIRROR-END extent_flags
 
+// VERUS-MIRROR-BEGIN extent_entry_coalesce  (proved in verus/extent_coalesce.rs — see verus/INTEGRATION.md)
 /// A single extent entry in the B+ tree.
 #[derive(Clone, Copy, Debug)]
 pub struct ExtentEntry {
@@ -79,6 +82,7 @@ impl ExtentEntry {
             && self.object_offset + self.page_count as u32 == other.object_offset
     }
 }
+// VERUS-MIRROR-END extent_entry_coalesce
 
 // ---------------------------------------------------------------------------
 // B+ tree node structures

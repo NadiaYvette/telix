@@ -39,13 +39,19 @@ maps each Verus clause to the Lean theorem and Kani harness that justify it.
 
 ## Integration notes for the telix side
 
-- The seed is a **self-contained `verus!{}` module** with the leaf deps stubbed
-  (`PhysAddr`, `page_size`). The telix-side task is to re-point it at the real
-  `mm::page::PhysAddr` / `page::page_size()` and decide the in-tree shape: a `verus!{}`
-  block guarded so the normal `cargo build` skips the spec code, verified by a separate
-  `verus` CI step.
+- **The in-tree integration scaffolding is drafted — see `INTEGRATION.md`.** The shape is
+  settled by one constraint: Verus's pinned rustc (`1.96.0`) cannot compile the edition-2024
+  `no_std` kernel crate, so the proofs verify **standalone** (not part of `cargo build`); the
+  kernel build is untouched and pulls in no `vstd` dependency.
+  - `verify-intree.sh` — the single CI entry point (version-pin check → drift-guard → verify all).
+  - `drift-guard.sh` + `mirror-baseline.sha256` — bind the standalone (verbatim) proofs to the
+    real `mm/` code via `// VERUS-MIRROR-BEGIN/END` markers; CI fails if a proved function changes
+    until it is re-verified. (Markers are placed around `ExtentFlags` / `ExtentEntry::can_coalesce`
+    in `kernel/src/mm/extent.rs` as the template.)
+  - `ci.example.yml` — two independent jobs (kernel `cargo build` on nightly; `verify-intree.sh`
+    on pinned Verus). `INTEGRATION.md` has the migration ladder to annotating the real functions.
 - Verus toolchain: a prebuilt release from `verus-lang/verus` (binary + `vstd` + z3);
-  pin the version in CI.
+  pin the version in CI (`TOOLCHAIN.md`).
 - The seed's `proof fn`s are the soundness obligations (e.g. `can_coalesce ⇒ physically
   adjacent + same object`), mirroring the Kani harness `coalesce_is_sound`.
 
@@ -73,14 +79,15 @@ maps each Verus clause to the Lean theorem and Kani harness that justify it.
       separated) flattens to a **globally sorted extent map** (`chain_flatten_sorted`,
       built on `concat_sorted`) — the multi-node analogue of `ExtentMap.Ordered` /
       `BTree.bst_ordered`, closing the loop back to the Layer-A ordering invariant.
-- [ ] telix integration of stages 1–3c into mainline `mm/extent.rs` (re-point stubs at
-      `mm::page`; host in a `verus!{}` block; the Verus build step re-verifies all five on
-      every compile)
-- [ ] remaining exec mechanics (optional, beyond the structural core): the executable
-      `next`/`prev` linked-list maintenance, and `insert_into_parent` recursive split
-      propagation with the full multi-permission tree (a research-grade exercise).
+- [x] telix integration **scaffolding** drafted (`INTEGRATION.md`): in-tree standalone
+      verification (`verify-intree.sh`), the proof⟷code drift-guard (`drift-guard.sh` +
+      markers in `mm/extent.rs`), and CI wiring (`ci.example.yml`) — rung 1 of the migration
+      ladder, with the seam cut for re-pointing the stubs (rungs 2–3).
+- [x] remaining exec mechanics (done, not optional after all): the executable `next`/`prev`
+      linked-list maintenance (`extent_ptr_list.rs`) **and** `insert_into_parent` recursive
+      split propagation through the full multi-permission tree (`extent_ptr_tree.rs`).
 
-**Five stages verified — 33 Verus obligations, 0 errors** — spanning `can_coalesce` →
+**Eleven modules verified — 64 Verus obligations, 0 errors** — spanning `can_coalesce` →
 leaf ops → a node through a pointer → a two-node split → the whole-chain ordered map.
 
 ## Beyond the extent B+-tree — broadened roadmap
