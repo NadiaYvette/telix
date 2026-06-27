@@ -30,6 +30,22 @@ telix's manual shift-right/shift-left over the fixed `[ExtentEntry; LEAF_CAP]` +
 computes exactly `Seq::insert`/`Seq::remove` on the live content; the Verus spec is stated
 at that logical level, and the telix side proves its array code meets it.
 
+## Stage 3a — node-through-pointer (`extent_node.rs`)
+
+This is the rung where **Verus does something Lean and Kani cannot**: reason about the
+*raw-pointer heap*. The Lean and Kani layers proved the algorithm on pure data; telix's
+nodes live behind `*mut` pointers, and the soundness of dereferencing them is the whole
+difficulty (it is why Aeneas couldn't model the code).
+
+| Verus obligation | Justified by |
+|---|---|
+| `leaf_insert_through_ptr`: a leaf insert performed through a `PointsTo<LeafNode>` permission preserves sortedness | the leaf invariant comes from stage 2 (`insert_preserves_sorted`); the *pointer soundness* is Verus-native — no Lean/Kani analogue, because they don't model the heap |
+| `demo_alloc_insert_free`: allocate → operate-through-permission → reclaim verifies | the `alloc_node`/`as_leaf`+mutate/`free_node` lifecycle, with the allocation as a `PointsTo` resource |
+
+So the division of labour across the three tools is now sharp: **Lean** = the algorithm is
+right; **Kani** = the verbatim code meets it (bounded); **Verus** = it meets it *unbounded
+and through the raw pointers*, in mainline, in CI. Stage 3 is Verus's home turf.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —

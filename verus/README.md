@@ -57,7 +57,15 @@ maps each Verus clause to the Lean theorem and Kani harness that justify it.
       `insert_entry_at`/`remove_entry_at` preserve the leaf's sorted-by-start invariant
       (`insert_preserves_sorted`/`remove_preserves_sorted`) — the per-leaf analogue of
       `ExtentMap.insert_ordered`. `verify.sh` runs both stages.
-- [ ] telix integration of stages 1–2 into mainline `mm/extent.rs` (re-point stubs at
-      `mm::page`; host in a build-skipped `verus!{}` block; add a `verus` CI step)
-- [ ] stage 3 (the pointer B+-tree: `insert`/`split_leaf_and_insert` with `vstd`
-      `PointsTo` permissions and the slab allocator as a resource)
+- [x] **Stage 3a `extent_node.rs` VERIFIED** — `6 verified, 0 errors`: a leaf operation
+      performed **through a raw pointer** (`PointsTo<LeafNode>` permission — the sound,
+      checked form of telix's `unsafe { &mut *leaf_ptr }`) preserves the invariant
+      (`leaf_insert_through_ptr`), plus a full allocate→operate→free lifecycle
+      (`demo_alloc_insert_free`). The first raw-pointer rung — Verus's home turf, where it
+      does what Lean/Kani cannot (model the heap).
+- [ ] telix integration of stages 1–3a into mainline `mm/extent.rs` (re-point stubs at
+      `mm::page`; host in a `verus!{}` block; wire into the Verus build step — note: telix
+      is integrating Verus into its build system, so these re-verify on every compile)
+- [ ] stage 3b–c (the rest of the pointer tree): `find_leaf` tree-walk, the linked-leaf
+      `next`/`prev` invariant, `split_leaf_and_insert`, and `insert_into_parent` — the
+      multi-node permission reasoning. The hard remainder.
