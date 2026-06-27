@@ -158,6 +158,25 @@ sidesteps the doubly-linked aliasing.
 | `last_ptr`: a recursive walk over the unbounded `*mut` chain (sound per-node via the permission slice), returning `to_seq().last()` | the list analogue of the tree's `contains`; Lean/Kani cannot state it (no heap) |
 | `push_front`: prepend, re-establishing `wf` across the old-head back-pointer write, prepending exactly the new node to `to_seq()` | the maintenance operation; the back-pointer write is exactly telix's splice write that silently desynchronizes a doubly-linked list if dropped |
 
+## Sub-page placement & the permutation π (`extent_placement.rs`) — the #143 wrong-data class
+
+telix is the *other* clustered-superpage VMM, so it shares pgcl's #143 hazard: the virtual→physical
+sub-page map (`π : vsub ↦ psub`) is normally identity but not always (non-cluster-aligned virtual
+motion keeps psub, changes vsub). A rematerialize-in path that reconstructs psub from the faulting
+vaddr loses π and serves wrong content (pgcl Bug 2). telix has no sub-offset encoding *yet* — so this
+is a **forward-looking guard**, proved in-tree so CI catches the regression the day such code lands
+(not a verbatim mirror, so no drift-guard marker).
+
+| Verus obligation (`extent_placement.rs`) | Justified by |
+|---|---|
+| `carry_psub_faithful`: an entry carrying the source sub-offset places every vsub correctly, for ANY π | the Verus twin of tessera `Permute.framePi_faithful`; the fix obligation (Option 1) the spec authority chose — what COW/fork already do |
+| `reconstruct_from_vaddr_wrong`: reconstructing psub from the vaddr (vsub) mis-places whenever `vsub != psub` | tessera `Permute.reconstruct_from_vaddr_wrong` — pgcl's general localization of Bug 2 |
+| `extent_translation_is_identity`: telix's linear `start/MMUPAGE + vsub` *is* the identity placement | pins where the guard bites in the real `mm/extent.rs` — correct iff canonically aligned |
+| `identity_observes_wrong`: at the content level, the identity reader observes wrong content vs the π-carrying reader | tessera `Permute.identity_remat_observed_wrong` |
+
+This carries this session's biggest cross-project result — the `vsub==psub` assumption is the bug —
+into telix's in-tree CI, on telix's real `PhysAddr` / `MMUPAGE_SIZE` / `ExtentEntry`.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —

@@ -10,7 +10,7 @@ set -e
 cd "$(dirname "$0")"
 VERUS="${VERUS:-$HOME/verus/verus-x86-linux/verus}"
 echo "verus: $("$VERUS" --version | head -1)"
-for f in extent_coalesce.rs extent_leaf.rs extent_node.rs extent_split.rs extent_chain.rs extent_link.rs extent_ptr_list.rs rmap.rs rmap_cluster.rs extent_tree.rs extent_ptr_tree.rs; do
+for f in extent_coalesce.rs extent_leaf.rs extent_node.rs extent_split.rs extent_chain.rs extent_link.rs extent_ptr_list.rs rmap.rs rmap_cluster.rs extent_placement.rs extent_tree.rs extent_ptr_tree.rs; do
   echo "--- $f ---"
   "$VERUS" --crate-type=lib --triggers-mode silent "$f"
 done

@@ -105,6 +105,15 @@ leaf ops → a node through a pointer → a two-node split → the whole-chain o
       (`freed_while_mapped_breaks_wf`). The **sequential (∀-state) complement** of the Iris
       ∀-interleaving proof `tessera/property2/coq/rmap_defer.v` — the #143 fix obligation,
       machine-checked from both sides.
+- [x] **sub-page placement & the permutation π** (`extent_placement.rs`, `5 verified`): the #143
+      wrong-data class, in-tree for telix. The virtual→physical sub-page map `π : vsub ↦ psub` is
+      normally identity but not always (relocation keeps psub, changes vsub); a rematerialize path
+      that rebuilds psub from the faulting vaddr loses π and serves wrong content (pgcl Bug 2).
+      `carry_psub_faithful` (the fix — carry psub, any π), `reconstruct_from_vaddr_wrong` (the bug),
+      `extent_translation_is_identity` (telix's linear `start/MMUPAGE + vsub` *is* the identity
+      placement → correct iff aligned). The Verus twin of tessera `Placement`/`Permute`, on telix's
+      real `PhysAddr`/`MMUPAGE_SIZE`/`ExtentEntry` — a forward-looking guard for when telix grows a
+      swap/migration path.
 - [x] **next/prev exec linking** — `extent_link.rs` (`3 verified`, bounded sibling splice) +
       **`extent_ptr_list.rs` (`6 verified`, the UNBOUNDED chain)**: an arbitrary-length
       doubly-linked leaf chain through raw pointers, owned *forward* by a recursive permission
