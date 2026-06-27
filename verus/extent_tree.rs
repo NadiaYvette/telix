@@ -143,4 +143,68 @@ pub proof fn bst_sorted(t: Tree)
     }
 }
 
+/// Recursive BST insert: descend by key, place the new entry at a leaf.
+pub open spec fn insert(t: Tree, ne: Entry) -> Tree
+    decreases t,
+{
+    match t {
+        Tree::Leaf => Tree::Node(Box::new(Tree::Leaf), ne, Box::new(Tree::Leaf)),
+        Tree::Node(l, e, r) =>
+            if ne.start <= e.start {
+                Tree::Node(Box::new(insert(*l, ne)), e, r)
+            } else {
+                Tree::Node(l, e, Box::new(insert(*r, ne)))
+            },
+    }
+}
+
+/// **Insert loses nothing and adds exactly `ne`**: the in-order content afterwards is the
+/// old content plus the new entry (the anti-entry-loss property at the recursive level).
+pub proof fn insert_contains(t: Tree, ne: Entry, x: Entry)
+    ensures
+        to_seq(insert(t, ne)).contains(x) <==> (x == ne || to_seq(t).contains(x)),
+    decreases t,
+{
+    broadcast use vstd::seq_lib::group_seq_properties;
+    match t {
+        Tree::Leaf => {}
+        Tree::Node(l, e, r) => {
+            if ne.start <= e.start {
+                insert_contains(*l, ne, x);
+            } else {
+                insert_contains(*r, ne, x);
+            }
+        }
+    }
+}
+
+/// **Recursive insert preserves the search-tree invariant** — the tree-growth operation
+/// keeps the whole-tree ordering (so, with `bst_sorted`, the flattened map stays sorted).
+pub proof fn insert_preserves_bst(t: Tree, ne: Entry)
+    requires
+        bst(t),
+    ensures
+        bst(insert(t, ne)),
+    decreases t,
+{
+    match t {
+        Tree::Leaf => {}
+        Tree::Node(l, e, r) => {
+            if ne.start <= e.start {
+                insert_preserves_bst(*l, ne);
+                assert forall|x: Entry|
+                    to_seq(insert(*l, ne)).contains(x) implies x.start <= e.start by {
+                    insert_contains(*l, ne, x);
+                }
+            } else {
+                insert_preserves_bst(*r, ne);
+                assert forall|x: Entry|
+                    to_seq(insert(*r, ne)).contains(x) implies e.start <= x.start by {
+                    insert_contains(*r, ne, x);
+                }
+            }
+        }
+    }
+}
+
 } // verus!

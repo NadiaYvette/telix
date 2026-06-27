@@ -98,6 +98,7 @@ The last structural rung: an *arbitrary-depth* search tree, not a flat chain.
 | Verus obligation | Justified by |
 |---|---|
 | `bst_sorted`: a search tree's in-order traversal is one globally sorted extent map, by structural induction over a recursive datatype | the direct Verus port of Lean `proof/Tessera/BTree.lean` `bst_ordered` — same theorem, same induction, now unbounded and in-tree; the recursive generalization of `extent_chain.rs` |
+| `insert_preserves_bst`: recursive insert preserves the whole-tree ordering; `insert_contains`: it loses no entry and adds exactly the new one | the recursive tree-growth operation; the anti-entry-loss property (telix #9 / pgcl #7/#8 split-fold family) at unbounded depth — Lean `Refinement`/`Tiling` cousins |
 
 This is the cleanest cross-prover correspondence in the whole effort: the *same recursive
 search-tree invariant* is proved in Lean (`BTree.bst_ordered`, axiom-clean) and Verus
