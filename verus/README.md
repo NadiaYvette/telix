@@ -114,6 +114,13 @@ leaf ops → a node through a pointer → a two-node split → the whole-chain o
       placement → correct iff aligned). The Verus twin of tessera `Placement`/`Permute`, on telix's
       real `PhysAddr`/`MMUPAGE_SIZE`/`ExtentEntry` — a forward-looking guard for when telix grows a
       swap/migration path.
+- [x] **#208 fork-COW kernel-PML4 invariant** (`fork_cow_pml4.rs`, `4 verified`): telix's own
+      corruption family. The kernel PML4 set is indices 507..=511 (`boot.S`), shared by every AS; a
+      fork COW pass that marks the whole PML4 write-protects the kernel's own mappings → the "5f
+      silent triple". `fork_preserves_kernel` (correct: mark user half only), `fork_buggy_corrupts_
+      kernel` (the #208 bug), `user_pml4_safe`/`fork_preserves_safe`/`fork_buggy_breaks_safe` (the
+      `USER-CR3-BAD` probe's invariant, proved). The PML4-entry-level instance of tessera
+      `Fork.forkKernel_breaks_userSafe`.
 - [x] **next/prev exec linking** — `extent_link.rs` (`3 verified`, bounded sibling splice) +
       **`extent_ptr_list.rs` (`6 verified`, the UNBOUNDED chain)**: an arbitrary-length
       doubly-linked leaf chain through raw pointers, owned *forward* by a recursive permission

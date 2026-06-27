@@ -177,6 +177,22 @@ is a **forward-looking guard**, proved in-tree so CI catches the regression the 
 This carries this session's biggest cross-project result — the `vsub==psub` assumption is the bug —
 into telix's in-tree CI, on telix's real `PhysAddr` / `MMUPAGE_SIZE` / `ExtentEntry`.
 
+## The #208 fork-COW kernel-PML4 invariant (`fork_cow_pml4.rs`)
+
+telix's own corruption family: on x86-64 the kernel regions are PML4[507..=511] (`boot.S`), shared by
+every address space; a fork COW pass that COW-marks the whole PML4 write-protects the kernel's own
+mappings → the "5f silent triple". The PML4-entry-level instantiation of `Fork.lean`
+`forkKernel_breaks_userSafe`.
+
+| Verus obligation (`fork_cow_pml4.rs`) | Justified by |
+|---|---|
+| `fork_preserves_kernel`: the correct COW pass (mark user half only) leaves every kernel entry (507..=511) untouched | Lean `Fork.fork` write-protects the *mapping*, never a kernel object; here at PML4-entry granularity |
+| `fork_buggy_corrupts_kernel`: marking the whole PML4 COW-marks a kernel entry — a provable error | tessera `Fork.forkKernel_breaks_userSafe` (telix #1), now the #208 PML4 instance |
+| `user_pml4_safe` / `fork_preserves_safe` / `fork_buggy_breaks_safe`: no kernel entry is COW-marked in a user AS; correct fork preserves it, the bug breaks it | the `vm_debug_probes` `USER-CR3-BAD` runtime check (`PML4[507..=511]`) as a proved invariant |
+
+An invariant-level guard (not a verbatim mirror of a single function), so no drift-guard marker; it
+pins the property the `USER-CR3-BAD` probe enforces dynamically.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
