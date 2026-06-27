@@ -63,9 +63,14 @@ maps each Verus clause to the Lean theorem and Kani harness that justify it.
       (`leaf_insert_through_ptr`), plus a full allocate→operate→free lifecycle
       (`demo_alloc_insert_free`). The first raw-pointer rung — Verus's home turf, where it
       does what Lean/Kani cannot (model the heap).
-- [ ] telix integration of stages 1–3a into mainline `mm/extent.rs` (re-point stubs at
-      `mm::page`; host in a `verus!{}` block; wire into the Verus build step — note: telix
-      is integrating Verus into its build system, so these re-verify on every compile)
-- [ ] stage 3b–c (the rest of the pointer tree): `find_leaf` tree-walk, the linked-leaf
-      `next`/`prev` invariant, `split_leaf_and_insert`, and `insert_into_parent` — the
-      multi-node permission reasoning. The hard remainder.
+- [x] **Stage 3b `extent_split.rs` VERIFIED** — `5 verified, 0 errors`: the leaf split
+      (`split_leaf`) keeps the lower half and moves the upper half to a freshly-allocated
+      sibling, **across two `PointsTo` permissions at once**, proven to lose/duplicate no
+      entries (`old' ++ new' == combined`), keep both halves sorted, and yield a valid
+      separator (`split_sorted`). The multi-node rung.
+- [ ] telix integration of stages 1–3b into mainline `mm/extent.rs` (re-point stubs at
+      `mm::page`; host in a `verus!{}` block; wire into the Verus build step — telix is
+      integrating Verus into its build, so these re-verify on every compile)
+- [ ] stage 3c (the remainder): `find_leaf` tree-walk over interior nodes, the linked-leaf
+      `next`/`prev` list invariant, and `insert_into_parent` (recursive split propagation +
+      new-root creation) — whole-tree, many-permission reasoning. The hardest remaining.

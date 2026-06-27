@@ -46,6 +46,21 @@ So the division of labour across the three tools is now sharp: **Lean** = the al
 right; **Kani** = the verbatim code meets it (bounded); **Verus** = it meets it *unbounded
 and through the raw pointers*, in mainline, in CI. Stage 3 is Verus's home turf.
 
+## Stage 3b — leaf split, two permissions (`extent_split.rs`)
+
+The multi-node rung: telix's `split_leaf_and_insert` keeps the lower half of a full
+leaf's entries and moves the upper half to a freshly-allocated sibling.
+
+| Verus obligation | Justified by |
+|---|---|
+| `split_sorted`: a sorted sequence splits into two sorted halves, concatenating to the original, with `s[mid-1] <= s[mid]` the separator | pure sequence reasoning; the abstract cousin is Lean `WF_split_at` (split preserves well-formedness / the partition) |
+| `split_leaf`: the split **loses and duplicates no entries** (`old' ++ new' == combined`), each half sorted, separator valid — performed across **two `PointsTo` permissions** (the old node and the new sibling) at once | content-preservation is the anti-loss property the catalogue's split/fold family (telix #9, pgcl #7/#8) is about; the two-permission heap reasoning is Verus-native |
+
+Verus caught a real **spec** bug here: with a 1-entry combined sequence `mid = 0` and the
+lower half is empty, so the separator and non-emptiness fail — the precondition must be
+`>= 2` entries (telix only splits a *full* leaf). A good example of the specs being
+exercised, not rubber-stamped.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
