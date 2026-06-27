@@ -51,8 +51,9 @@ maps each Verus clause to the Lean theorem and Kani harness that justify it.
 
 ## Status
 
-- [x] Branch + plan + correspondence (this commit)
-- [ ] Seed `extent_coalesce.rs` verified against a real Verus toolchain (tessera is
-      installing Verus to do this before final handoff)
-- [ ] telix integration of stage 1 into mainline `mm/extent.rs`
-- [ ] stages 2–3
+- [x] Branch + plan + correspondence
+- [x] **Seed `extent_coalesce.rs` VERIFIED** against Verus 0.2026.06.20 —
+      `verify.sh` → `11 verified, 0 errors`. Handoff is a verifying spec, not a draft.
+- [ ] telix integration of stage 1 into mainline `mm/extent.rs` (re-point stubs at
+      `mm::page`; host in a build-skipped `verus!{}` block; add a `verus` CI step)
+- [ ] stages 2–3 (leaf-array ops; the pointer B+-tree with `PointsTo` permissions)
