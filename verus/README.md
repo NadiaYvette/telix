@@ -82,3 +82,15 @@ maps each Verus clause to the Lean theorem and Kani harness that justify it.
 
 **Five stages verified — 33 Verus obligations, 0 errors** — spanning `can_coalesce` →
 leaf ops → a node through a pointer → a two-node split → the whole-chain ordered map.
+
+## Beyond the extent B+-tree — broadened roadmap
+
+- [x] **PTE ⟷ rmap relation invariant** (`rmap.rs`, `4 verified`): a page's cached
+      `mapcount` tracks its true reverse map; correct map/unmap preserve it; under-remove
+      is a provable error (pgcl #1/#143 — the page-cache-corruption / mapcount-drift
+      cluster). The bug-densest invariant, and exactly what a CBMC check on Linux
+      `mm/rmap.c` would target.
+- [ ] **next/prev exec linking** — the executable doubly-linked-leaf-list maintenance
+      (the back-pointer invariant `a.next.prev == a`), completing the chain story.
+- [ ] **recursive B+-tree** — `insert_into_parent` recursive split propagation + the
+      whole-tree height/shape invariant over an unbounded permission set (research-grade).

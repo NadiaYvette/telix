@@ -76,6 +76,21 @@ leaf ops (2) → a node through a pointer (3a) → a two-node split (3b) → the
 ordered-map invariant (3c) — and `chain_flatten_sorted` reconnects it to the very Layer-A
 ordering invariant the Lean development proves abstractly. The tower closes on itself.
 
+## PTE ⟷ rmap relation invariant (`rmap.rs`)
+
+A different subsystem from the extent B+-tree, but the bug-densest one: the reverse-mapping
+consistency. `wf`: a page's cached `mapcount` equals the size of its true reverse map.
+
+| Verus obligation | Justified by |
+|---|---|
+| `map_preserves_wf` / `unmap_preserves_wf`: correct map/unmap keep `mapcount == |rmap|` | Lean `Sharing.add_wf`/`remove_wf` (the `Backing` mapcount discipline) |
+| `free_iff_unmapped`: `mapcount == 0 ⟺ no mappers` (reclaim-on-zero is sound) | Lean `Sharing.free_iff_unmapped` |
+| `under_remove_breaks_wf`: removing a mapper without dropping the count is a provable error | the catalogue's **rank-2 cluster** — pgcl #1/#143 (rmap under-remove → mapcount underflow → freed-while-mapped folio → page-cache corruption), telix #2 |
+
+This is the Verus / in-tree form of the Lean `Sharing.Backing` discipline, framed on a `Set`
+so no-double-map is intrinsic. It is exactly the property a CBMC check on Linux's
+`mm/rmap.c` would target.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
