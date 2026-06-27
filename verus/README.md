@@ -92,5 +92,10 @@ leaf ops → a node through a pointer → a two-node split → the whole-chain o
       `mm/rmap.c` would target.
 - [ ] **next/prev exec linking** — the executable doubly-linked-leaf-list maintenance
       (the back-pointer invariant `a.next.prev == a`), completing the chain story.
-- [ ] **recursive B+-tree** — `insert_into_parent` recursive split propagation + the
-      whole-tree height/shape invariant over an unbounded permission set (research-grade).
+- [x] **recursive B+-tree structural invariant** (`extent_tree.rs`, `5 verified`): an
+      arbitrary-depth search tree's in-order traversal is one globally sorted extent map
+      (`bst_sorted`, structural induction over a recursive datatype) — the Verus twin of
+      Lean `BTree.bst_ordered`, unbounded. The last structural rung.
+- [ ] remaining (deepest): recursive `insert` preserving the invariant; and the
+      *pointer* recursive tree (`insert_into_parent` propagation over an unbounded
+      `PointsTo` set) — research-grade, beyond the structural core.

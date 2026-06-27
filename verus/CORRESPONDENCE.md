@@ -91,6 +91,20 @@ This is the Verus / in-tree form of the Lean `Sharing.Backing` discipline, frame
 so no-double-map is intrinsic. It is exactly the property a CBMC check on Linux's
 `mm/rmap.c` would target.
 
+## Stage 3d — the recursive (unbounded-depth) tree (`extent_tree.rs`)
+
+The last structural rung: an *arbitrary-depth* search tree, not a flat chain.
+
+| Verus obligation | Justified by |
+|---|---|
+| `bst_sorted`: a search tree's in-order traversal is one globally sorted extent map, by structural induction over a recursive datatype | the direct Verus port of Lean `proof/Tessera/BTree.lean` `bst_ordered` — same theorem, same induction, now unbounded and in-tree; the recursive generalization of `extent_chain.rs` |
+
+This is the cleanest cross-prover correspondence in the whole effort: the *same recursive
+search-tree invariant* is proved in Lean (`BTree.bst_ordered`, axiom-clean) and Verus
+(`bst_sorted`) — the abstract and the in-tree proof of one structural fact, over
+unbounded depth. (Modeled as a datatype: the *shape* invariant, decoupled from the
+pointer representation that stages 3a/3b verified for one/two nodes.)
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
