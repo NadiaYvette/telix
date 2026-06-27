@@ -18,6 +18,18 @@ tessera: `NadiaYvette/tessera` (public — github / sourcehut / disroot / framag
 | `end` overflow-free (the `requires` bound) | Kani's automatic arithmetic-overflow checks (0 failures) | — (arithmetic; below the Lean granule-unit abstraction) |
 | `union` ⟹ `contains(a) ∧ contains(b)` (flag join is an upper bound) | `union_contains_both_operands` | — (bit-level; `bit_vector` in Verus) |
 
+## Stage 2 — leaf-array operations (`extent_leaf.rs`)
+
+| Verus obligation | Kani harness | Lean theorem |
+|---|---|---|
+| `insert_preserves_sorted`: inserting at the sorted position keeps the leaf sorted | `rust/extent-kani/lib.rs` `insert_preserves_order` (bounded array insert) | `proof/Tessera/ExtentMap.lean` `insert_ordered` (the abstract theorem) |
+| `remove_preserves_sorted`: removal keeps the leaf sorted (subsequence of a sorted seq) | — | `ExtentMap`/`Basic` `Pairwise` sublist closure |
+| `insert_entry_at` / `remove_entry_at` functional spec (`Seq::insert`/`Seq::remove`) + count | the harness's array-shift semantics | `ExtentMap.insert_mem` (insert adds exactly the element) |
+
+telix's manual shift-right/shift-left over the fixed `[ExtentEntry; LEAF_CAP]` + count
+computes exactly `Seq::insert`/`Seq::remove` on the live content; the Verus spec is stated
+at that logical level, and the telix side proves its array code meets it.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —

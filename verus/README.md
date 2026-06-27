@@ -52,8 +52,12 @@ maps each Verus clause to the Lean theorem and Kani harness that justify it.
 ## Status
 
 - [x] Branch + plan + correspondence
-- [x] **Seed `extent_coalesce.rs` VERIFIED** against Verus 0.2026.06.20 —
-      `verify.sh` → `11 verified, 0 errors`. Handoff is a verifying spec, not a draft.
-- [ ] telix integration of stage 1 into mainline `mm/extent.rs` (re-point stubs at
+- [x] **Stage 1 `extent_coalesce.rs` VERIFIED** — `11 verified, 0 errors`.
+- [x] **Stage 2 `extent_leaf.rs` VERIFIED** — `6 verified, 0 errors`: leaf
+      `insert_entry_at`/`remove_entry_at` preserve the leaf's sorted-by-start invariant
+      (`insert_preserves_sorted`/`remove_preserves_sorted`) — the per-leaf analogue of
+      `ExtentMap.insert_ordered`. `verify.sh` runs both stages.
+- [ ] telix integration of stages 1–2 into mainline `mm/extent.rs` (re-point stubs at
       `mm::page`; host in a build-skipped `verus!{}` block; add a `verus` CI step)
-- [ ] stages 2–3 (leaf-array ops; the pointer B+-tree with `PointsTo` permissions)
+- [ ] stage 3 (the pointer B+-tree: `insert`/`split_leaf_and_insert` with `vstd`
+      `PointsTo` permissions and the slab allocator as a resource)

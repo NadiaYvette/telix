@@ -10,4 +10,7 @@ set -e
 cd "$(dirname "$0")"
 VERUS="${VERUS:-$HOME/verus/verus-x86-linux/verus}"
 echo "verus: $("$VERUS" --version | head -1)"
-"$VERUS" --crate-type=lib extent_coalesce.rs
+for f in extent_coalesce.rs extent_leaf.rs; do
+  echo "--- $f ---"
+  "$VERUS" --crate-type=lib "$f"
+done
