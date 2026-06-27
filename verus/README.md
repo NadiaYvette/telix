@@ -105,6 +105,13 @@ leaf ops → a node through a pointer → a two-node split → the whole-chain o
       (`bst_sorted`); the **recursive insert preserves the invariant** (`insert_preserves_bst`)
       and loses no entry, adding exactly the new one (`insert_contains`). The Verus twin of
       Lean `BTree.lean`, unbounded. The structural recursive tree — done.
-- [ ] remaining (deepest, research-grade): the *pointer* recursive tree —
-      `insert_into_parent` split propagation over an unbounded `PointsTo` set with the
-      whole-tree height/balance invariant. Beyond the structural core proved here.
+- [x] **the POINTER recursive tree** (`extent_ptr_tree.rs`, `6 verified`): the deepest rung —
+      an *arbitrary-depth tree of nodes behind raw pointers*, where the right to dereference the
+      whole tree is a **recursive permission collection** (`TreePerm`: each node's `PointsTo`
+      plus, recursively, its children's permission trees). Both directions verified: a recursive
+      **traversal** (`contains`) walks the unbounded `*mut` tree soundly and agrees with the
+      abstract key set, and a recursive **insert** (`insert`) allocates a fresh node, rewires the
+      parent pointer, and reconstructs the permission collection on the way up — preserving `wf`
+      and `bst` and adding exactly the key. This fuses `extent_tree.rs` (recursive datatype) with
+      `extent_node.rs`/`extent_split.rs` (pointer permissions): what they did for the *shape* and
+      for *one/two nodes*, now for the *unbounded heap-pointer tree*. The summit of the tower.

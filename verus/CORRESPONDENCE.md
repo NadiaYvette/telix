@@ -124,6 +124,24 @@ search-tree invariant* is proved in Lean (`BTree.bst_ordered`, axiom-clean) and 
 unbounded depth. (Modeled as a datatype: the *shape* invariant, decoupled from the
 pointer representation that stages 3a/3b verified for one/two nodes.)
 
+## Stage 3e — the pointer recursive tree (`extent_ptr_tree.rs`)
+
+The deepest rung, and the one furthest from what Lean/Kani can express: an arbitrary-depth tree
+of nodes **behind raw pointers**, where the permission to walk the whole tree is itself a
+**recursive collection** — `TreePerm` holds a node's `PointsTo<Node>` plus, recursively, the
+`TreePerm`s for its children. This is the real shape of telix's `mm/extent.rs`.
+
+| Verus obligation | Justified by |
+|---|---|
+| `TreePerm::{wf, keys, bst}`: the recursive permission collection and its abstract content/ordering, by structural recursion over the `Box`-linked permission tree | the pointer realization of Lean `BTree.lean` / `extent_tree.rs`'s `bst`/`to_seq` — the *shape* invariant, now carried by the heap permissions rather than a datatype |
+| `contains`: a recursive walk over the unbounded `*mut` tree, each deref sound via its slice of the permission collection, agreeing with `keys()` (BST-pruned) | the unbounded generalization of stage 3a's single-node `leaf_insert_through_ptr`; Lean/Kani cannot state it (no heap model) |
+| `insert`: recursive insert — allocate a node, rewire the parent's child pointer (`take`/`put`), reconstruct the permission tree up the spine — preserving `wf`/`bst`, `keys() == old.insert(key)` | the heap-pointer form of `extent_tree.rs` `insert_preserves_bst`/`insert_contains`; the multi-permission split reasoning of stage 3b (`split_leaf`) now propagated recursively |
+
+This closes the tower: stage 1 (pure logic) → 2 (leaf arrays) → 3a/3b (one/two nodes through
+pointers) → 3c/3d (whole structure, datatype) → **3e (whole structure, through pointers,
+unbounded, with mutation)**. The `bst`/ordered-map invariant the Lean development proves
+abstractly is now also proved on the actual heap-pointer representation telix runs.
+
 ## Why three tools
 
 - **Lean** proves the property *abstractly*, for all inputs, over the idealized model —
