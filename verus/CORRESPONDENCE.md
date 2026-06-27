@@ -91,6 +91,24 @@ This is the Verus / in-tree form of the Lean `Sharing.Backing` discipline, frame
 so no-double-map is intrinsic. It is exactly the property a CBMC check on Linux's
 `mm/rmap.c` would target.
 
+## Cross-mm aggregate-refcount invariant (`rmap_cluster.rs`) — pgcl #143 gate
+
+One level up from `rmap.rs`: a PGCL **cluster** (folio) shared across **several mms** (the fork
+parent+children of pgcl's live -smp8 reproducer), carrying a single per-cluster aggregate
+refcount. This is the home of #143's *free-while-mapped*. The sequential (∀-state) complement of
+the concurrent (∀-interleaving) Iris proof `tessera/property2/coq/rmap_defer.v`.
+
+| Verus obligation (`rmap_cluster.rs`) | Justified by |
+|---|---|
+| `free_iff_unmapped`: `refcount == 0 ⟺ !folio_mapped()` — the aggregate over all mms | the sequential statement the runtime `dec_and_test`-on-`folio_mapped()` gate enforces; the Iris `rmap_defer_spec` is the ∀-interleaving form |
+| `mapped_implies_refcount_pos`: a sibling mm's live sub-PTE keeps `refcount > 0` | the cross-mm gate #143 violated; the Coq `no_free_while_referenced` (a reference blocks the free) at folio granularity |
+| `two_sharers_refcount_ge2`: two distinct sharing mms ⟹ `refcount ≥ 2` ⟹ a single deferred put cannot reach 0 | the fork-share safety margin; why a *correct* aggregate refcount cannot be raced to free by one put |
+| `freed_while_mapped_breaks_wf`: `folio_mapped ∧ refcount == 0 ⟹ ¬wf` | the #143 bad state as an invariant violation — the cross-mm lift of `rmap.rs` `under_remove_breaks_wf` |
+
+So the #143 fix obligation is now machine-checked from both sides: the **gate is sound in every
+state** (`rmap_cluster.rs`, Verus) and **under every thread interleaving** (`rmap_defer.v`, Iris),
+and `freed_while_mapped_breaks_wf` certifies the bug state is genuinely impossible under `wf`.
+
 ## Stage 3d — the recursive (unbounded-depth) tree (`extent_tree.rs`)
 
 The last structural rung: an *arbitrary-depth* search tree, not a flat chain.

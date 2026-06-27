@@ -90,6 +90,14 @@ leaf ops → a node through a pointer → a two-node split → the whole-chain o
       is a provable error (pgcl #1/#143 — the page-cache-corruption / mapcount-drift
       cluster). The bug-densest invariant, and exactly what a CBMC check on Linux
       `mm/rmap.c` would target.
+- [x] **cross-mm aggregate-refcount gate** (`rmap_cluster.rs`, `4 verified`): pgcl #143's
+      free-while-mapped at *folio* granularity across multiple mms — `refcount == Σ live
+      sub-PTEs across mms`, so `refcount == 0 ⟺ !folio_mapped()` (`free_iff_unmapped`), a
+      sibling mm's mapping keeps `refcount > 0` (`mapped_implies_refcount_pos`), and
+      `folio_mapped ∧ refcount == 0` is a provable invariant violation
+      (`freed_while_mapped_breaks_wf`). The **sequential (∀-state) complement** of the Iris
+      ∀-interleaving proof `tessera/property2/coq/rmap_defer.v` — the #143 fix obligation,
+      machine-checked from both sides.
 - [ ] **next/prev exec linking** — the executable doubly-linked-leaf-list maintenance
       (the back-pointer invariant `a.next.prev == a`), completing the chain story.
 - [x] **recursive B+-tree, structural + insert** (`extent_tree.rs`, `8 verified`): an
