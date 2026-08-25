@@ -1,0 +1,9 @@
+# kernel-v2 host-target default, for direct `cargo` invocations from this
+# directory.  NOTE: this cannot fully neutralise the repo-root
+# .cargo/config.toml (its `[unstable] build-std = ["core"]` is needed by
+# the prototype kernel, and cargo merges config arrays rather than
+# letting a nested file clear it).  The supported entry point is
+# tools/build-kernel-v2.sh, which runs from a neutral CWD so the
+# repo-root config drops out of the discovery chain entirely.
+[build]
+target = "x86_64-unknown-linux-gnu"

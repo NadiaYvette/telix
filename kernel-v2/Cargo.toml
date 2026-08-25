@@ -1,0 +1,25 @@
+[package]
+name = "telix-kernel-v2"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Second-round verified Telix kernel (spec-first, host-testable)"
+
+# kernel-v2 is its OWN workspace, deliberately NOT a member of the root
+# workspace.  The root .cargo/config.toml defaults every build to the
+# aarch64-unknown-none bare-metal target with `-Z build-std` (needed by
+# the prototype kernel); cargo merges config arrays, so that cannot be
+# cleared from a nested config.  Standalone (like the 29 loom test
+# crates) means root-workspace commands never see kernel-v2, and the
+# build entry point is tools/build-kernel-v2.sh / `make test-kernel-v2`.
+[workspace]
+resolver = "2"
+
+[lib]
+name = "telix_kernel_v2"
+path = "src/lib.rs"
+
+# No dependencies by design: the crate must stay dependency-free so the
+# verification story (manual Iris heap_lang correspondence, per
+# docs/kernel-v2-verification-bridge.md) never has to chase a transitive
+# dep.  Everything used lives in core/alloc.
