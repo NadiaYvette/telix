@@ -4,13 +4,29 @@ Status: **scaffolding done (2026-08-25)** — workspace layout, build
 system, and the capability-transport first component are in place and
 host-testable; the Rocq/Iris spec side is pending K1.
 
-This document is the Telix-side companion to Tessera's
-[`doc/kernel-development-plan.md`](~/src/tessera/doc/kernel-development-plan.md)
-(the K1–K10 build-up table) and
-[`doc/stage3-kernel-strategy.md`](~/src/tessera/doc/stage3-kernel-strategy.md)
-(the manual-Iris verification pipeline).  It records the *concrete repo
-layout and build-system changes* for growing the verified kernel inside
-this repository, and it is the working reference for the build-up.
+## Where the planning lives
+
+The **authoritative planning for the second-round prototype lives in
+Tessera**, not here:
+
+- [`~/src/tessera/doc/kernel-development-plan.md`](~/src/tessera/doc/kernel-development-plan.md)
+  — the high-level strategy: two prototypes, the K1–K10 build-up order,
+  verification strategy, relationship to the hardware model, test
+  strategy, open questions.
+- [`~/src/tessera/doc/stage3-kernel-strategy.md`](~/src/tessera/doc/stage3-kernel-strategy.md)
+  — the verification pipeline: manual Iris heap_lang, the machine-
+  interface layer, the Rust→Rocq connection.
+- [`~/src/tessera/doc/formalization-status.md`](~/src/tessera/doc/formalization-status.md)
+  and the rest of Tessera's `doc/` tree — milestone status and the
+  hardware-model side.
+
+This document records only the **Telix-repo specifics** the Tessera
+plans do not cover: the concrete crate layout and build-system
+mechanics inside this repository, and the Rust→Iris→hardware-model
+correspondence itemised in
+[`docs/kernel-v2-verification-bridge.md`](kernel-v2-verification-bridge.md).
+Changes to the strategy, build-up order, or pipeline belong in the
+Tessera docs, not here.
 
 The design intent comes from the whitepaper (`~/src/telix-whitepaper/`):
 the first-round prototype stays as a frozen reference, and the second-round
@@ -136,11 +152,14 @@ document** (`docs/kernel-v2-verification-bridge.md`).
 ## 3. Build-up order — capability transport first
 
 The K1–K10 table in Tessera's `doc/kernel-development-plan.md` is the
-canonical order.  This repository's first kernel-v2 component is the
-**capability transport** (per the 2026-08-25 decision), which the K
-table does not name explicitly; it sits at the heart of a microkernel
-(the seL4 lesson: IPC + capability table is the core), so it is defined
-here as a new phase that lands between K1 and K2:
+canonical order; see that document (not this one) for the full table
+and dependencies.  Two updates to it were decided here:
+
+- The first kernel-v2 component is the **capability transport** (per the
+2026-08-25 decision), which the K table does not name explicitly;
+it sits at the heart of a microkernel (the seL4 lesson: IPC +
+capability table is the core).  It is defined as **Phase K1.5**, landing
+between K1 (machine interface) and K2 (framekernel core):
 
 | Phase | Component | Where | Verification | Depends on |
 |-------|-----------|-------|--------------|------------|
@@ -153,6 +172,8 @@ here as a new phase that lands between K1 and K2:
 | K6 | Scheduler management loop (EEVDF, per-core) | kernel-v2 | Manual Iris (bounded state) | K2 |
 | K7 | External pager framework (capability channels, fault dispatch) | kernel-v2 | Protocol-level (K1 contracts) | K1.5, K2, K4 |
 | K8–K10 | First pager, first personality server, device drivers | kernel-v2 | Independent / untrusted | K7 |
+
+The full table, rationale, and dependencies live in the Tessera plan.
 
 K1.5 reuses K1's memory/allocation resources for the capability table,
 gpfsl for the lock-free ring binding, the SSG-3 interrupt-controller
@@ -211,25 +232,15 @@ pattern Tessera already uses for extent/superpage tiling.
 
 ## 5. Verification pipeline (summary)
 
-```
-Telix kernel-v2 (Rust, spec-first)
-        │  manual correspondence (audited, seL4-style)
-        ▼
-Iris heap_lang spec (Rocq, tessera/hardware/rocq/kernel_specs/)
-        │  Iris separation logic
-        ▼
-K1 machine-interface resources (Rocq)
-        │  Iris separation logic (gpfsl iRC11 where weak memory matters)
-        ▼
-Tessera hardware model (machine.sail → machine.v, axiom-free)
-```
-
-- **Axiom hygiene**: the Tessera build enforces `axiom_free` on headline
-  theorems; kernel-spec theorems get the same check.
-- **Unit tests**: every kernel-v2 component is host-testable; protocol
-  paths are later exercised in QEMU against the prototype's harnesses.
-- **Conformance**: kernel page walks and (eventually) transport
-  behaviour are diff-tested against Tessera's oracle.
+The pipeline itself is planned in Tessera's `stage3-kernel-strategy.md`;
+the Telix-side artifact is the itemised Rust→Iris correspondence in
+[`docs/kernel-v2-verification-bridge.md`](kernel-v2-verification-bridge.md).
+In one line: kernel-v2 Rust (spec-first, audited by hand) ↔ Iris
+heap_lang spec (Rocq, `tessera/hardware/rocq/kernel_specs/`) ↔ K1
+machine-interface resources ↔ the axiom-free Tessera machine model,
+with `axiom_free` hygiene on every headline theorem, host unit tests
+per component, and QEMU diff-tests against Tessera's oracle for the
+protocol paths.
 
 ---
 
