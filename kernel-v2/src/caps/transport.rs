@@ -77,12 +77,57 @@ impl Transport {
         id
     }
 
-    fn table(&self, task: TaskId) -> Option<&CapTable> {
+    /// `task`'s capability table, if the task is registered.
+    ///
+    /// Public so higher layers (the cluster / multikernel domain) can
+    /// inspect tables for partition-qualified capabilities; the kernel's
+    /// exclusive ownership of tables is unaffected (read-only view).
+    pub fn table(&self, task: TaskId) -> Option<&CapTable> {
         self.tasks.get(&task)
     }
 
     fn table_mut(&mut self, task: TaskId) -> Option<&mut CapTable> {
         self.tasks.get_mut(&task)
+    }
+
+    /// True iff `port` exists in this transport.
+    pub fn has_port(&self, port: PortId) -> bool {
+        self.ports.contains_key(&port)
+    }
+
+    /// Kernel-internal capability allocation: place `ty` with `rights`
+    /// into `task`'s table.
+    ///
+    /// Used by the cluster to plant partition-qualified capabilities
+    /// (`RemotePort`) across partitions.  `UnknownTask` / `TableFull`
+    /// on failure; table unchanged.
+    pub fn alloc_cap(
+        &mut self,
+        task: TaskId,
+        ty: CapType,
+        rights: Rights,
+    ) -> Result<(), TransportError> {
+        let table = self.table_mut(task).ok_or(TransportError::UnknownTask)?;
+        match table.alloc_slot(ty, rights) {
+            Some(_) => Ok(()),
+            None => Err(TransportError::TableFull),
+        }
+    }
+
+    /// Kernel-internal inbound delivery: enqueue `msg` into `port`
+    /// *without* a capability check.
+    ///
+    /// The kernel (or a device path — NIC, another node) is the
+    /// authority: this is the counterpart of `send`, which requires the
+    /// sender to hold a `Port(port)` cap with `SEND`.  The bound is
+    /// still enforced: a full queue refuses the message (`QueueFull`)
+    /// and is unchanged — no message is ever lost or invented.
+    pub fn deliver(&mut self, port: PortId, msg: Message) -> Result<(), TransportError> {
+        let p = self
+            .ports
+            .get_mut(&port)
+            .ok_or(TransportError::UnknownPort)?;
+        p.send(msg).map_err(|SendError| TransportError::QueueFull)
     }
 
     /// Create a port owned by `task` with queue bound `bound`, and

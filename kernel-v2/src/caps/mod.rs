@@ -10,11 +10,15 @@
 //! models is itemised in `docs/kernel-v2-verification-bridge.md`.
 
 pub mod cap;
+pub mod cluster;
+pub mod doorbell;
 pub mod port;
 pub mod table;
 pub mod transport;
 
-pub use cap::{CapSlot, CapType, PortId, Rights, TaskId};
+pub use cap::{CapSlot, CapType, PartitionId, PortId, Rights, TaskId};
+pub use cluster::{Cluster, ClusterError};
+pub use doorbell::IntcDoorbell;
 pub use port::{Message, Port, RecvError, SendError};
 pub use table::{CapTable, GrantError, Slot};
 pub use transport::{Transport, TransportError};

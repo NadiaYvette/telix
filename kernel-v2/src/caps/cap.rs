@@ -17,6 +17,15 @@ pub struct TaskId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortId(pub u32);
 
+/// Unique identifier for a partition (a multikernel domain).
+///
+/// A partition owns a `Transport`; ports are local to their partition
+/// and are addressed from outside by `(PartitionId, PortId)` pairs.
+/// This is the SSG-1 topology scoping: the capability namespace is
+/// flat within a partition and partition-qualified across them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PartitionId(pub u32);
+
 /// Access rights on a capability.
 ///
 /// Bit flags; the subset lattice is what `grant` must respect: a grant
@@ -92,8 +101,14 @@ impl fmt::Display for Rights {
 /// The kind of object a capability refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CapType {
-    /// A message port (endpoint) in the transport.
+    /// A message port (endpoint) in the *local* transport.
     Port(PortId),
+    /// A port endpoint in *another* partition's transport — the
+    /// multikernel remote-port capability.  A task holding
+    /// `RemotePort(part, port)` may send (with the `SEND` right) to a
+    /// port owned in partition `part`; the delivery enqueues into that
+    /// partition's transport and rings its inbound doorbell.
+    RemotePort(PartitionId, PortId),
     /// A memory region.  (Later: governed by the K1 machine-interface
     /// memory resources; the transport itself does not touch it.)
     Memory { base: u64, pages: u64 },
